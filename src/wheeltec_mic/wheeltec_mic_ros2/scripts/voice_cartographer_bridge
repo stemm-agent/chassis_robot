@@ -1,0 +1,669 @@
+#!/usr/bin/env python3
+"""Voice control and recoverable motion gate for Cartographer mapping."""
+
+from concurrent.futures import ThreadPoolExecutor
+import fcntl
+import json
+import os
+import subprocess
+import time
+
+import rclpy
+from geometry_msgs.msg import Twist
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool, String
+from std_srvs.srv import SetBool, Trigger
+
+from cartographer_voice_policy import (
+    ENDING,
+    IDLE,
+    PAUSED,
+    RUNNING,
+    STARTING,
+    classify_external_state,
+    command_action,
+    command_in_cooldown,
+    command_is_allowed,
+    motion_is_blocked,
+    service_discovery_decision,
+    service_request_decision,
+    COMPLETE,
+    SEND,
+    TIMEOUT,
+)
+
+
+class VoiceCartographerBridge(Node):
+    def __init__(self):
+        super().__init__('voice_cartographer_bridge')
+
+        self.declare_parameter('voice_words_topic', 'voice_words')
+        self.declare_parameter('feedback_topic', 'feedback_audio')
+        self.declare_parameter(
+            'nav_state_topic', '/stemm_cartographer/nav_state')
+        self.declare_parameter(
+            'motion_gate_topic', '/stemm_cartographer/motion_blocked')
+        self.declare_parameter(
+            'voice_state_topic', '/stemm_cartographer/voice_state')
+        self.declare_parameter(
+            'session_unit', 'stemm-cartographer-session.service')
+        self.declare_parameter(
+            'session_control_helper',
+            '/usr/local/sbin/stemm-cartographer-session-control')
+        self.declare_parameter(
+            'session_lock_file', '/tmp/stemm-cartographer-exploration.lock')
+        self.declare_parameter('status_poll_sec', 0.5)
+        self.declare_parameter('nav_state_fresh_sec', 3.0)
+        self.declare_parameter('service_discovery_timeout_sec', 3.0)
+        self.declare_parameter('service_request_timeout_sec', 12.0)
+        self.declare_parameter('save_request_timeout_sec', 55.0)
+        self.declare_parameter('start_confirmation_timeout_sec', 75.0)
+        self.declare_parameter('command_cooldown_sec', 1.0)
+        self.declare_parameter('dry_run', False)
+
+        self.session_unit = str(self.get_parameter('session_unit').value)
+        self.session_control_helper = str(
+            self.get_parameter('session_control_helper').value)
+        self.session_lock_file = str(
+            self.get_parameter('session_lock_file').value)
+        self.status_poll_sec = max(
+            0.2, float(self.get_parameter('status_poll_sec').value))
+        self.nav_state_fresh_sec = max(
+            1.0, float(self.get_parameter('nav_state_fresh_sec').value))
+        self.service_discovery_timeout_sec = max(
+            0.1,
+            float(self.get_parameter('service_discovery_timeout_sec').value),
+        )
+        self.service_request_timeout_sec = max(
+            1.0, float(self.get_parameter('service_request_timeout_sec').value))
+        self.save_request_timeout_sec = max(
+            self.service_request_timeout_sec,
+            float(self.get_parameter('save_request_timeout_sec').value),
+        )
+        self.start_confirmation_timeout_sec = max(
+            5.0,
+            float(self.get_parameter('start_confirmation_timeout_sec').value),
+        )
+        self.command_cooldown_sec = max(
+            0.0, float(self.get_parameter('command_cooldown_sec').value))
+        self.dry_run = bool(self.get_parameter('dry_run').value)
+
+        # Start conservatively blocked until the first systemd/lock poll.  This
+        # prevents a mic restart during mapping from briefly reopening motion.
+        self._state = STARTING
+        self._unit_state = 'unknown'
+        self._lock_held = False
+        self._status_error = ''
+        self._last_message = 'waiting for external session status'
+        self._nav_state = None
+        self._nav_state_received_at = 0.0
+        self._last_command_at = {}
+        self._pending_service = None
+        self._start_future = None
+        self._start_confirm_deadline = 0.0
+        self._force_starting = False
+        self._emergency_pause_queued = False
+        self._status_future = None
+        self._next_status_poll_at = 0.0
+        self._last_published_signature = None
+        self._last_state_publish_at = 0.0
+        self._worker = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix='cartographer_voice')
+
+        self.service_clients = {
+            'pause': self.create_client(
+                Trigger, '/stemm_cartographer/stop_navigation'),
+            'save': self.create_client(
+                Trigger, '/stemm_cartographer/save_map'),
+            'continue': self.create_client(
+                Trigger, '/stemm_cartographer/start_mapping'),
+            'end': self.create_client(
+                SetBool, '/stemm_cartographer/set_mapping_done'),
+        }
+
+        gate_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.feedback_pub = self.create_publisher(
+            String, self.get_parameter('feedback_topic').value, 10)
+        self.motion_gate_pub = self.create_publisher(
+            Bool, self.get_parameter('motion_gate_topic').value, gate_qos)
+        self.voice_state_pub = self.create_publisher(
+            String, self.get_parameter('voice_state_topic').value, gate_qos)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.create_subscription(
+            String,
+            self.get_parameter('voice_words_topic').value,
+            self._voice_words_callback,
+            10,
+        )
+        self.create_subscription(
+            String,
+            self.get_parameter('nav_state_topic').value,
+            self._nav_state_callback,
+            10,
+        )
+        self.create_timer(0.1, self._timer_callback)
+        self._publish_state(force=True)
+        self.get_logger().info(
+            'voice_cartographer_bridge ready: unit=%s dry_run=%s'
+            % (self.session_unit, self.dry_run)
+        )
+
+    def close(self):
+        self._worker.shutdown(wait=False, cancel_futures=True)
+
+    def _voice_words_callback(self, msg):
+        command = msg.data.strip()
+        if not command:
+            return
+
+        if command == '小车停':
+            self._handle_emergency_stop()
+            return
+
+        action = command_action(command)
+        if action is None:
+            return
+        if self._in_cooldown(command):
+            return
+        if action == 'start':
+            self._start_session()
+            return
+        self._begin_service_command(action)
+
+    def _in_cooldown(self, command):
+        now = time.monotonic()
+        if command_in_cooldown(
+                self._last_command_at,
+                command,
+                now,
+                self.command_cooldown_sec):
+            self.get_logger().info(
+                'Ignore repeated mapping voice command in cooldown: %s'
+                % command)
+            return True
+        return False
+
+    def _handle_emergency_stop(self):
+        if not motion_is_blocked(
+                self._state, self._unit_state, self._lock_held):
+            return
+        self.cmd_vel_pub.publish(Twist())
+        if self._state in (RUNNING, ENDING) and self._pending_service is None:
+            self.get_logger().warn(
+                'Emergency stop received during mapping; pausing exploration.')
+            self._begin_service_command('pause', emergency=True)
+        elif self._state in (RUNNING, ENDING):
+            self._emergency_pause_queued = True
+            self.get_logger().warn(
+                'Emergency stop queued behind the active mapping request.')
+        else:
+            self.get_logger().warn(
+                'Emergency stop received in mapping state %s; zero velocity '
+                'published.' % self._state)
+
+    def _start_session(self):
+        if self._pending_service is not None or self._start_future is not None:
+            self._reject('mapping command is already pending', unavailable=False)
+            return
+        if not command_is_allowed('start', self._state):
+            self._reject(
+                'start mapping is invalid in state %s' % self._state,
+                unavailable=False,
+            )
+            return
+        if self._lock_held or self._unit_state in (
+                'active', 'activating', 'deactivating', 'reloading'):
+            self._reject(
+                'a Cartographer session is already active', unavailable=False)
+            return
+
+        self._force_starting = True
+        self._state = STARTING
+        self._nav_state = None
+        self._nav_state_received_at = 0.0
+        self._publish_feedback('/2d_mapping.wav')
+        self._publish_state(force=True)
+        self.get_logger().info('Accepted voice request to start mapping.')
+        self._last_message = '开始建图已受理，正在启动独立建图会话'
+        if self.dry_run:
+            self.get_logger().info(
+                'Dry run: would request the independent systemd session.')
+            self._force_starting = False
+            self._state = IDLE
+            self._last_message = '演练模式：未实际启动建图会话'
+            self._publish_state(force=True)
+            return
+        self._start_future = self._worker.submit(self._run_session_start)
+
+    def _run_session_start(self):
+        try:
+            completed = subprocess.run(
+                ['sudo', '-n', self.session_control_helper, 'start'],
+                capture_output=True,
+                text=True,
+                timeout=8.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        output = (completed.stdout + completed.stderr).strip()
+        if completed.returncode != 0:
+            return False, output or 'session start helper failed'
+        return True, output or 'systemd session start accepted'
+
+    def _consume_start_result(self, now):
+        if self._start_future is None or not self._start_future.done():
+            return
+        future = self._start_future
+        self._start_future = None
+        try:
+            success, message = future.result()
+        except Exception as exc:  # noqa: BLE001
+            success, message = False, str(exc)
+        if not success:
+            self._force_starting = False
+            self._state = IDLE
+            self.get_logger().error('Mapping session start failed: %s' % message)
+            self._last_message = '建图会话启动失败：%s' % message
+            self._publish_feedback('/overmap.wav')
+            self._publish_state(force=True)
+            return
+        self._start_confirm_deadline = now + self.start_confirmation_timeout_sec
+        self._next_status_poll_at = 0.0
+        self.get_logger().info(
+            'Mapping session supervisor accepted start: %s' % message)
+        self._last_message = '独立建图会话已由 systemd 接管，等待 ROS 就绪'
+
+    def _begin_service_command(self, action, emergency=False):
+        if self._pending_service is not None or self._start_future is not None:
+            if not emergency:
+                self._reject('mapping command is already pending', unavailable=False)
+            return
+        if not emergency and not command_is_allowed(action, self._state):
+            self._reject(
+                '%s is invalid in state %s' % (action, self._state),
+                unavailable=False,
+            )
+            return
+
+        if action == 'end':
+            request = SetBool.Request()
+            request.data = True
+        else:
+            request = Trigger.Request()
+        if self.dry_run:
+            self.get_logger().info(
+                'Dry run: would call Cartographer service for action %s.'
+                % action)
+            self._last_message = '演练模式：未实际执行 %s' % action
+            self._publish_state(force=True)
+            return
+        now = time.monotonic()
+        self._pending_service = {
+            'action': action,
+            'client': self.service_clients[action],
+            'request': request,
+            'phase': 'discovering',
+            'deadline': now + self.service_discovery_timeout_sec,
+            'future': None,
+            'emergency': bool(emergency),
+        }
+        if not emergency:
+            self._publish_feedback('/OK.wav')
+        if action == 'end':
+            self._last_message = '结束建图已受理；本操作不会自动保存地图'
+            self.get_logger().warn(self._last_message)
+        else:
+            self._last_message = '建图控制请求已受理：%s' % action
+        self.get_logger().info(
+            'Accepted mapping voice action %s; waiting for service.' % action)
+        self._advance_pending_service(now)
+
+    def _advance_pending_service(self, now):
+        pending = self._pending_service
+        if pending is None:
+            return
+        if pending['phase'] == 'discovering':
+            discovery = service_discovery_decision(
+                pending['client'].service_is_ready(),
+                now,
+                pending['deadline'],
+            )
+            if discovery == SEND:
+                try:
+                    pending['future'] = pending['client'].call_async(
+                        pending['request'])
+                except Exception as exc:  # noqa: BLE001
+                    self._finish_service_failure(
+                        'could not send %s request: %s'
+                        % (pending['action'], exc), unavailable=True)
+                    return
+                timeout = (
+                    self.save_request_timeout_sec
+                    if pending['action'] == 'save'
+                    else self.service_request_timeout_sec
+                )
+                pending['phase'] = 'requesting'
+                pending['deadline'] = now + timeout
+                return
+            if discovery == TIMEOUT:
+                self._finish_service_failure(
+                    '%s service is unavailable' % pending['action'],
+                    unavailable=True,
+                )
+            return
+
+        future = pending['future']
+        request_decision = service_request_decision(
+            future is not None and future.done(),
+            now,
+            pending['deadline'],
+        )
+        if request_decision == COMPLETE:
+            try:
+                response = future.result()
+            except Exception as exc:  # noqa: BLE001
+                self._finish_service_failure(
+                    '%s service request failed: %s'
+                    % (pending['action'], exc), unavailable=False)
+                return
+            if response is None or not response.success:
+                self._finish_service_failure(
+                    '%s rejected: %s'
+                    % (
+                        pending['action'],
+                        response.message if response is not None
+                        else 'empty response',
+                    ),
+                    unavailable=False,
+                )
+                return
+            self._finish_service_success(pending['action'], response.message)
+            return
+
+        if request_decision == TIMEOUT:
+            if future is not None:
+                try:
+                    pending['client'].remove_pending_request(future)
+                except (KeyError, RuntimeError, ValueError):
+                    pass
+                try:
+                    future.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._finish_service_failure(
+                '%s service request timed out' % pending['action'],
+                unavailable=True,
+            )
+
+    def _finish_service_success(self, action, message):
+        pending = self._pending_service or {}
+        emergency = bool(pending.get('emergency'))
+        self._pending_service = None
+        if action == 'pause':
+            self._state = PAUSED
+            mapping_done = bool(
+                (self._nav_state or {}).get('mapping_done')) if emergency else False
+            self._cache_nav_transition(
+                'stopped', mapping_done=mapping_done)
+            self._publish_feedback('/stop.wav')
+        elif action == 'continue':
+            self._state = RUNNING
+            self._cache_nav_transition('mapping', mapping_done=False)
+            self._publish_feedback('/OK.wav')
+        elif action == 'end':
+            self._state = ENDING
+            self._cache_nav_transition('returning_home', mapping_done=True)
+            self._publish_feedback('/2d_mapping_close.wav')
+        elif action == 'save':
+            self._publish_feedback('/OK.wav')
+        self.get_logger().info(
+            'Mapping voice action %s succeeded: %s' % (action, message))
+        if action == 'end':
+            self._last_message = '结束建图已执行，正在返航；地图未自动保存'
+        else:
+            self._last_message = '%s 执行成功：%s' % (action, message)
+        self._publish_state(force=True)
+
+    def _finish_service_failure(self, message, unavailable):
+        pending = self._pending_service
+        self._pending_service = None
+        self.get_logger().error(message)
+        self._last_message = message
+        if pending is None or not pending.get('emergency'):
+            self._publish_feedback(
+                '/close_node.wav' if unavailable else '/overmap.wav')
+        self._publish_state(force=True)
+
+    def _cache_nav_transition(self, mode, mapping_done):
+        payload = dict(self._nav_state or {})
+        payload['mode'] = mode
+        payload['mapping_done'] = bool(mapping_done)
+        self._nav_state = payload
+        self._nav_state_received_at = time.monotonic()
+
+    def _reject(self, message, unavailable):
+        self.get_logger().warn('Reject mapping voice command: %s' % message)
+        self._last_message = message
+        self._publish_feedback(
+            '/close_node.wav' if unavailable else '/overmap.wav')
+
+    def _nav_state_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError) as exc:
+            self.get_logger().warn(
+                'Ignore invalid Cartographer nav state: %s' % exc)
+            return
+        if not isinstance(payload, dict):
+            self.get_logger().warn(
+                'Ignore non-object Cartographer nav state.')
+            return
+        self._nav_state = payload
+        self._nav_state_received_at = time.monotonic()
+        self._recompute_state(self._nav_state_received_at)
+
+    def _timer_callback(self):
+        now = time.monotonic()
+        self._consume_start_result(now)
+        self._consume_status_result(now)
+        if self._status_future is None and now >= self._next_status_poll_at:
+            self._next_status_poll_at = now + self.status_poll_sec
+            self._status_future = self._worker.submit(
+                self._query_external_status)
+        self._advance_pending_service(now)
+        if self._emergency_pause_queued and self._pending_service is None:
+            self._emergency_pause_queued = False
+            if self._state in (RUNNING, ENDING):
+                self._begin_service_command('pause', emergency=True)
+        self._recompute_state(now)
+        self._check_start_confirmation(now)
+        self._publish_state()
+
+    def _query_external_status(self):
+        try:
+            completed = subprocess.run(
+                [
+                    'systemctl', 'show', self.session_unit,
+                    '--property=ActiveState', '--value', '--no-pager',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+            unit_state = completed.stdout.strip().lower() or 'unknown'
+            error = '' if completed.returncode == 0 else (
+                completed.stderr.strip() or 'systemctl show failed')
+        except (OSError, subprocess.SubprocessError) as exc:
+            unit_state, error = 'unknown', str(exc)
+        return unit_state, self._session_lock_is_held(), error
+
+    def _session_lock_is_held(self):
+        fd = None
+        try:
+            fd = os.open(
+                self.session_lock_file,
+                os.O_RDWR | os.O_CREAT,
+                0o600,
+            )
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except BlockingIOError:
+            return True
+        except OSError as exc:
+            self.get_logger().warn(
+                'Could not inspect mapping session lock: %s' % exc)
+            return False
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _consume_status_result(self, now):
+        if self._status_future is None or not self._status_future.done():
+            return
+        future = self._status_future
+        self._status_future = None
+        try:
+            unit_state, lock_held, error = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self._status_error = str(exc)
+            return
+        if unit_state != 'unknown':
+            self._unit_state = unit_state
+        self._lock_held = bool(lock_held)
+        self._status_error = error
+        self._recompute_state(now)
+
+    def _recompute_state(self, now):
+        nav_fresh = (
+            self._nav_state is not None
+            and now - self._nav_state_received_at <= self.nav_state_fresh_sec
+        )
+        derived = classify_external_state(
+            self._unit_state,
+            self._lock_held,
+            self._nav_state,
+            nav_fresh,
+        )
+        if (
+            not nav_fresh
+            and self._nav_state is not None
+            and self._unit_state == 'active'
+            and self._state in (RUNNING, PAUSED, ENDING)
+        ):
+            # save_map can occupy the manager's single-threaded executor for
+            # up to 45 seconds.  Preserve the last externally confirmed state
+            # during that bounded call instead of regressing to STARTING.
+            derived = self._state
+        if self._force_starting and derived in (IDLE, STARTING):
+            derived = STARTING
+        elif derived in (RUNNING, PAUSED, ENDING):
+            self._force_starting = False
+        if derived != self._state:
+            self.get_logger().info(
+                'Recovered mapping voice state: %s -> %s '
+                '(unit=%s lock=%s)'
+                % (self._state, derived, self._unit_state, self._lock_held))
+            self._state = derived
+            self._publish_state(force=True)
+
+    def _check_start_confirmation(self, now):
+        if self._start_confirm_deadline <= 0.0:
+            return
+        if self._state in (RUNNING, PAUSED):
+            self.get_logger().info(
+                'Cartographer mapping session confirmed by external state.')
+            self._last_message = '建图会话已运行'
+            self._start_confirm_deadline = 0.0
+            return
+        if now < self._start_confirm_deadline:
+            if self._unit_state != 'failed':
+                return
+            self.get_logger().error(
+                'Cartographer systemd session entered failed state during '
+                'startup; inspect its journal.')
+            self._last_message = '建图会话启动失败，请检查 systemd 日志'
+        else:
+            self.get_logger().error(
+                'Cartographer mapping session was not ready before '
+                'confirmation timeout; inspect systemd journal.')
+            self._last_message = '建图会话启动超时，请检查 systemd 日志'
+        self._start_confirm_deadline = 0.0
+        self._force_starting = False
+        self._publish_feedback('/overmap.wav')
+        self._recompute_state(now)
+
+    def _publish_state(self, force=False):
+        now = time.monotonic()
+        blocked = motion_is_blocked(
+            self._state, self._unit_state, self._lock_held)
+        pending_action = (
+            self._pending_service['action']
+            if self._pending_service is not None else '')
+        signature = (
+            self._state, blocked, self._unit_state, self._lock_held,
+            pending_action, self._status_error, self._last_message,
+        )
+        if (
+            not force
+            and signature == self._last_published_signature
+            and now - self._last_state_publish_at < 0.5
+        ):
+            return
+        gate_msg = Bool()
+        gate_msg.data = bool(blocked)
+        self.motion_gate_pub.publish(gate_msg)
+
+        state_msg = String()
+        state_msg.data = json.dumps(
+            {
+                'state': self._state,
+                'motion_blocked': blocked,
+                'unit_state': self._unit_state,
+                'lock_held': self._lock_held,
+                'pending_action': pending_action,
+                'nav_mode': (
+                    self._nav_state.get('mode')
+                    if isinstance(self._nav_state, dict) else None),
+                'status_error': self._status_error,
+                'message': self._last_message,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.voice_state_pub.publish(state_msg)
+        self._last_published_signature = signature
+        self._last_state_publish_at = now
+
+    def _publish_feedback(self, audio_file):
+        msg = String()
+        msg.data = audio_file
+        self.feedback_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VoiceCartographerBridge()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.close()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

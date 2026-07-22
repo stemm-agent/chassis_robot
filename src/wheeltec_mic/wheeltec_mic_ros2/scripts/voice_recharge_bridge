@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+import os
+import signal
+import shutil
+import subprocess
+import time
+from datetime import datetime
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Bool, Float32, String, UInt8
+from std_srvs.srv import SetBool, Trigger
+
+
+class VoiceRechargeBridge(Node):
+    def __init__(self):
+        super().__init__('voice_recharge_bridge')
+
+        self.declare_parameter('start_commands', ['小车回充'])
+        self.declare_parameter('cancel_commands', ['取消回充'])
+        self.declare_parameter('navigation_commands', ['开启导航'])
+        self.declare_parameter('follow_commands', ['开始跟随', '开启跟随'])
+        self.declare_parameter('cancel_navigation_commands', ['取消导航'])
+        self.declare_parameter('cancel_follow_commands', ['取消跟随'])
+        self.declare_parameter('log_dir', '/tmp')
+        self.declare_parameter('dry_run', False)
+        self.declare_parameter('command_cooldown_sec', 2.0)
+        self.declare_parameter('recharge_package', 'auto_recharge_ros2')
+        self.declare_parameter('navigate_executable', 'navigate_to_charger')
+        self.declare_parameter('cancel_executable', 'cancel_charge')
+        self.declare_parameter('navigation_launch_package', 'wheeltec_nav2')
+        self.declare_parameter('navigation_launch_file', 'wheeltec_nav2.launch.py')
+        self.declare_parameter('follow_launch_package', 'bodyreader')
+        self.declare_parameter('follow_launch_file', 'bodyfollow_no_avoider.launch.py')
+        self.declare_parameter('cancel_recharge_timeout_sec', 25.0)
+        self.declare_parameter('dock_evidence_hold_sec', 15.0)
+        self.declare_parameter('recharge_start_service', '/auto_recharge/start')
+        self.declare_parameter('recharge_stop_service', '/auto_recharge/stop')
+
+        self.start_commands = set(self.get_parameter('start_commands').value)
+        self.cancel_commands = set(self.get_parameter('cancel_commands').value)
+        self.navigation_commands = set(self.get_parameter('navigation_commands').value)
+        self.follow_commands = set(self.get_parameter('follow_commands').value)
+        self.cancel_navigation_commands = set(self.get_parameter('cancel_navigation_commands').value)
+        self.cancel_follow_commands = set(self.get_parameter('cancel_follow_commands').value)
+        self.log_dir = self.get_parameter('log_dir').value
+        self.dry_run = bool(self.get_parameter('dry_run').value)
+        self.command_cooldown_sec = float(self.get_parameter('command_cooldown_sec').value)
+        self.recharge_package = self.get_parameter('recharge_package').value
+        self.navigate_executable = self.get_parameter('navigate_executable').value
+        self.cancel_executable = self.get_parameter('cancel_executable').value
+        self.navigation_launch_package = self.get_parameter('navigation_launch_package').value
+        self.navigation_launch_file = self.get_parameter('navigation_launch_file').value
+        self.follow_launch_package = self.get_parameter('follow_launch_package').value
+        self.follow_launch_file = self.get_parameter('follow_launch_file').value
+        self.cancel_recharge_timeout_sec = float(
+            self.get_parameter('cancel_recharge_timeout_sec').value
+        )
+        self.dock_evidence_hold_sec = float(
+            self.get_parameter('dock_evidence_hold_sec').value
+        )
+        self.recharge_start_service = str(
+            self.get_parameter('recharge_start_service').value
+        )
+        self.recharge_stop_service = str(
+            self.get_parameter('recharge_stop_service').value
+        )
+        self.ros2_command = shutil.which('ros2') or '/opt/ros/humble/bin/ros2'
+
+        self._navigate_process = None
+        self._navigate_log = None
+        self._navigate_log_path = None
+        self._child_processes = []
+        self._last_command_at = {}
+        self._cancel_recharge_deadline = None
+        self._dock_evidence_until = 0.0
+        self._recharge_start_future = None
+        self._recharge_stop_future = None
+        self._mapping_motion_blocked = False
+
+        self.recharge_start_client = self.create_client(
+            Trigger, self.recharge_start_service
+        )
+        self.recharge_stop_client = self.create_client(
+            Trigger, self.recharge_stop_service
+        )
+        self.follow_control_client = self.create_client(
+            SetBool, '/voice_summon/set_body_follow_enabled'
+        )
+        self.feedback_pub = self.create_publisher(String, 'feedback_audio', 10)
+        self.voice_sub = self.create_subscription(
+            String, 'voice_words', self._voice_words_callback, 10
+        )
+        self.create_subscription(
+            Bool,
+            '/stemm_cartographer/motion_blocked',
+            self._mapping_motion_blocked_callback,
+            10,
+        )
+        # Keep a recent dock-state hint in this long-lived node.  A freshly
+        # spawned cancel node can otherwise miss volatile chassis topics while
+        # DDS discovery is still converging.
+        self.create_subscription(
+            Bool, 'robot_charging_flag', self._charging_state_callback, 10
+        )
+        self.create_subscription(
+            Float32, 'robot_charging_current', self._charging_current_callback, 10
+        )
+        self.create_subscription(UInt8, 'robot_red_flag', self._red_state_callback, 10)
+        self.create_timer(1.0, self._reap_finished_processes)
+
+        self.get_logger().info(
+            'voice_recharge_bridge ready: start=%s cancel=%s navigation=%s follow=%s cancel_navigation=%s cancel_follow=%s dry_run=%s'
+            % (
+                sorted(self.start_commands),
+                sorted(self.cancel_commands),
+                sorted(self.navigation_commands),
+                sorted(self.follow_commands),
+                sorted(self.cancel_navigation_commands),
+                sorted(self.cancel_follow_commands),
+                self.dry_run,
+            )
+        )
+
+    def _voice_words_callback(self, msg):
+        command = msg.data.strip()
+        if not command:
+            return
+
+        if command in self.start_commands:
+            if self._in_cooldown(command):
+                return
+            self._start_recharge()
+        elif command in self.cancel_commands:
+            if self._in_cooldown(command):
+                return
+            self._cancel_recharge()
+        elif command in self.navigation_commands:
+            if self._in_cooldown(command):
+                return
+            self._start_navigation()
+        elif command in self.follow_commands:
+            if self._in_cooldown(command):
+                return
+            self._start_follow()
+        elif command in self.cancel_navigation_commands:
+            if self._in_cooldown(command):
+                return
+            self._cancel_navigation()
+        elif command in self.cancel_follow_commands:
+            if self._in_cooldown(command):
+                return
+            self._cancel_follow()
+
+    def _in_cooldown(self, command):
+        now = time.monotonic()
+        last = self._last_command_at.get(command, 0.0)
+        if now - last < self.command_cooldown_sec:
+            self.get_logger().info('Ignore repeated voice command within cooldown: %s' % command)
+            return True
+        self._last_command_at[command] = now
+        return False
+
+    def _remember_dock_evidence(self):
+        self._dock_evidence_until = max(
+            self._dock_evidence_until,
+            time.monotonic() + self.dock_evidence_hold_sec,
+        )
+
+    def _charging_state_callback(self, msg):
+        if bool(msg.data):
+            self._remember_dock_evidence()
+
+    def _charging_current_callback(self, msg):
+        if float(msg.data) > 0.05:
+            self._remember_dock_evidence()
+
+    def _red_state_callback(self, msg):
+        if int(msg.data) > 0:
+            self._remember_dock_evidence()
+
+    def _has_recent_dock_evidence(self):
+        return time.monotonic() <= self._dock_evidence_until
+
+    def _mapping_motion_blocked_callback(self, msg):
+        blocked = bool(msg.data)
+        if blocked and not self._mapping_motion_blocked:
+            self.get_logger().warn(
+                'Cartographer mapping gate active; block recharge, normal '
+                'navigation, and body-follow start commands.')
+        self._mapping_motion_blocked = blocked
+
+    def _reject_mapping_motion(self, action):
+        if not self._mapping_motion_blocked:
+            return False
+        self.get_logger().warn(
+            'Reject %s while Cartographer mapping owns motion.' % action)
+        self._publish_feedback('/stop.wav')
+        return True
+
+    def _start_recharge(self):
+        if self._reject_mapping_motion('recharge start'):
+            return
+        self._publish_feedback('/OK.wav')
+        if self.dry_run:
+            self.get_logger().info(
+                'Dry run: would call recharge manager service %s'
+                % self.recharge_start_service
+            )
+            return
+        if (
+            self._recharge_start_future is not None
+            and not self._recharge_start_future.done()
+        ):
+            self.get_logger().warn(
+                'Recharge start request is already pending; ignore duplicate command.'
+            )
+            return
+        if not (
+            self.recharge_start_client.service_is_ready()
+            or self.recharge_start_client.wait_for_service(timeout_sec=0.5)
+        ):
+            self.get_logger().error(
+                'Persistent recharge manager service is unavailable: %s'
+                % self.recharge_start_service
+            )
+            return
+        self._recharge_start_future = self.recharge_start_client.call_async(
+            Trigger.Request()
+        )
+        self._recharge_start_future.add_done_callback(
+            self._recharge_start_response
+        )
+
+    def _recharge_start_response(self, future):
+        self._recharge_start_future = None
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error('Recharge manager start request failed: %s' % exc)
+            return
+        if response is not None and response.success:
+            self.get_logger().info('Recharge manager accepted voice request: %s' % response.message)
+        else:
+            self.get_logger().warn(
+                'Recharge manager rejected voice request: %s'
+                % (response.message if response is not None else 'empty response')
+            )
+
+    def _request_manager_stop_fallback(self):
+        if not (
+            self.recharge_stop_client.service_is_ready()
+            or self.recharge_stop_client.wait_for_service(timeout_sec=0.5)
+        ):
+            self.get_logger().error(
+                'Recharge manager stop service is unavailable: %s'
+                % self.recharge_stop_service
+            )
+            return
+        self._recharge_stop_future = self.recharge_stop_client.call_async(
+            Trigger.Request()
+        )
+        self._recharge_stop_future.add_done_callback(
+            self._recharge_stop_response
+        )
+
+    def _recharge_stop_response(self, future):
+        self._recharge_stop_future = None
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error('Recharge manager stop request failed: %s' % exc)
+            return
+        if response is not None and response.success:
+            self.get_logger().info('Recharge manager stop confirmed: %s' % response.message)
+        else:
+            self.get_logger().warn(
+                'Recharge manager stop was not confirmed: %s'
+                % (response.message if response is not None else 'empty response')
+            )
+
+    def _cancel_recharge(self):
+        self._publish_feedback('/OK.wav')
+        self._reap_finished_processes()
+        if self._is_tracked_process_running('cancel_charge'):
+            self.get_logger().warn(
+                'Cancel-charge process is already running; ignore duplicate cancel command.'
+            )
+            return
+
+        dock_hint = self._has_recent_dock_evidence()
+        self.get_logger().info('Cancel recharge with cached dock_hint=%s.' % dock_hint)
+        launched = self._launch_ros2_run(
+            self.cancel_executable,
+            'cancel_charge',
+            ros_args=['--ros-args', '-p', 'dock_hint:=%s' % str(dock_hint).lower()],
+        )
+        if launched is not None:
+            self._child_processes.append(('cancel_charge',) + launched)
+            self._cancel_recharge_deadline = (
+                time.monotonic() + self.cancel_recharge_timeout_sec
+            )
+            self.get_logger().info(
+                'Cancel-charge owns the graceful shutdown; force cleanup is deferred for %.1fs.'
+                % self.cancel_recharge_timeout_sec
+            )
+            return
+
+        self.get_logger().error(
+            'Failed to launch cancel_charge; falling back to recharge manager stop service.'
+        )
+        self._request_manager_stop_fallback()
+
+    def _start_navigation(self):
+        if self._reject_mapping_motion('normal navigation start'):
+            return
+        self._publish_feedback('/OK.wav')
+        self._launch_named_process(
+            'navigation_launch',
+            [self.ros2_command, 'launch', self.navigation_launch_package, self.navigation_launch_file],
+            ['bt_navigator', 'planner_server', 'controller_server', 'waypoint_cycle'],
+            [
+                'ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py',
+                'wheeltec_nav2.launch.py',
+                'nav2_container',
+            ],
+        )
+
+    def _start_follow(self):
+        if self._reject_mapping_motion('body follow start'):
+            return
+        self._publish_feedback('/OK.wav')
+        self._set_body_follow_enabled(True)
+
+    def _cancel_navigation(self):
+        self._publish_feedback('/OK.wav')
+        self._terminate_navigate_process('cancel_navigation')
+        self._kill_named_process_tree(
+            'navigation_launch',
+            [
+                'ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py',
+                'wheeltec_nav2.launch.py',
+                'nav2_container',
+            ],
+        )
+
+    def _cancel_follow(self):
+        self._publish_feedback('/OK.wav')
+        self._set_body_follow_enabled(False)
+
+    def _set_body_follow_enabled(self, enabled):
+        if enabled and self._reject_mapping_motion('body follow enable'):
+            return
+        if self.dry_run:
+            self.get_logger().info(
+                'Dry run: would call /voice_summon/set_body_follow_enabled data=%s'
+                % bool(enabled)
+            )
+            return
+
+        if not self.follow_control_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error(
+                '/voice_summon/set_body_follow_enabled service is unavailable'
+            )
+            return
+
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        future = self.follow_control_client.call_async(request)
+        future.add_done_callback(
+            lambda completed, requested=bool(enabled): self._follow_control_response(
+                completed, requested
+            )
+        )
+
+    def _follow_control_response(self, future, enabled):
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error(
+                'Body follow service call failed for data=%s: %s' % (enabled, exc)
+            )
+            return
+
+        if response.success:
+            self.get_logger().info(
+                'Body follow service call succeeded: data=%s message=%s'
+                % (enabled, response.message)
+            )
+        else:
+            self.get_logger().error(
+                'Body follow service rejected data=%s: %s'
+                % (enabled, response.message)
+            )
+
+    def _launch_named_process(self, label, cmd, active_node_names, active_process_patterns=None):
+        self._reap_finished_processes()
+
+        if self._is_tracked_process_running(label):
+            self.get_logger().warn('%s process is already running; ignore duplicate command.' % label)
+            return
+
+        active_nodes = [node_name for node_name in active_node_names if self._is_node_active(node_name)]
+        if active_nodes:
+            active_pids = []
+            for pattern in active_process_patterns or []:
+                active_pids.extend(self._pgrep(pattern))
+            active_pids = sorted(set(pid for pid in active_pids if pid > 1 and pid != os.getpid()))
+            if active_pids:
+                self.get_logger().warn(
+                    '%s appears active because node(s) %s and process(es) %s exist; ignore duplicate command.'
+                    % (label, active_nodes, active_pids)
+                )
+                return
+            self.get_logger().warn(
+                '%s has stale ROS node(s) %s but no matching launch process; starting a new process.'
+                % (label, active_nodes)
+            )
+
+        launched = self._launch_process(cmd, label)
+        if launched is not None:
+            self._child_processes.append((label,) + launched)
+
+    def _kill_named_process_tree(self, label, root_patterns):
+        self._reap_finished_processes()
+
+        roots = []
+        roots.extend(self._tracked_process_pids(label))
+        for pattern in root_patterns:
+            roots.extend(self._pgrep(pattern))
+
+        roots = sorted(set(pid for pid in roots if pid > 1 and pid != os.getpid()))
+        if not roots:
+            self.get_logger().warn('No running process found for %s.' % label)
+            return
+
+        for root_pid in roots:
+            self._terminate_process_tree(root_pid, label)
+        self._reap_finished_processes()
+
+    def _terminate_navigate_process(self, label):
+        self._reap_finished_processes()
+        roots = []
+        if self._is_process_running(self._navigate_process):
+            roots.append(self._navigate_process.pid)
+        roots.extend(self._pgrep('ros2 run auto_recharge_ros2 navigate_to_charger'))
+        roots.extend(self._pgrep('/auto_recharge_ros2/navigate_to_charger'))
+        roots = sorted(set(pid for pid in roots if pid > 1 and pid != os.getpid()))
+        if not roots:
+            return
+        for root_pid in roots:
+            self._terminate_process_tree(root_pid, label)
+        self._reap_finished_processes()
+
+    def _tracked_process_pids(self, label):
+        pids = []
+        for process_label, process, _, _ in self._child_processes:
+            if process_label == label and process.poll() is None:
+                pids.append(process.pid)
+        return pids
+
+    def _pgrep(self, pattern):
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', pattern],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            self.get_logger().warn('Failed to search process pattern %s: %s' % (pattern, exc))
+            return []
+
+        pids = []
+        for item in result.stdout.split():
+            try:
+                pid = int(item)
+            except ValueError:
+                continue
+            if pid != os.getpid():
+                pids.append(pid)
+        return pids
+
+    def _process_tree_pids(self, root_pid):
+        pids = [root_pid]
+        index = 0
+        while index < len(pids):
+            pid = pids[index]
+            index += 1
+            try:
+                result = subprocess.run(
+                    ['pgrep', '-P', str(pid)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                )
+            except Exception:
+                continue
+            for item in result.stdout.split():
+                try:
+                    child_pid = int(item)
+                except ValueError:
+                    continue
+                if child_pid not in pids:
+                    pids.append(child_pid)
+        return pids
+
+    def _terminate_process_tree(self, root_pid, label):
+        pids = self._process_tree_pids(root_pid)
+        if not pids:
+            return
+
+        self.get_logger().warn('Terminating %s process tree: %s' % (label, pids))
+        self._signal_pids(reversed(pids), signal.SIGTERM)
+        time.sleep(1.5)
+
+        alive = [pid for pid in pids if self._pid_exists(pid)]
+        if alive:
+            self.get_logger().warn('Force killing %s remaining process(es): %s' % (label, alive))
+            self._signal_pids(reversed(alive), signal.SIGKILL)
+
+    def _signal_pids(self, pids, sig):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                self.get_logger().warn('No permission to signal pid %s: %s' % (pid, exc))
+            except Exception as exc:
+                self.get_logger().warn('Failed to signal pid %s: %s' % (pid, exc))
+
+    def _pid_exists(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _launch_ros2_run(self, executable, label, ros_args=None):
+        cmd = [self.ros2_command, 'run', self.recharge_package, executable]
+        if ros_args:
+            cmd.extend(ros_args)
+        return self._launch_process(cmd, label)
+
+    def _launch_process(self, cmd, label):
+        log_path = self._make_log_path(label)
+
+        if self.dry_run:
+            self.get_logger().info('Dry run: would execute %s' % ' '.join(cmd))
+            return None
+
+        log_file = None
+        try:
+            log_file = open(log_path, 'ab', buffering=0)
+            log_file.write(('[voice_recharge_bridge] execute: %s\n' % ' '.join(cmd)).encode('utf-8'))
+            process_env = os.environ.copy()
+            process_env['PYTHONUNBUFFERED'] = '1'
+            process = subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd='/home/wheeltec/wheeltec_ros2',
+                env=process_env,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            self.get_logger().error('Failed to launch %s: %s' % (label, exc))
+            self._close_log(log_file)
+            return None
+
+        self.get_logger().info('Launched %s with pid=%s, log=%s' % (label, process.pid, log_path))
+        return process, log_file, log_path
+
+    def _make_log_path(self, label):
+        os.makedirs(self.log_dir, exist_ok=True)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        return os.path.join(self.log_dir, 'voice_recharge_%s_%s.log' % (label, stamp))
+
+    def _publish_feedback(self, audio_file):
+        msg = String()
+        msg.data = audio_file
+        self.feedback_pub.publish(msg)
+
+    def _is_node_active(self, node_name):
+        try:
+            return node_name in {name.lstrip('/') for name in self.get_node_names()}
+        except Exception as exc:
+            self.get_logger().warn('Failed to inspect active ROS nodes: %s' % exc)
+            return False
+
+    @staticmethod
+    def _is_process_running(process):
+        return process is not None and process.poll() is None
+
+    def _is_tracked_process_running(self, label):
+        for process_label, process, _, _ in self._child_processes:
+            if process_label == label and process.poll() is None:
+                return True
+        return False
+
+    def _reap_finished_processes(self):
+        if self._navigate_process is not None and self._navigate_process.poll() is not None:
+            self.get_logger().info(
+                'navigate_to_charger exited with code=%s, log=%s'
+                % (self._navigate_process.returncode, self._navigate_log_path)
+            )
+            self._close_log(self._navigate_log)
+            self._navigate_process = None
+            self._navigate_log = None
+            self._navigate_log_path = None
+
+        alive = []
+        cancel_finished = False
+        for label, process, log_file, log_path in self._child_processes:
+            if process.poll() is None:
+                alive.append((label, process, log_file, log_path))
+            else:
+                self.get_logger().info('%s exited with code=%s, log=%s' % (label, process.returncode, log_path))
+                self._close_log(log_file)
+                if label == 'cancel_charge':
+                    cancel_finished = True
+        self._child_processes = alive
+
+        if self._cancel_recharge_deadline is None:
+            return
+
+        timed_out = time.monotonic() >= self._cancel_recharge_deadline
+        if not cancel_finished and not timed_out:
+            return
+
+        self._cancel_recharge_deadline = None
+        if timed_out:
+            self.get_logger().error(
+                'cancel_charge exceeded %.1fs; forcing navigate-to-charger cleanup.'
+                % self.cancel_recharge_timeout_sec
+            )
+            self._request_manager_stop_fallback()
+            self._terminate_navigate_process('cancel_recharge_timeout')
+        else:
+            # The normal path publishes robot_recharge_flag=0 and waits for the
+            # recharge node to exit.  This is only a final cleanup for a stale
+            # wrapper/process that survived that handshake.
+            self._terminate_navigate_process('cancel_recharge_postcheck')
+
+    @staticmethod
+    def _close_log(log_file):
+        try:
+            if log_file is not None:
+                log_file.close()
+        except Exception:
+            pass
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VoiceRechargeBridge()
+    try:
+        rclpy.spin(node)
+    finally:
+        node._reap_finished_processes()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

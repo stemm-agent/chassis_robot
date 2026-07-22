@@ -1,0 +1,56 @@
+# Generated build and runtime state
+build/
+install/
+log/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local backups and recordings
+*.bak
+*.bak_*
+*.orig
+*.rej
+*~
+*.pcm
+*.wav
+
+# Runtime maps, bags, databases and generated previews
+*.bag
+*.db
+*.db3
+*.mcap
+*.pgm
+*.pbstream
+stemm_cartographer_render_preview/
+
+# Models, precompiled libraries, meshes and media
+*.a
+*.bin
+*.dae
+*.dll
+*.engine
+*.gif
+*.jpeg
+*.jpg
+*.jet
+*.log
+*.mp3
+*.mp4
+*.obj
+*.onnx
+*.pcd
+*.ply
+*.png
+*.pt
+*.pth
+*.so
+*.so.*
+*.stl
+*.svg
+*.tflite
+*.webm
+*.webp

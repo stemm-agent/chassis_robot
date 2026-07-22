@@ -1,0 +1,37 @@
+local_rrt:
+  ros__parameters:
+    map_topic: /map
+    map_service: /slam_toolbox/dynamic_map
+
+global_rrt:
+  ros__parameters:
+    map_topic: /map
+    map_service: /slam_toolbox/dynamic_map
+
+filter:
+  ros__parameters:
+    map_topic: /map
+    costmap_clearing_threshold: 70
+    info_radius: 1.4
+    goals_topic: /detected_frontiers
+    global_costmap_topic: /global_costmap/costmap
+    global_costmap_service: /global_costmap/get_costmap
+
+assigner:
+  ros__parameters:
+    map_topic: /map
+    info_radius: 1.4
+    info_multiplier: 7.0
+    hysteresis_radius: 3.2
+    hysteresis_gain: 1.2
+    frontiers_topic: /filtered_goal_points
+
+
+# # anti_clockwise
+# boundry_publisher:
+#   ros__parameters:
+#     x1y1: 
+#     x2y2:
+#     x3y3:
+#     x4y4:
+#     start_coordinates:

@@ -1,0 +1,19 @@
+[Unit]
+Description=STEMM Cartographer Managed Mapping Session
+After=wheeltec-robot.service
+Wants=wheeltec-robot.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/home/wheeltec/wheeltec_ros2
+Environment=HOME=/home/wheeltec
+Environment=ROS_DOMAIN_ID=0
+Environment=ROS_LOCALHOST_ONLY=0
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/wheeltec/wheeltec_ros2/install/setup.bash && exec ros2 launch stemm_cartographer_exploration stemm_cartographer_session.launch.py'
+Restart=no
+KillMode=control-group
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

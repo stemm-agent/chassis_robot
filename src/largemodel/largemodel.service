@@ -1,0 +1,27 @@
+[Unit]
+Description=LargeModel ROS2 Launch
+After=graphical-session.target
+
+[Service]
+Type=simple
+User=wheeltec
+# 加载 ROS2 环境
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="PULSE_RUNTIME_PATH=/run/user/1000/pulse"
+Environment="DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus"
+ExecStartPre=/usr/bin/pactl set-default-sink alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo
+ExecStartExecStartPre=/bin/sleep 5
+ExecStart=/bin/bash -c "\
+  source /opt/ros/humble/setup.bash && \
+  source /home/wheeltec/wheeltec_ros2/install/setup.bash && \
+  ros2 launch largemodel largemodel_control.launch.py"
+  
+WorkingDirectory=/home/wheeltec/wheeltec_ros2
+# 自动重启策略：意外退出 3 秒后重启，永远重试
+Restart=always
+RestartSec=3
+# 把 stdout/stderr 重定向到日志
+StandardOutput=append:/home/wheeltec/wheeltec_ros2/log/largemodel.log
+StandardError=inherit
+[Install]
+WantedBy=multi-user.target

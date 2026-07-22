@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RECHARGE_UNIT=wheeltec-recharge-manager.service
+RECHARGE_STOP_HELPER=/home/wheeltec/wheeltec_ros2/install/stemm_cartographer_exploration/lib/stemm_cartographer_exploration/stemm_cartographer_recharge_stop_guard
+STOP_GRACE_ATTEMPTS=80
+STOP_KILL_ATTEMPTS=30
+STOP_POLL_SEC=0.1
+
+STOP_ORDER=(
+  low-battery-auto-recharge.service
+  wheeltec-recharge-manager.service
+  bodyfollow-nav2.service
+  device-reporter.service
+)
+
+RESTART_ORDER=(
+  bodyfollow-nav2.service
+  wheeltec-recharge-manager.service
+  low-battery-auto-recharge.service
+  device-reporter.service
+)
+
+request_recharge_stop() {
+  if ! systemctl is-active --quiet "${RECHARGE_UNIT}"; then
+    return 0
+  fi
+  if [[ ! -x "${RECHARGE_STOP_HELPER}" ]]; then
+    echo "recharge stop helper is missing: ${RECHARGE_STOP_HELPER}" >&2
+    return 1
+  fi
+
+  timeout --signal=TERM 12s \
+    runuser -u wheeltec -- \
+      env HOME=/home/wheeltec ROS_DOMAIN_ID=0 ROS_LOCALHOST_ONLY=0 \
+      /bin/bash -c \
+      'source /opt/ros/humble/setup.bash
+       source /home/wheeltec/wheeltec_ros2/install/stemm_cartographer_exploration/share/stemm_cartographer_exploration/package.bash
+       exec /home/wheeltec/wheeltec_ros2/install/stemm_cartographer_exploration/lib/stemm_cartographer_exploration/stemm_cartographer_recharge_stop_guard'
+}
+
+read_unit_state() {
+  local unit=$1
+  UNIT_ACTIVE_STATE=
+  UNIT_MAIN_PID=
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      ActiveState) UNIT_ACTIVE_STATE=${value} ;;
+      MainPID) UNIT_MAIN_PID=${value} ;;
+    esac
+  done < <(systemctl show \
+    --property=ActiveState --property=MainPID "${unit}")
+}
+
+unit_is_stopped() {
+  local unit=$1
+  read_unit_state "${unit}"
+  [[ ("${UNIT_ACTIVE_STATE}" == inactive ||
+      "${UNIT_ACTIVE_STATE}" == failed) &&
+     "${UNIT_MAIN_PID}" == 0 ]]
+}
+
+wait_for_stopped() {
+  local unit=$1
+  local attempts=$2
+  local index
+  for ((index = 0; index < attempts; index += 1)); do
+    if unit_is_stopped "${unit}"; then
+      return 0
+    fi
+    sleep "${STOP_POLL_SEC}"
+  done
+  return 1
+}
+
+stop_unit() {
+  local unit=$1
+  echo "stopping feature service: ${unit}"
+  if unit_is_stopped "${unit}"; then
+    echo "feature service already stopped: ${unit}"
+    return 0
+  fi
+
+  if [[ "${unit}" == "${RECHARGE_UNIT}" ]]; then
+    request_recharge_stop
+  fi
+
+  systemctl stop --no-block "${unit}"
+  if ! wait_for_stopped "${unit}" "${STOP_GRACE_ATTEMPTS}"; then
+    read_unit_state "${unit}"
+    echo "graceful stop timed out; force-killing allowlisted feature service: ${unit} state=${UNIT_ACTIVE_STATE} pid=${UNIT_MAIN_PID}" >&2
+    if ! systemctl kill --kill-who=all --signal=KILL "${unit}"; then
+      echo "force-kill command reported failure; verifying final unit state: ${unit}" >&2
+    fi
+    systemctl stop --no-block "${unit}" || true
+    if ! wait_for_stopped "${unit}" "${STOP_KILL_ATTEMPTS}"; then
+      read_unit_state "${unit}"
+      echo "feature service did not stop after bounded force-kill: ${unit} state=${UNIT_ACTIVE_STATE} pid=${UNIT_MAIN_PID}" >&2
+      return 1
+    fi
+  fi
+
+  echo "stopped feature service: ${unit}"
+}
+
+restart_unit() {
+  local unit=$1
+  echo "restarting feature service: ${unit}"
+  if ! systemctl restart "${unit}"; then
+    echo "systemctl restart failed for feature service: ${unit}" >&2
+    return 1
+  fi
+  if ! systemctl is-active --quiet "${unit}"; then
+    read_unit_state "${unit}"
+    echo "feature service failed to restart: ${unit} state=${UNIT_ACTIVE_STATE} pid=${UNIT_MAIN_PID}" >&2
+    return 1
+  fi
+  echo "restarted feature service: ${unit}"
+}
+
+case "${1:-}" in
+  stop)
+    for unit in "${STOP_ORDER[@]}"; do
+      stop_unit "${unit}"
+    done
+    ;;
+  restart)
+    restart_status=0
+    for unit in "${RESTART_ORDER[@]}"; do
+      if ! restart_unit "${unit}"; then
+        restart_status=1
+      fi
+    done
+    exit "${restart_status}"
+    ;;
+  *)
+    echo "usage: $0 {stop|restart}" >&2
+    exit 64
+    ;;
+esac

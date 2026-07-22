@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+import math
+import time
+
+import rclpy
+from bodyreader_msg.msg import Bodyposture
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from std_msgs.msg import Bool, Int8, String, UInt32
+from std_srvs.srv import SetBool
+
+
+class VoiceSummonCoordinator(Node):
+    def __init__(self):
+        super().__init__('voice_summon_coordinator')
+
+        self.declare_parameter('summon_commands', ['小车过来'])
+        self.declare_parameter('pause_commands', ['小车停', '关闭跟随'])
+        self.declare_parameter('voice_words_topic', 'voice_words')
+        self.declare_parameter('awake_angle_topic', 'awake_angle')
+        self.declare_parameter('odom_topic', '/odom_combined')
+        self.declare_parameter('body_posture_topic', '/body_posture_yolo_validated')
+        self.declare_parameter('mode_topic', '/mode')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('feedback_topic', 'feedback_audio')
+        self.declare_parameter('follow_control_service', '/voice_summon/set_body_follow_enabled')
+        self.declare_parameter('search_feedback_audio', '/search_voice.wav')
+        self.declare_parameter('enable_turn_to_sound', True)
+        self.declare_parameter('enable_follow_without_fresh_angle', False)
+        self.declare_parameter('angle_fresh_timeout_s', 15.0)
+        self.declare_parameter('command_cooldown_s', 1.5)
+        self.declare_parameter('summon_lockout_s', 8.0)
+        self.declare_parameter('feedback_cooldown_s', 2.0)
+        self.declare_parameter('turn_angular_speed_rad_s', 0.5)
+        self.declare_parameter('min_turn_angle_deg', 5.0)
+        self.declare_parameter('max_turn_angle_deg', 180.0)
+        self.declare_parameter('turn_timeout_s', 12.0)
+        self.declare_parameter('turn_kp', 1.2)
+        self.declare_parameter('turn_min_angular_speed_rad_s', 0.12)
+        self.declare_parameter('turn_max_angular_accel_rad_s2', 0.8)
+        self.declare_parameter('turn_tolerance_deg', 3.0)
+        self.declare_parameter('turn_settle_time_s', 0.30)
+        self.declare_parameter('stop_angular_speed_rad_s', 0.05)
+        self.declare_parameter('stop_stable_time_s', 0.25)
+        self.declare_parameter('wait_stop_timeout_s', 2.0)
+        self.declare_parameter('odom_fresh_timeout_s', 0.25)
+        self.declare_parameter('mic_yaw_offset_deg', -20.0)
+        self.declare_parameter('mode_pause', 1)
+        self.declare_parameter('mode_follow', 2)
+        self.declare_parameter('follow_distance_m', 1.5)
+        self.declare_parameter('follow_complete_tolerance_m', 0.2)
+        self.declare_parameter('follow_complete_stable_s', 2.0)
+        self.declare_parameter('body_fresh_timeout_s', 0.8)
+        self.declare_parameter('publish_pause_on_start', True)
+        self.declare_parameter('publish_pause_while_idle', False)
+        self.declare_parameter('pause_heartbeat_s', 1.0)
+        self.declare_parameter('timer_period_s', 0.02)
+
+        self.summon_commands = set(self.get_parameter('summon_commands').value)
+        self.pause_commands = set(self.get_parameter('pause_commands').value)
+        self.enable_turn_to_sound = bool(self.get_parameter('enable_turn_to_sound').value)
+        self.enable_follow_without_fresh_angle = bool(
+            self.get_parameter('enable_follow_without_fresh_angle').value)
+        self.angle_fresh_timeout_s = float(self.get_parameter('angle_fresh_timeout_s').value)
+        self.command_cooldown_s = float(self.get_parameter('command_cooldown_s').value)
+        self.summon_lockout_s = float(self.get_parameter('summon_lockout_s').value)
+        self.feedback_cooldown_s = float(self.get_parameter('feedback_cooldown_s').value)
+        self.turn_angular_speed_rad_s = abs(float(self.get_parameter('turn_angular_speed_rad_s').value))
+        self.min_turn_angle_deg = float(self.get_parameter('min_turn_angle_deg').value)
+        self.max_turn_angle_deg = float(self.get_parameter('max_turn_angle_deg').value)
+        self.turn_timeout_s = max(1.0, float(self.get_parameter('turn_timeout_s').value))
+        self.turn_kp = max(0.0, float(self.get_parameter('turn_kp').value))
+        self.turn_min_angular_speed_rad_s = abs(float(
+            self.get_parameter('turn_min_angular_speed_rad_s').value))
+        self.turn_min_angular_speed_rad_s = min(
+            self.turn_min_angular_speed_rad_s, self.turn_angular_speed_rad_s)
+        self.turn_max_angular_accel_rad_s2 = max(
+            0.1, abs(float(self.get_parameter('turn_max_angular_accel_rad_s2').value)))
+        self.turn_tolerance_rad = math.radians(max(
+            0.5, float(self.get_parameter('turn_tolerance_deg').value)))
+        self.turn_settle_time_s = max(
+            0.05, float(self.get_parameter('turn_settle_time_s').value))
+        self.stop_angular_speed_rad_s = max(
+            0.01, abs(float(self.get_parameter('stop_angular_speed_rad_s').value)))
+        self.stop_stable_time_s = max(
+            0.05, float(self.get_parameter('stop_stable_time_s').value))
+        self.wait_stop_timeout_s = max(
+            0.5, float(self.get_parameter('wait_stop_timeout_s').value))
+        self.odom_fresh_timeout_s = max(
+            0.05, float(self.get_parameter('odom_fresh_timeout_s').value))
+        self.mic_yaw_offset_rad = math.radians(
+            float(self.get_parameter('mic_yaw_offset_deg').value))
+        self.mode_pause = int(self.get_parameter('mode_pause').value)
+        self.mode_follow = int(self.get_parameter('mode_follow').value)
+        self.follow_distance_m = float(self.get_parameter('follow_distance_m').value)
+        self.follow_complete_tolerance_m = float(self.get_parameter('follow_complete_tolerance_m').value)
+        self.follow_complete_stable_s = float(self.get_parameter('follow_complete_stable_s').value)
+        self.body_fresh_timeout_s = float(self.get_parameter('body_fresh_timeout_s').value)
+        self.publish_pause_on_start = bool(self.get_parameter('publish_pause_on_start').value)
+        self.publish_pause_while_idle = bool(self.get_parameter('publish_pause_while_idle').value)
+        self.pause_heartbeat_s = float(self.get_parameter('pause_heartbeat_s').value)
+        timer_period_s = float(self.get_parameter('timer_period_s').value)
+
+        self.latest_angle_deg = None
+        self.latest_angle_monotonic = None
+        self.latest_angle_reference_yaw = None
+        self.latest_odom_yaw = None
+        self.latest_odom_angular_z = 0.0
+        self.latest_odom_monotonic = None
+        self.latest_body_id = None
+        self.latest_body_distance_m = None
+        self.latest_body_monotonic = None
+        self.state = 'idle'
+        self.follow_enabled = False
+        self.follow_monitor_enabled = False
+        self.follow_stable_body_id = None
+        self.follow_stable_since = 0.0
+        self.turn_target_yaw = None
+        self.turn_start_yaw = None
+        self.turn_relative_angle_rad = 0.0
+        self.wait_stop_deadline_monotonic = 0.0
+        self.stop_stable_since = 0.0
+        self.turn_started_monotonic = 0.0
+        self.turn_deadline_monotonic = 0.0
+        self.turn_settle_since = 0.0
+        self.last_turn_control_monotonic = 0.0
+        self.last_turn_command_wz = 0.0
+        self.last_turn_progress_log = 0.0
+        self.last_command_at = {}
+        self.last_feedback_at = {}
+        self.last_summon_started_at = 0.0
+        self.last_pause_publish = 0.0
+        self.mapping_motion_blocked = False
+
+        mode_topic = self.get_parameter('mode_topic').value
+        self.mode_pub = self.create_publisher(Int8, mode_topic, 10)
+        self.cmd_vel_pub = self.create_publisher(Twist, self.get_parameter('cmd_vel_topic').value, 10)
+        self.feedback_pub = self.create_publisher(String, self.get_parameter('feedback_topic').value, 10)
+
+        self.voice_sub = self.create_subscription(
+            String,
+            self.get_parameter('voice_words_topic').value,
+            self._voice_words_callback,
+            10,
+        )
+        self.mapping_gate_sub = self.create_subscription(
+            Bool,
+            '/stemm_cartographer/motion_blocked',
+            self._mapping_motion_blocked_callback,
+            10,
+        )
+        self.angle_sub = self.create_subscription(
+            UInt32,
+            self.get_parameter('awake_angle_topic').value,
+            self._awake_angle_callback,
+            10,
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            self.get_parameter('odom_topic').value,
+            self._odom_callback,
+            20,
+        )
+        self.body_sub = self.create_subscription(
+            Bodyposture,
+            self.get_parameter('body_posture_topic').value,
+            self._body_posture_callback,
+            10,
+        )
+        self.follow_control_srv = self.create_service(
+            SetBool,
+            self.get_parameter('follow_control_service').value,
+            self._follow_control_callback,
+        )
+        self.timer = self.create_timer(timer_period_s, self._timer_callback)
+
+        if self.publish_pause_on_start:
+            self._set_follow_enabled(False, 'startup_pause', monitor_completion=False)
+
+        self.get_logger().info(
+            'voice_summon_coordinator ready: summon=%s pause=%s enable_turn=%s '
+            'angle_timeout=%.1fs odom=%s max_wz=%.2f tol=%.1fdeg '
+            'mode_pause=%d mode_follow=%d follow_distance=%.2fm stable=%.1fs'
+            % (
+                sorted(self.summon_commands),
+                sorted(self.pause_commands),
+                self.enable_turn_to_sound,
+                self.angle_fresh_timeout_s,
+                self.get_parameter('odom_topic').value,
+                self.turn_angular_speed_rad_s,
+                math.degrees(self.turn_tolerance_rad),
+                self.mode_pause,
+                self.mode_follow,
+                self.follow_distance_m,
+                self.follow_complete_stable_s,
+            )
+        )
+
+    def _awake_angle_callback(self, msg):
+        now = time.monotonic()
+        self.latest_angle_deg = int(msg.data) % 360
+        self.latest_angle_monotonic = now
+        if self._odom_is_fresh(now):
+            self.latest_angle_reference_yaw = self.latest_odom_yaw
+        else:
+            self.latest_angle_reference_yaw = None
+            self.get_logger().warn(
+                'awake_angle=%d received without fresh odometry' % self.latest_angle_deg)
+
+    def _odom_callback(self, msg):
+        orientation = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (
+            orientation.w * orientation.z + orientation.x * orientation.y)
+        cosy_cosp = 1.0 - 2.0 * (
+            orientation.y * orientation.y + orientation.z * orientation.z)
+        self.latest_odom_yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.latest_odom_angular_z = float(msg.twist.twist.angular.z)
+        self.latest_odom_monotonic = time.monotonic()
+
+    @staticmethod
+    def _normalize_angle(angle_rad):
+        return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+    def _odom_is_fresh(self, now):
+        return (
+            self.latest_odom_yaw is not None
+            and self.latest_odom_monotonic is not None
+            and now - self.latest_odom_monotonic <= self.odom_fresh_timeout_s
+        )
+
+    def _reset_follow_observation(self):
+        self.latest_body_id = None
+        self.latest_body_distance_m = None
+        self.latest_body_monotonic = None
+        self.follow_stable_body_id = None
+        self.follow_stable_since = 0.0
+
+    def _body_posture_callback(self, msg):
+        if self.state != 'following' or not self.follow_monitor_enabled:
+            return
+
+        if msg.lock_status != 2 or msg.centerofmass_z <= 100.0:
+            self._reset_follow_observation()
+            return
+
+        body_id = int(msg.bodyid)
+        if self.latest_body_id is not None and body_id != self.latest_body_id:
+            self.get_logger().warn(
+                'Reset summon completion stability because validated body changed: %d -> %d'
+                % (self.latest_body_id, body_id)
+            )
+            self.follow_stable_body_id = None
+            self.follow_stable_since = 0.0
+
+        self.latest_body_id = body_id
+        self.latest_body_distance_m = float(msg.centerofmass_z) * 0.001
+        self.latest_body_monotonic = time.monotonic()
+
+    def _follow_control_callback(self, request, response):
+        enabled = bool(request.data)
+        if enabled and self.mapping_motion_blocked:
+            self._set_follow_enabled(
+                False, 'mapping_motion_gate', monitor_completion=False)
+            response.success = False
+            response.message = 'body follow blocked during Cartographer mapping'
+            return response
+        self._set_follow_enabled(enabled, 'setbool_service', monitor_completion=False)
+        response.success = True
+        response.message = 'body follow %s' % ('enabled' if enabled else 'disabled')
+        return response
+
+    def _mapping_motion_blocked_callback(self, msg):
+        blocked = bool(msg.data)
+        if blocked and not self.mapping_motion_blocked:
+            self.get_logger().warn(
+                'Cartographer mapping gate active; stop voice summon/follow.')
+            self.mapping_motion_blocked = True
+            self._set_follow_enabled(
+                False, 'mapping_motion_gate', monitor_completion=False)
+            return
+        self.mapping_motion_blocked = blocked
+
+    def _voice_words_callback(self, msg):
+        command = msg.data.strip()
+        if not command:
+            return
+
+        if command == '小车休眠':
+            self.get_logger().info(
+                'Ignore voice module sleep; keep current body follow state'
+            )
+            return
+
+        if command in self.pause_commands:
+            if self._in_cooldown(command):
+                return
+            self._set_follow_enabled(False, 'voice_pause:%s' % command, monitor_completion=False)
+            return
+
+        if command in self.summon_commands:
+            if self.mapping_motion_blocked:
+                self.get_logger().warn(
+                    'Reject voice summon while Cartographer mapping owns motion.')
+                self._publish_feedback('/stop.wav')
+                return
+            if self._in_cooldown(command) or self._summon_locked_out(command):
+                return
+            self._start_summon(command)
+            return
+
+        if self.state in ('waiting_stop', 'turning', 'following'):
+            self.get_logger().info('Leave voice summon flow on non-summon command: %s' % command)
+            self._set_follow_enabled(False, 'non_summon_command:%s' % command, monitor_completion=False)
+
+    def _in_cooldown(self, command):
+        now = time.monotonic()
+        last = self.last_command_at.get(command, 0.0)
+        if now - last < self.command_cooldown_s:
+            self.get_logger().info('Ignore repeated command in cooldown: %s' % command)
+            return True
+        self.last_command_at[command] = now
+        return False
+
+    def _summon_locked_out(self, command):
+        now = time.monotonic()
+        if self.state in ('waiting_stop', 'turning'):
+            self.get_logger().info('Ignore summon while sound turn is active: %s' % command)
+            return True
+
+        if self.state == 'following' and now - self.last_summon_started_at < self.summon_lockout_s:
+            self.get_logger().info(
+                'Ignore summon during lockout: %s age=%.2fs lockout=%.2fs'
+                % (command, now - self.last_summon_started_at, self.summon_lockout_s)
+            )
+            return True
+
+        return False
+
+    def _start_summon(self, command):
+        if self.mapping_motion_blocked:
+            self.get_logger().warn(
+                'Ignore summon start because mapping motion gate is active.')
+            return
+        self.last_summon_started_at = time.monotonic()
+        self.follow_monitor_enabled = False
+        self.follow_stable_since = 0.0
+        self.get_logger().info('Start voice summon from command: %s' % command)
+        self._set_follow_enabled(
+            False, 'pause_before_closed_loop_turn', monitor_completion=False)
+        self._publish_feedback(self.get_parameter('search_feedback_audio').value)
+
+        target = self._make_target_from_latest_angle()
+        if target is None:
+            if self.enable_follow_without_fresh_angle:
+                self.get_logger().warn(
+                    'Cannot prepare closed-loop sound turn; enable body follow without turn.')
+                self._set_follow_enabled(
+                    True, 'turn_target_unavailable', monitor_completion=True)
+            else:
+                self.get_logger().warn(
+                    'Cannot prepare closed-loop sound turn; keep body follow disabled.')
+                self._set_follow_enabled(
+                    False, 'turn_target_unavailable', monitor_completion=False)
+            return
+
+        relative_angle_rad, target_yaw = target
+        relative_angle_deg = abs(math.degrees(relative_angle_rad))
+        if relative_angle_deg < self.min_turn_angle_deg:
+            self.get_logger().info(
+                'Sound target is inside deadband: relative=%.2fdeg target_yaw=%.2fdeg'
+                % (math.degrees(relative_angle_rad), math.degrees(target_yaw)))
+            self._set_follow_enabled(
+                True, 'angle_deadband', monitor_completion=True)
+            return
+
+        now = time.monotonic()
+        self.turn_target_yaw = target_yaw
+        self.turn_relative_angle_rad = relative_angle_rad
+        self.wait_stop_deadline_monotonic = now + self.wait_stop_timeout_s
+        self.stop_stable_since = 0.0
+        self.turn_settle_since = 0.0
+        self.last_turn_command_wz = 0.0
+        self.last_turn_control_monotonic = now
+        self.last_turn_progress_log = 0.0
+        self.state = 'waiting_stop'
+        self.get_logger().info(
+            'VOICE_TURN_WAIT_STOP awake_angle=%d relative_deg=%.2f target_yaw_deg=%.2f'
+            % (
+                self.latest_angle_deg,
+                math.degrees(relative_angle_rad),
+                math.degrees(target_yaw),
+            )
+        )
+
+    def _make_target_from_latest_angle(self):
+        if not self.enable_turn_to_sound:
+            self.get_logger().warn('Closed-loop sound turn is disabled by parameter')
+            return None
+        if self.latest_angle_deg is None or self.latest_angle_monotonic is None:
+            self.get_logger().warn('No awake_angle has been received')
+            return None
+
+        now = time.monotonic()
+        age_s = now - self.latest_angle_monotonic
+        if age_s > self.angle_fresh_timeout_s:
+            self.get_logger().warn(
+                'Ignore stale awake_angle=%d age=%.2fs'
+                % (self.latest_angle_deg, age_s)
+            )
+            return None
+        if not self._odom_is_fresh(now):
+            self.get_logger().error('Cannot turn because /odom_combined is stale')
+            return None
+        if self.latest_angle_reference_yaw is None:
+            self.get_logger().error(
+                'Cannot turn because awake_angle has no synchronized odom yaw')
+            return None
+
+        raw_angle = self.latest_angle_deg % 360
+        relative_deg = float(raw_angle if raw_angle <= 180 else raw_angle - 360)
+        relative_deg = max(
+            -self.max_turn_angle_deg, min(self.max_turn_angle_deg, relative_deg))
+        relative_angle_rad = self._normalize_angle(
+            -math.radians(relative_deg) + self.mic_yaw_offset_rad)
+        target_yaw = self._normalize_angle(
+            self.latest_angle_reference_yaw + relative_angle_rad)
+        return relative_angle_rad, target_yaw
+
+    def _wait_for_stop(self, now):
+        self._publish_turn_command(0.0)
+        if not self._odom_is_fresh(now):
+            self._abort_turn('odom_stale_while_waiting_stop')
+            return
+        if now >= self.wait_stop_deadline_monotonic:
+            self._abort_turn('wait_stop_timeout')
+            return
+
+        if abs(self.latest_odom_angular_z) <= self.stop_angular_speed_rad_s:
+            if self.stop_stable_since <= 0.0:
+                self.stop_stable_since = now
+            elif now - self.stop_stable_since >= self.stop_stable_time_s:
+                self._begin_closed_loop_turn(now)
+            return
+
+        self.stop_stable_since = 0.0
+
+    def _begin_closed_loop_turn(self, now):
+        if self.turn_target_yaw is None or not self._odom_is_fresh(now):
+            self._abort_turn('turn_start_without_fresh_target_or_odom')
+            return
+
+        self.turn_start_yaw = self.latest_odom_yaw
+        initial_error = self._normalize_angle(
+            self.turn_target_yaw - self.latest_odom_yaw)
+        estimated_timeout_s = max(
+            3.0,
+            abs(initial_error) / max(self.turn_angular_speed_rad_s, 0.01) * 2.5
+            + 2.0,
+        )
+        self.turn_started_monotonic = now
+        self.turn_deadline_monotonic = now + min(
+            self.turn_timeout_s, estimated_timeout_s)
+        self.turn_settle_since = 0.0
+        self.last_turn_control_monotonic = now
+        self.last_turn_command_wz = 0.0
+        self.last_turn_progress_log = 0.0
+        self.state = 'turning'
+        self.get_logger().info(
+            'VOICE_TURN_START start_yaw_deg=%.2f target_yaw_deg=%.2f '
+            'initial_error_deg=%.2f timeout_s=%.2f'
+            % (
+                math.degrees(self.turn_start_yaw),
+                math.degrees(self.turn_target_yaw),
+                math.degrees(initial_error),
+                self.turn_deadline_monotonic - now,
+            )
+        )
+
+    def _run_closed_loop_turn(self, now):
+        if not self._odom_is_fresh(now):
+            self._abort_turn('odom_stale_while_turning')
+            return
+        if now >= self.turn_deadline_monotonic:
+            self._abort_turn('turn_timeout')
+            return
+
+        error = self._normalize_angle(
+            self.turn_target_yaw - self.latest_odom_yaw)
+        if abs(error) <= self.turn_tolerance_rad:
+            self._publish_turn_command(0.0)
+            self.last_turn_command_wz = 0.0
+            self.last_turn_control_monotonic = now
+            if abs(self.latest_odom_angular_z) <= self.stop_angular_speed_rad_s:
+                if self.turn_settle_since <= 0.0:
+                    self.turn_settle_since = now
+                elif now - self.turn_settle_since >= self.turn_settle_time_s:
+                    self._finish_closed_loop_turn(now)
+            else:
+                self.turn_settle_since = 0.0
+            return
+
+        self.turn_settle_since = 0.0
+        desired_wz = max(
+            -self.turn_angular_speed_rad_s,
+            min(self.turn_angular_speed_rad_s, self.turn_kp * error),
+        )
+        if (
+            abs(desired_wz) < self.turn_min_angular_speed_rad_s
+            and self.turn_min_angular_speed_rad_s > 0.0
+        ):
+            desired_wz = math.copysign(
+                self.turn_min_angular_speed_rad_s, error)
+
+        dt = max(0.005, min(0.10, now - self.last_turn_control_monotonic))
+        max_delta = self.turn_max_angular_accel_rad_s2 * dt
+        command_wz = max(
+            self.last_turn_command_wz - max_delta,
+            min(self.last_turn_command_wz + max_delta, desired_wz),
+        )
+        self._publish_turn_command(command_wz)
+        self.last_turn_command_wz = command_wz
+        self.last_turn_control_monotonic = now
+
+        if now - self.last_turn_progress_log >= 0.50:
+            self.last_turn_progress_log = now
+            self.get_logger().info(
+                'VOICE_TURN_PROGRESS current_yaw_deg=%.2f error_deg=%.2f '
+                'command_wz=%.3f measured_wz=%.3f'
+                % (
+                    math.degrees(self.latest_odom_yaw),
+                    math.degrees(error),
+                    command_wz,
+                    self.latest_odom_angular_z,
+                )
+            )
+
+    def _finish_closed_loop_turn(self, now):
+        final_error = self._normalize_angle(
+            self.turn_target_yaw - self.latest_odom_yaw)
+        actual_delta = self._normalize_angle(
+            self.latest_odom_yaw - self.turn_start_yaw)
+        duration_s = now - self.turn_started_monotonic
+        self.get_logger().info(
+            'VOICE_TURN_END result=ok actual_delta_deg=%.2f '
+            'final_error_deg=%.2f duration_s=%.2f'
+            % (
+                math.degrees(actual_delta),
+                math.degrees(final_error),
+                duration_s,
+            )
+        )
+        self._publish_turn_command(0.0)
+        self._reset_turn_tracking()
+        self._set_follow_enabled(
+            True, 'closed_loop_turn_complete', monitor_completion=True)
+
+    def _abort_turn(self, reason):
+        error_deg = float('nan')
+        if self.turn_target_yaw is not None and self.latest_odom_yaw is not None:
+            error_deg = math.degrees(self._normalize_angle(
+                self.turn_target_yaw - self.latest_odom_yaw))
+        self.get_logger().error(
+            'VOICE_TURN_END result=aborted reason=%s final_error_deg=%.2f'
+            % (reason, error_deg)
+        )
+        self._publish_turn_command(0.0)
+        self._reset_turn_tracking()
+        self._set_follow_enabled(
+            False, 'closed_loop_turn_abort:%s' % reason,
+            monitor_completion=False)
+
+    def _publish_turn_command(self, angular_z):
+        twist = Twist()
+        twist.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(twist)
+
+    def _reset_turn_tracking(self):
+        self.turn_target_yaw = None
+        self.turn_start_yaw = None
+        self.turn_relative_angle_rad = 0.0
+        self.wait_stop_deadline_monotonic = 0.0
+        self.stop_stable_since = 0.0
+        self.turn_started_monotonic = 0.0
+        self.turn_deadline_monotonic = 0.0
+        self.turn_settle_since = 0.0
+        self.last_turn_control_monotonic = 0.0
+        self.last_turn_command_wz = 0.0
+        self.last_turn_progress_log = 0.0
+
+    def _timer_callback(self):
+        if self.mapping_motion_blocked:
+            return
+        now = time.monotonic()
+        if self.state == 'waiting_stop':
+            self._wait_for_stop(now)
+            return
+
+        if self.state == 'turning':
+            self._run_closed_loop_turn(now)
+            return
+
+        if self.state == 'following' and self.follow_monitor_enabled:
+            self._check_follow_complete(now)
+            return
+
+        if self.state == 'idle' and self.publish_pause_while_idle:
+            if now - self.last_pause_publish >= self.pause_heartbeat_s:
+                self._publish_mode(self.mode_pause, 'idle_pause_heartbeat')
+
+    def _check_follow_complete(self, now):
+        if (
+            self.latest_body_id is None
+            or self.latest_body_distance_m is None
+            or self.latest_body_monotonic is None
+        ):
+            self.follow_stable_body_id = None
+            self.follow_stable_since = 0.0
+            return
+
+        if now - self.latest_body_monotonic > self.body_fresh_timeout_s:
+            self.follow_stable_body_id = None
+            self.follow_stable_since = 0.0
+            return
+
+        error_m = abs(self.latest_body_distance_m - self.follow_distance_m)
+        if error_m <= self.follow_complete_tolerance_m:
+            if (
+                self.follow_stable_body_id != self.latest_body_id
+                or self.follow_stable_since <= 0.0
+            ):
+                self.follow_stable_body_id = self.latest_body_id
+                self.follow_stable_since = now
+                return
+            stable_s = now - self.follow_stable_since
+            if stable_s >= self.follow_complete_stable_s:
+                self.get_logger().info(
+                    'Summon follow complete: body_id=%d distance=%.2fm target=%.2fm stable=%.2fs'
+                    % (
+                        self.latest_body_id,
+                        self.latest_body_distance_m,
+                        self.follow_distance_m,
+                        stable_s,
+                    )
+                )
+                self._set_follow_enabled(False, 'summon_follow_complete', monitor_completion=False)
+            return
+
+        self.follow_stable_body_id = None
+        self.follow_stable_since = 0.0
+
+    def _set_follow_enabled(self, enabled, reason, monitor_completion=False):
+        self.follow_enabled = bool(enabled)
+        self.follow_monitor_enabled = bool(enabled and monitor_completion)
+        self._reset_follow_observation()
+
+        if enabled:
+            self.state = 'following' if monitor_completion else 'idle'
+            self._publish_stop_cmd()
+            self._publish_mode(self.mode_follow, reason)
+            self.get_logger().info('Body follow enabled: %s monitor=%s' % (reason, monitor_completion))
+            return
+
+        self.state = 'idle'
+        self._reset_turn_tracking()
+        self._publish_stop_cmd()
+        self._publish_mode(self.mode_pause, reason)
+        self.get_logger().info('Body follow disabled: %s' % reason)
+
+    def _publish_mode(self, value, reason):
+        msg = Int8()
+        msg.data = int(value)
+        self.mode_pub.publish(msg)
+        if int(value) == self.mode_pause:
+            self.last_pause_publish = time.monotonic()
+        self.get_logger().debug('Publish /mode=%d reason=%s' % (value, reason))
+
+    def _publish_stop_cmd(self):
+        self.cmd_vel_pub.publish(Twist())
+
+    def _publish_feedback(self, audio_file):
+        if not audio_file:
+            return
+
+        now = time.monotonic()
+        last = self.last_feedback_at.get(audio_file, 0.0)
+        if now - last < self.feedback_cooldown_s:
+            self.get_logger().info('Ignore repeated feedback audio: %s' % audio_file)
+            return
+
+        self.last_feedback_at[audio_file] = now
+        msg = String()
+        msg.data = audio_file
+        self.feedback_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VoiceSummonCoordinator()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if rclpy.ok():
+            node._publish_stop_cmd()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

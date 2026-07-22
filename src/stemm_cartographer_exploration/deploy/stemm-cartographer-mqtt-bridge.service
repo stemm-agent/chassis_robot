@@ -1,0 +1,25 @@
+[Unit]
+Description=STEMM Cartographer MQTT Launch Bridge
+After=network.target mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/opt/demo-control/jetson-agent
+Environment=MQTT_BROKER_HOST=127.0.0.1
+Environment=MQTT_BROKER_PORT=1883
+Environment=MQTT_DEVICE_ID=robot-001-cartographer
+Environment=MQTT_COMMAND_TOPIC=robot/robot-001/cartographer/launch/command
+Environment=MQTT_STATUS_TOPIC=robot/robot-001/cartographer/launch/status
+Environment=MQTT_HEARTBEAT_TOPIC=robot/robot-001/cartographer/heartbeat
+Environment=MQTT_ERROR_TOPIC=robot/robot-001/cartographer/error
+Environment=MQTT_ALLOWED_LAUNCH_TARGETS=stemm_cartographer_exploration:stemm_cartographer_session.launch.py
+Environment=MQTT_ALLOWED_NODE_TARGETS=disabled:none
+Environment=MQTT_ALLOWED_SERVICE_TARGETS=/stemm_cartographer/start_mapping:std_srvs/srv/Trigger,/stemm_cartographer/save_map:std_srvs/srv/Trigger,/stemm_cartographer/stop_navigation:std_srvs/srv/Trigger,/stemm_cartographer/set_mapping_done:std_srvs/srv/SetBool,/stemm_cartographer/save_state:std_srvs/srv/Trigger
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/wheeltec/wheeltec_ros2/install/setup.bash && exec /opt/demo-control/.venv/bin/python /opt/demo-control/jetson-agent/launch_mqtt_bridge.py'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

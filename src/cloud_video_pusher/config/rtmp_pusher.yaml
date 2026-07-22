@@ -1,0 +1,22 @@
+rtmp_image_pusher:
+  ros__parameters:
+    image_topic: /camera/color/image_raw
+    rtmp_url: ""
+    media_host: ""
+    rtmp_base_url: ""
+    hls_base_url: ""
+    stream_app: live
+    stream_name: robot001
+    hub_id: "910007"
+    camera_device_id: robot-camera-1
+    session_ttl_seconds: 60
+    upload_interval_ms: 15000
+    width: 640
+    height: 480
+    fps: 15.0
+    bitrate: 800k
+    gop: 30
+    ffmpeg_path: ffmpeg
+    auto_start: true
+    restart_on_failure: true
+    restart_interval_sec: 3.0

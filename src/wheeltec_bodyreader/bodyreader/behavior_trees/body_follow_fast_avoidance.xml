@@ -1,0 +1,55 @@
+<!--
+  Body-follow avoidance tree.
+
+  The lidar obstacle that triggers avoidance can leave the robot start cell
+  blocked in the global dynamic costmap. Clear that layer before the first
+  planning attempt instead of waiting for the 5 second planner timeout.
+  The local costmap remains active for collision avoidance.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="0.05" name="RateControllerComputePathToPose">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <Fallback name="ComputePathIfNeeded">
+              <ReactiveSequence name="UseCurrentPathIfValid">
+                <Inverter>
+                  <GlobalUpdatedGoal/>
+                </Inverter>
+                <IsPathValid path="{path}"/>
+              </ReactiveSequence>
+              <Sequence name="ClearGlobalCostmapBeforePlanning">
+                <ClearEntireCostmap
+                  name="ClearGlobalCostmap-BeforePlanning"
+                  service_name="global_costmap/clear_entirely_global_costmap"/>
+                <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              </Sequence>
+            </Fallback>
+            <ClearEntireCostmap
+              name="ClearGlobalCostmap-Context"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap
+            name="ClearLocalCostmap-Context"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Spin spin_dist="1.57"/>
+          <Wait wait_duration="5"/>
+          <Wait wait_duration="1.0"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
