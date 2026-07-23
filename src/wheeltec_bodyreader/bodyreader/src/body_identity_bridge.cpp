@@ -61,6 +61,8 @@ public:
     appearance_accept_score_ = declare_parameter<double>("appearance_accept_score", 1.35);
     bound_appearance_accept_score_ =
       declare_parameter<double>("bound_appearance_accept_score", 1.15);
+    identity_validation_grace_s_ =
+      std::max(0.0, declare_parameter<double>("identity_validation_grace_s", 0.5));
     reacquire_candidate_margin_ =
       declare_parameter<double>("reacquire_candidate_margin", 0.18);
     reacquire_confirm_frames_ = static_cast<int>(
@@ -102,6 +104,7 @@ public:
     last_features_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_recovery_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_lock_command_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    last_validated_body_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     yolo_without_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_astra_restart_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
 
@@ -359,6 +362,25 @@ private:
         tracking_appearance_matches(match.yolo);
     }
 
+    if (yolo_validated) {
+      last_validated_body_time_ = t;
+    } else {
+      const bool same_locked_body =
+        has_identity_ && msg->lock_status == 2 && msg->bodyid == target_body_id_ &&
+        msg->centerofmass_z > 100.0f;
+      const bool within_validation_grace =
+        last_validated_body_time_.nanoseconds() != 0 &&
+        (t - last_validated_body_time_).seconds() <= identity_validation_grace_s_;
+      if (same_locked_body && within_validation_grace) {
+        yolo_validated = true;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Identity validation grace active for body=%d (age=%.3fs limit=%.3fs)",
+          msg->bodyid, (t - last_validated_body_time_).seconds(),
+          identity_validation_grace_s_);
+      }
+    }
+
     auto validated = *msg;
     if (!yolo_validated) {
       validated.lock_status = 0;
@@ -593,6 +615,21 @@ private:
     if (!has_signature_) {
       return choice;
     }
+
+    // When the original locked track is still present, keep it authoritative.
+    // Duplicate detections of the same person must not make the identity ambiguous,
+    // and the bound-track threshold should remain consistent during body-ID rebinding.
+    for (const auto & target : yolo_targets_) {
+      if (!is_bound_yolo_track(target)) {
+        continue;
+      }
+      choice.best_score = appearance_score(target);
+      if (choice.best_score <= bound_appearance_accept_score_) {
+        choice.target = &target;
+      }
+      return choice;
+    }
+
     for (const auto & target : yolo_targets_) {
       const double score = appearance_score(target);
       if (score < choice.best_score) {
@@ -793,6 +830,7 @@ private:
     last_features_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_recovery_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_lock_command_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    last_validated_body_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     yolo_without_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_astra_restart_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     astra_restart_count_ = 0;
@@ -941,7 +979,7 @@ private:
 
     const Match match = match_yolo_to_body(*choice.target);
     if (match.valid && match.score <= reacquire_accept_score_ &&
-        appearance_matches(match.yolo)) {
+        tracking_appearance_matches(match.yolo)) {
       if (confirm_rebind(match)) {
         publish_recovery_id(target_body_id_, "identity_reacquired");
       }
@@ -1024,6 +1062,7 @@ private:
   double reacquire_accept_score_{1.65};
   double appearance_accept_score_{1.35};
   double bound_appearance_accept_score_{1.15};
+  double identity_validation_grace_s_{0.5};
   double reacquire_candidate_margin_{0.18};
   bool require_yolo_for_initial_lock_{true};
   int initial_confirm_frames_{4};
@@ -1056,6 +1095,7 @@ private:
   rclcpp::Time last_features_time_;
   rclcpp::Time last_recovery_time_;
   rclcpp::Time last_lock_command_time_;
+  rclcpp::Time last_validated_body_time_;
   rclcpp::Time yolo_without_body_since_;
   rclcpp::Time last_astra_restart_time_;
 
