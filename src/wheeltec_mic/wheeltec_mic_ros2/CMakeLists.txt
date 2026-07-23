@@ -82,6 +82,7 @@ install(PROGRAMS
   scripts/voice_cartographer_bridge
   scripts/nav2_start_feedback_monitor
   scripts/voice_summon_coordinator
+  scripts/voice_summon_shadow_logger
   DESTINATION lib/${PROJECT_NAME})
 
 install(FILES
