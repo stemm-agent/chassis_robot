@@ -83,6 +83,7 @@ install(PROGRAMS
   scripts/nav2_start_feedback_monitor
   scripts/voice_summon_coordinator
   scripts/voice_summon_shadow_logger
+  scripts/voice_summon_bearing_search_shadow
   DESTINATION lib/${PROJECT_NAME})
 
 install(FILES

@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Read-only bearing-only search policy observer for voice summon.
+
+This node never publishes cmd_vel, /mode, or action goals.  It emits the
+in-place search turns that a later controlled version would recommend, while
+allowing every validated visual lock to preempt the simulated search instantly.
+"""
+
+import json
+import math
+import os
+import time
+
+import rclpy
+from bodyreader_msg.msg import Bodyposture
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from std_msgs.msg import Int8, String, UInt32
+
+
+def normal_cdf(value):
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+class BearingSearchShadow(Node):
+    """Models the post-turn search branch without taking control of the robot."""
+
+    def __init__(self):
+        super().__init__('voice_summon_bearing_search_shadow')
+        self.declare_parameter('enabled', True)
+        self.declare_parameter('summon_commands', ['小车过来'])
+        self.declare_parameter('awake_angle_topic', 'awake_angle')
+        self.declare_parameter('voice_words_topic', 'voice_words')
+        self.declare_parameter('mode_topic', '/mode')
+        self.declare_parameter('body_posture_topic', '/body_posture_yolo_validated')
+        self.declare_parameter('mode_follow', 2)
+        self.declare_parameter('angle_fresh_timeout_s', 15.0)
+        self.declare_parameter('initial_visual_wait_s', 0.80)
+        self.declare_parameter('search_dwell_s', 0.80)
+        self.declare_parameter('camera_half_fov_deg', 30.0)
+        self.declare_parameter('bearing_sigma_deg', 4.0)
+        self.declare_parameter('visual_miss_likelihood', 0.05)
+        self.declare_parameter('max_search_candidates', 5)
+        self.declare_parameter('log_dir', '/home/wheeltec/.ros/voice_summon_shadow')
+        self.declare_parameter('log_filename', 'bearing_search_decisions.jsonl')
+
+        self.enabled = bool(self.get_parameter('enabled').value)
+        self.summon_commands = set(self.get_parameter('summon_commands').value)
+        self.angle_fresh_timeout_s = float(self.get_parameter('angle_fresh_timeout_s').value)
+        self.initial_visual_wait_s = float(self.get_parameter('initial_visual_wait_s').value)
+        self.search_dwell_s = float(self.get_parameter('search_dwell_s').value)
+        self.camera_half_fov_deg = float(self.get_parameter('camera_half_fov_deg').value)
+        self.bearing_sigma_deg = max(0.1, float(self.get_parameter('bearing_sigma_deg').value))
+        self.visual_miss_likelihood = min(1.0, max(0.0, float(self.get_parameter('visual_miss_likelihood').value)))
+        self.max_candidates = max(1, int(self.get_parameter('max_search_candidates').value))
+        log_dir = os.path.abspath(str(self.get_parameter('log_dir').value))
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        self.log_path = os.path.join(log_dir, str(self.get_parameter('log_filename').value))
+
+        self.latest_angle_deg = None
+        self.latest_angle_monotonic = 0.0
+        self.session = None
+        self.sequence = 0
+
+        self.create_subscription(UInt32, self.get_parameter('awake_angle_topic').value, self._angle_cb, 20)
+        self.create_subscription(String, self.get_parameter('voice_words_topic').value, self._voice_cb, 20)
+        self.create_subscription(Int8, self.get_parameter('mode_topic').value, self._mode_cb, 20)
+        self.create_subscription(Bodyposture, self.get_parameter('body_posture_topic').value, self._body_cb, 30)
+        self.status_pub = self.create_publisher(String, '/voice_summon/bearing_search_shadow_status', 10)
+        self.decision_pub = self.create_publisher(String, '/voice_summon/bearing_search_shadow_decision', 10)
+        self.create_timer(0.05, self._timer_cb)
+        self.get_logger().info('Bearing-only search shadow ready: %s' % self.log_path)
+
+    def _angle_cb(self, msg):
+        self.latest_angle_deg = int(msg.data) % 360
+        self.latest_angle_monotonic = time.monotonic()
+
+    def _voice_cb(self, msg):
+        if not self.enabled or msg.data.strip() not in self.summon_commands:
+            return
+        now = time.monotonic()
+        if self.session is not None:
+            self._finish('superseded_by_new_summon')
+        self.sequence += 1
+        fresh = self.latest_angle_deg is not None and now - self.latest_angle_monotonic <= self.angle_fresh_timeout_s
+        angle = self.latest_angle_deg if fresh else None
+        self.session = {
+            'session_id': 'bearing-shadow-%d-%04d' % (int(time.time() * 1000), self.sequence),
+            'command_unix_s': time.time(),
+            'state': 'await_mode2',
+            'awake_angle_deg': angle,
+            'candidate_offsets_deg': self._candidate_offsets(),
+            'visited_offsets_deg': [],
+            'posterior': self._initial_posterior(),
+            'candidate_started_monotonic': None,
+            'candidate_offset_deg': None,
+        }
+        self._publish_status('session_started')
+        if not fresh:
+            self._finish('stale_or_missing_awake_angle')
+
+    def _mode_cb(self, msg):
+        if self.session is None or self.session['state'] != 'await_mode2':
+            return
+        if int(msg.data) != int(self.get_parameter('mode_follow').value):
+            return
+        self.session['state'] = 'observe_initial_view'
+        self._start_candidate(0.0, 'initial_acoustic_heading')
+
+    def _body_cb(self, msg):
+        if self.session is None or self.session['state'] not in ('observe_initial_view', 'recommend_search_turn'):
+            return
+        if msg.lock_status != 2 or msg.centerofmass_z <= 100.0:
+            return
+        now = time.monotonic()
+        started = self.session['candidate_started_monotonic']
+        self.session['visual_body_id'] = int(msg.bodyid)
+        self.session['visual_preempt_latency_s'] = now - started if started is not None else None
+        self._finish('visual_lock_preempts_search')
+
+    def _timer_cb(self):
+        if self.session is None:
+            return
+        if self.session['state'] == 'await_mode2':
+            return
+        now = time.monotonic()
+        wait_s = self.initial_visual_wait_s if self.session['state'] == 'observe_initial_view' else self.search_dwell_s
+        if now - self.session['candidate_started_monotonic'] < wait_s:
+            return
+        self._apply_visual_miss(self.session['candidate_offset_deg'])
+        if len(self.session['visited_offsets_deg']) >= self.max_candidates:
+            self._finish('search_budget_exhausted')
+            return
+        next_offset = self._select_next_offset()
+        if next_offset is None:
+            self._finish('no_unvisited_safe_candidate')
+            return
+        self.session['state'] = 'recommend_search_turn'
+        self._start_candidate(next_offset, 'recommended_in_place_search_turn')
+
+    def _candidate_offsets(self):
+        delta = max(1.0, 0.8 * self.camera_half_fov_deg)
+        offsets = [0.0, delta, -delta, 2.0 * delta, -2.0 * delta]
+        return offsets[:self.max_candidates]
+
+    def _initial_posterior(self):
+        weights = {}
+        for degree in range(-90, 91):
+            weights[degree] = math.exp(-0.5 * (degree / self.bearing_sigma_deg) ** 2)
+        return self._normalise(weights)
+
+    def _apply_visual_miss(self, offset_deg):
+        posterior = self.session['posterior']
+        for degree in posterior:
+            if abs(degree - offset_deg) <= self.camera_half_fov_deg:
+                posterior[degree] *= self.visual_miss_likelihood
+        self.session['posterior'] = self._normalise(posterior)
+
+    def _select_next_offset(self):
+        visited = set(self.session['visited_offsets_deg'])
+        choices = [item for item in self.session['candidate_offsets_deg'] if item not in visited]
+        if not choices:
+            return None
+        return max(choices, key=self._visible_probability)
+
+    def _visible_probability(self, offset_deg):
+        posterior = self.session['posterior']
+        return sum(weight for degree, weight in posterior.items() if abs(degree - offset_deg) <= self.camera_half_fov_deg)
+
+    @staticmethod
+    def _normalise(weights):
+        total = sum(weights.values())
+        return {key: value / total for key, value in weights.items()} if total else weights
+
+    def _start_candidate(self, offset_deg, reason):
+        session = self.session
+        now = time.monotonic()
+        session['candidate_offset_deg'] = offset_deg
+        session['candidate_started_monotonic'] = now
+        session['visited_offsets_deg'].append(offset_deg)
+        self._emit('candidate_recommended', reason)
+
+    def _finish(self, outcome):
+        self._emit(outcome, outcome)
+        self.session = None
+
+    def _emit(self, event, reason):
+        session = self.session
+        if session is None:
+            return
+        record = {
+            'event': event,
+            'reason': reason,
+            'recorded_unix_s': time.time(),
+            'session_id': session['session_id'],
+            'awake_angle_deg': session['awake_angle_deg'],
+            'candidate_offset_deg': session['candidate_offset_deg'],
+            'candidate_visible_probability': self._visible_probability(session['candidate_offset_deg']) if session['candidate_offset_deg'] is not None else None,
+            'visited_offsets_deg': list(session['visited_offsets_deg']),
+            'motion_policy': 'in_place_only_no_command_published',
+        }
+        for key in ('visual_body_id', 'visual_preempt_latency_s'):
+            if key in session:
+                record[key] = session[key]
+        with open(self.log_path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+        message = String()
+        message.data = json.dumps(record, ensure_ascii=False, separators=(',', ':'))
+        self.decision_pub.publish(message)
+        self._publish_status(event)
+        self.get_logger().info('%s session=%s offset=%s' % (event, session['session_id'], session['candidate_offset_deg']))
+
+    def _publish_status(self, state):
+        message = String()
+        message.data = state
+        self.status_pub.publish(message)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BearingSearchShadow()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
