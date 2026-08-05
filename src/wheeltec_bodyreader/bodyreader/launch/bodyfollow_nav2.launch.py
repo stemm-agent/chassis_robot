@@ -12,6 +12,21 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
+        # Voice and other controllers request follow state through this service;
+        # it is the only publisher of the real /mode topic in this launch.
+        Node(
+            package='bodyreader',
+            executable='bodyfollow_mode_controller',
+            name='bodyfollow_mode_controller',
+            output='screen',
+            parameters=[
+                {'service_name': '/voice_summon/set_body_follow_enabled'},
+                {'legacy_service_name': '/bodyfollow/set_enabled'},
+                {'status_service_name': '/voice_summon/get_body_follow_status'},
+                {'mode_topic': '/mode'},
+            ],
+        ),
+
         Node(
             package='bodyreader',
             executable='body_nav2_profile_guard',
@@ -78,7 +93,7 @@ def generate_launch_description():
                 {'body_stream': True},
                 {'mode_gated_body_stream': False},
                 {'mode_required': 2},
-                {'max_processing_rate_hz': 20.0},
+                {'max_processing_rate_hz': 15.0},
             ],
         ),
 
@@ -185,6 +200,7 @@ def generate_launch_description():
                     'reacquire_accept_score': 1.65,
                     'appearance_accept_score': 0.80,
                     'bound_appearance_accept_score': 1.15,
+                    'identity_validation_grace_s': 0.50,
                     'reacquire_candidate_margin': 0.18,
                     'initial_confirm_frames': 4,
                     'reacquire_confirm_frames': 4,
@@ -243,6 +259,7 @@ def generate_launch_description():
                 {'goal_position_tolerance_m': 0.25},
                 {'goal_yaw_tolerance_rad': 0.15},
                 {'lost_timeout_s': 1.5},
+                {'body_invalid_grace_s': 0.45},
                 {'tf_timeout_s': 0.20},
                 {'enable_retreat_goal': False},
                 {'max_retreat_goal_m': 0.8},
@@ -285,16 +302,17 @@ def generate_launch_description():
                 # Visual heading PD plus distance-proportional longitudinal speed.
                 {'visual_x_p': 0.5},
                 {'visual_x_d': 0.33},
-                {'visual_z_p': 1.8},
+                {'visual_z_p': 2.2},
                 {'visual_z_d': 0.30},
-                {'visual_filter_alpha': 0.55},
+                {'visual_filter_alpha': 0.62},
                 {'visual_angle_deadband': 0.015},
                 {'visual_distance_deadband_mm': 80.0},
                 {'visual_max_linear_mps': 0.75},
-                {'visual_max_angular_rps': 1.0},
+                {'visual_max_angular_rps': 1.15},
                 {'visual_linear_accel_limit': 0.90},
+                {'visual_reverse_accel_limit': 1.80},
                 {'visual_linear_decel_limit': 0.35},
-                {'visual_angular_accel_limit': 1.4},
+                {'visual_angular_accel_limit': 2.2},
                 {'visual_allow_reverse': True},
 
                 {'keep_last_goal_when_occluded': True},

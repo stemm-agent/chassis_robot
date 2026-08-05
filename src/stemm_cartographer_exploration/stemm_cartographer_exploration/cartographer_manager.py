@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Cartographer-only STEMM manager with recoverable Nav2 readiness checks."""
 
+import json
 import math
+import os
 import random
 import time
 from functools import partial
+from pathlib import Path
 from threading import RLock
 
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Twist
+from cartographer_ros_msgs.srv import FinishTrajectory
+from geometry_msgs.msg import TransformStamped, Twist
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose, Spin
@@ -17,6 +21,8 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
 from stemm_nav2_manager.manager import StemmNav2Manager
+from std_srvs.srv import Trigger
+from tf2_ros import TransformBroadcaster
 
 from .exploration_watchdog import ExplorationProgressWatchdog
 from .lifecycle_retry import LifecycleRetryState
@@ -27,6 +33,28 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
 
     def __init__(self):
         super().__init__()
+        # Cancellation is only exposed for a failed return-home sequence.  The
+        # outer session runner writes the final terminal state after the inner
+        # launch exits and the fixed functional services have been restored.
+        self._mapping_cancel_requested = False
+        self._mapping_cancel_shutdown_pending = False
+        self._mapping_cancel_shutdown_at = 0.0
+        self._mapping_cancel_reason = ''
+        self._mapping_cancel_detail = ''
+        self.create_service(
+            Trigger,
+            '/stemm/cancel_mapping',
+            self.cancel_mapping_callback,
+        )
+        self.session_status_path = os.getenv(
+            'STEMM_CARTOGRAPHER_SESSION_STATUS_PATH',
+            '/home/wheeltec/.local/state/stemm-cartographer-session.json',
+        )
+        self._session_status_write_error = ''
+        self.session_task_path = os.getenv(
+            'STEMM_CARTOGRAPHER_TASK_PATH',
+            '/home/wheeltec/.local/state/stemm-cartographer-task.json',
+        )
         self.declare_parameter('nav_lifecycle_request_timeout_sec', 1.5)
         self.declare_parameter('nav_lifecycle_retry_delay_sec', 0.5)
         self.declare_parameter('nav_lifecycle_retry_max_delay_sec', 2.0)
@@ -47,6 +75,15 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             'stemm_cartographer_exploration/config/'
             'stemm_cartographer_nav_to_pose.xml')
         self.declare_parameter('goal_acceptance_timeout_sec', 3.0)
+        self.declare_parameter(
+            'cartographer_finish_trajectory_service', '/finish_trajectory')
+        self.declare_parameter('cartographer_trajectory_id', 0)
+        self.declare_parameter('cartographer_finish_timeout_sec', 10.0)
+        self.declare_parameter('final_map_wait_timeout_sec', 3.0)
+        self.declare_parameter(
+            'cartographer_finish_tf_translation_tolerance_m', 0.01)
+        self.declare_parameter(
+            'cartographer_finish_tf_rotation_tolerance_rad', 0.01)
         self.declare_parameter('feedback_zero_epsilon_m', 0.01)
         self.declare_parameter('feedback_zero_goal_tolerance_m', 0.30)
         self.declare_parameter('feedback_baseline_settle_sec', 2.0)
@@ -68,6 +105,14 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.declare_parameter('blocked_clearance_stable_sec', 0.5)
         self.declare_parameter('recovery_log_throttle_sec', 2.0)
         self.declare_parameter('cancel_zero_guard_period_sec', 0.05)
+        # End-mapping has two bounded stages: Cartographer finalization before
+        # a home goal, then the actual return-home navigation.
+        self.declare_parameter('mapping_finish_confirm_timeout_sec', 90.0)
+        self.declare_parameter('return_home_hard_timeout_sec', 180.0)
+        self.declare_parameter('mapping_timeout_cancel_delay_sec', 5.0)
+        self.declare_parameter('manual_takeover_auto_close_enabled', True)
+        self.declare_parameter('manual_takeover_auto_close_distance_m', 0.35)
+        self.declare_parameter('manual_takeover_auto_close_stable_sec', 12.0)
         self.nav_lifecycle_retry = LifecycleRetryState(
             self.nav_lifecycle_nodes,
             self.get_parameter(
@@ -123,6 +168,23 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.goal_acceptance_timeout_sec = max(
             0.5, float(self.get_parameter(
                 'goal_acceptance_timeout_sec').value))
+        self.cartographer_finish_trajectory_service = str(
+            self.get_parameter(
+                'cartographer_finish_trajectory_service').value)
+        self.cartographer_trajectory_id = int(self.get_parameter(
+            'cartographer_trajectory_id').value)
+        self.cartographer_finish_timeout_sec = max(
+            1.0, float(self.get_parameter(
+                'cartographer_finish_timeout_sec').value))
+        self.final_map_wait_timeout_sec = max(
+            0.0, float(self.get_parameter(
+                'final_map_wait_timeout_sec').value))
+        self.cartographer_finish_tf_translation_tolerance_m = max(
+            0.0, float(self.get_parameter(
+                'cartographer_finish_tf_translation_tolerance_m').value))
+        self.cartographer_finish_tf_rotation_tolerance_rad = max(
+            0.0, float(self.get_parameter(
+                'cartographer_finish_tf_rotation_tolerance_rad').value))
         self.feedback_zero_epsilon_m = max(
             0.0, float(self.get_parameter(
                 'feedback_zero_epsilon_m').value))
@@ -189,6 +251,25 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.cancel_zero_guard_period_sec = max(
             0.02, float(self.get_parameter(
                 'cancel_zero_guard_period_sec').value))
+        self.mapping_finish_confirm_timeout_sec = max(
+            15.0, float(self.get_parameter(
+                'mapping_finish_confirm_timeout_sec').value))
+        self.return_home_hard_timeout_sec = max(
+            30.0, float(self.get_parameter(
+                'return_home_hard_timeout_sec').value))
+        self.mapping_timeout_cancel_delay_sec = max(
+            2.0, float(self.get_parameter(
+                'mapping_timeout_cancel_delay_sec').value))
+        self.manual_takeover_auto_close_enabled = bool(
+            self.get_parameter('manual_takeover_auto_close_enabled').value)
+        self.manual_takeover_auto_close_distance_m = max(
+            0.05, float(self.get_parameter(
+                'manual_takeover_auto_close_distance_m').value))
+        self.manual_takeover_auto_close_stable_sec = max(
+            1.0, float(self.get_parameter(
+                'manual_takeover_auto_close_stable_sec').value))
+        self._manual_recovery_stable_since = 0.0
+        self._reset_mapping_exit_timeout()
         self.exploration_watchdog = ExplorationProgressWatchdog(
             no_progress_timeout_sec=no_progress_timeout,
             min_progress_m=progress_delta,
@@ -269,6 +350,25 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self.cancel_zero_guard_period_sec,
             self._cancel_zero_guard_callback,
         )
+        self.cartographer_finish_client = self.create_client(
+            FinishTrajectory, self.cartographer_finish_trajectory_service)
+        self._cartographer_finish_future = None
+        self._cartographer_finish_started_at = 0.0
+        self._cartographer_trajectory_finished = False
+        self._map_revision = 0
+        self._final_map_finish_revision = None
+        self._final_map_wait_started_at = 0.0
+        self._final_map_save_attempted = False
+        self._final_map_saved = False
+        self._final_map_saved_at = ''
+        self._final_map_save_error = ''
+        self._cartographer_return_tf_anchor = None
+        self._cartographer_return_tf_stable_since = 0.0
+        self._last_cartographer_tf_motion_log = 0.0
+        self._frozen_return_map_to_odom = None
+        self._frozen_return_tf_broadcaster = TransformBroadcaster(self)
+        self._frozen_return_tf_timer = self.create_timer(
+            0.05, self._publish_frozen_return_tf)
         self.get_logger().info(
             'Cartographer exploration watchdog enabled: '
             f'no_net_progress={no_progress_timeout:.1f}s, '
@@ -278,6 +378,18 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             f'RRT fallback wait={self.rrt_fallback_wait_sec:.1f}s, '
             f'Nav2 spin={self.stall_spin_yaw_rad:.2f}-'
             f'{self.stall_spin_escalated_yaw_rad:.2f}rad')
+
+    def map_callback(self, msg):
+        super().map_callback(msg)
+        self._map_revision += 1
+
+    def _reset_final_map_save_state(self):
+        self._final_map_finish_revision = None
+        self._final_map_wait_started_at = 0.0
+        self._final_map_save_attempted = False
+        self._final_map_saved = False
+        self._final_map_saved_at = ''
+        self._final_map_save_error = ''
 
     def _warn_lifecycle_failure(self, node_name, message, now):
         if self.nav_lifecycle_retry.should_warn(node_name, now):
@@ -508,6 +620,13 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             'manual', super().goal_callback, msg)
 
     def start_mapping_callback(self, request, response):
+        if self._mapping_cancel_requested:
+            self.publish_zero_velocity()
+            response.success = False
+            response.message = (
+                'mapping cancellation is in progress; wait for the session '
+                'runner to restore functional services')
+            return response
         if (self._goal_transport_fault
                 or self._spin_transport_fault
                 or self._spin_phase != 'idle'
@@ -520,7 +639,453 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 'uncertain; '
                 'restart the Cartographer mapping session')
             return response
-        return super().start_mapping_callback(request, response)
+        response = super().start_mapping_callback(request, response)
+        if response.success:
+            self._cartographer_finish_future = None
+            self._cartographer_finish_started_at = 0.0
+            self._cartographer_trajectory_finished = False
+            self._reset_final_map_save_state()
+            self._cartographer_return_tf_anchor = None
+            self._cartographer_return_tf_stable_since = 0.0
+            self._frozen_return_map_to_odom = None
+            self._reset_mapping_exit_timeout()
+        return response
+
+    @staticmethod
+    def _shortest_angle_distance(first, second):
+        return abs(math.atan2(
+            math.sin(first - second), math.cos(first - second)))
+
+    @staticmethod
+    def _transform_yaw(transform):
+        rotation = transform.transform.rotation
+        return math.atan2(
+            2.0 * (rotation.w * rotation.z + rotation.x * rotation.y),
+            1.0 - 2.0 * (rotation.y * rotation.y + rotation.z * rotation.z),
+        )
+
+    def _fail_return_home_before_dispatch(self, message):
+        """Retry return-home setup failures before manual takeover.
+
+        Cartographer finalization and the first Nav2 goal can experience short
+        TF/service gaps while the robot is already near the origin. Those
+        transient conditions are not evidence that the home target is
+        unreachable, so preserve the active session and consume the same
+        bounded retry budget used for terminal Nav2 failures.
+        """
+        self.pending_home_goal = False
+        self.return_home_requested = False
+        self.publish_zero_velocity()
+        self.return_home_retry_count += 1
+
+        if self.return_home_retry_count > self.return_home_max_retries:
+            self._cartographer_finish_future = None
+            self._frozen_return_map_to_odom = None
+            self.mode = 'stopped'
+            self.navigation_state = 'return_home_failed_waiting_manual'
+            self.last_error = (
+                f'{message}; return-home failed after '
+                f'{self.return_home_max_retries} retries, '
+                'keeping launch alive for manual takeover')
+            self.get_logger().error(self.last_error)
+            return False, self.last_error
+
+        # Keep a completed trajectory and an in-flight finish request intact:
+        # resending FinishTrajectory after a successful response is unsafe.
+        # Restart only the wait window for a still-pending finish request; all
+        # other retry attempts re-check the prerequisite from scratch.
+        now = time.monotonic()
+        if self._cartographer_finish_future is not None:
+            self._cartographer_finish_started_at = now
+        elif not self._cartographer_trajectory_finished:
+            self._cartographer_finish_started_at = 0.0
+        self.return_home_ready_after = (
+            now + self.return_home_retry_delay_sec)
+        self.return_home_tf_stable_since = 0.0
+        self._cartographer_return_tf_anchor = None
+        self._cartographer_return_tf_stable_since = 0.0
+        self.pending_home_goal = True
+        self.mode = 'returning_home'
+        self.navigation_state = 'return_home_retry_recovery'
+        self.last_error = (
+            f'{message}; retrying return-home '
+            f'{self.return_home_retry_count}/{self.return_home_max_retries}')
+        self.get_logger().warn(self.last_error)
+        return False, self.last_error
+
+    def _publish_frozen_return_tf(self):
+        """Keep Cartographer's final map->odom transform fresh for Nav2."""
+        frozen = self._frozen_return_map_to_odom
+        if frozen is None:
+            return
+        frozen.header.stamp = self.get_clock().now().to_msg()
+        self._frozen_return_tf_broadcaster.sendTransform(frozen)
+
+    def _freeze_final_map_to_odom_transform(self):
+        """Capture and republish Cartographer's final map->odom transform."""
+        try:
+            sampled = self.tf_buffer.lookup_transform(
+                self.global_frame, 'odom_combined', rclpy.time.Time())
+        except Exception as exc:  # noqa: BLE001
+            return False, (
+                'could not capture Cartographer final map->odom transform: '
+                f'{exc}')
+
+        if not sampled.header.frame_id or not sampled.child_frame_id:
+            return False, (
+                'Cartographer final map->odom transform had empty frame IDs')
+
+        frozen = TransformStamped()
+        frozen.header.frame_id = sampled.header.frame_id
+        frozen.child_frame_id = sampled.child_frame_id
+        frozen.transform = sampled.transform
+        self._frozen_return_map_to_odom = frozen
+        self._publish_frozen_return_tf()
+        self.get_logger().info(
+            'frozen final map->odom_combined transform; rebroadcasting it '
+            'with current timestamps for Nav2 return-home')
+        return True, 'final map->odom transform frozen'
+
+    def _finish_cartographer_trajectory_before_return(self):
+        """Finish mapping once, then leave return-home pending for the TF gate."""
+        if self._cartographer_trajectory_finished:
+            if self._frozen_return_map_to_odom is None:
+                frozen, message = self._freeze_final_map_to_odom_transform()
+                if not frozen:
+                    return self._fail_return_home_before_dispatch(message)
+            if self._final_map_finish_revision is None:
+                self._final_map_finish_revision = self._map_revision
+                self._final_map_wait_started_at = time.monotonic()
+            return True, 'Cartographer trajectory is already finished'
+
+        now = time.monotonic()
+        future = self._cartographer_finish_future
+        if future is not None:
+            if future.done():
+                self._cartographer_finish_future = None
+                try:
+                    response = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    return self._fail_return_home_before_dispatch(
+                        'Cartographer finish_trajectory request failed: '
+                        f'{exc}')
+                status = getattr(response, 'status', None)
+                if status is None or int(getattr(status, 'code', 1)) != 0:
+                    detail = getattr(status, 'message', 'empty status')
+                    return self._fail_return_home_before_dispatch(
+                        'Cartographer finish_trajectory was rejected: '
+                        f'{detail}')
+                # A successful FinishTrajectory response is final even if
+                # the immediate TF sampling attempt loses a frame. Record it
+                # before retrying TF capture so subsequent retries never send
+                # a duplicate FinishTrajectory request.
+                self._cartographer_trajectory_finished = True
+                frozen, message = self._freeze_final_map_to_odom_transform()
+                if not frozen:
+                    return self._fail_return_home_before_dispatch(message)
+                self._cartographer_finish_started_at = 0.0
+                self._final_map_finish_revision = self._map_revision
+                self._final_map_wait_started_at = time.monotonic()
+                self._cartographer_return_tf_anchor = None
+                self._cartographer_return_tf_stable_since = 0.0
+                self.get_logger().info(
+                    'Cartographer trajectory %d finished; waiting for '
+                    'the final map->odom transform to settle before '
+                    'return-home' % self.cartographer_trajectory_id)
+                return True, 'Cartographer trajectory finished'
+
+            if (now - self._cartographer_finish_started_at
+                    >= self.cartographer_finish_timeout_sec):
+                return self._fail_return_home_before_dispatch(
+                    'Cartographer finish_trajectory timed out after '
+                    f'{self.cartographer_finish_timeout_sec:.1f}s')
+            self.publish_zero_velocity()
+            self.navigation_state = 'return_home_waiting_cartographer_finish'
+            return False, (
+                'mapping done acknowledged; waiting for Cartographer '
+                'trajectory finish')
+
+        if self._cartographer_finish_started_at <= 0.0:
+            self._cartographer_finish_started_at = now
+        if not self.cartographer_finish_client.service_is_ready():
+            if (now - self._cartographer_finish_started_at
+                    >= self.cartographer_finish_timeout_sec):
+                return self._fail_return_home_before_dispatch(
+                    'Cartographer finish_trajectory service is unavailable '
+                    f'after {self.cartographer_finish_timeout_sec:.1f}s')
+            self.publish_zero_velocity()
+            self.navigation_state = 'return_home_waiting_cartographer_finish'
+            return False, (
+                'mapping done acknowledged; waiting for Cartographer '
+                'finish_trajectory service')
+
+        request = FinishTrajectory.Request()
+        request.trajectory_id = self.cartographer_trajectory_id
+        try:
+            self._cartographer_finish_future = (
+                self.cartographer_finish_client.call_async(request))
+        except Exception as exc:  # noqa: BLE001
+            return self._fail_return_home_before_dispatch(
+                'could not request Cartographer finish_trajectory: '
+                f'{exc}')
+        self._cartographer_finish_started_at = now
+        self.publish_zero_velocity()
+        self.navigation_state = 'return_home_waiting_cartographer_finish'
+        self.get_logger().info(
+            'requested Cartographer finish_trajectory for trajectory %d '
+            'before return-home' % self.cartographer_trajectory_id)
+        return False, (
+            'mapping done acknowledged; finishing Cartographer trajectory '
+            'before returning home')
+
+    def _tf_is_stably_recent(
+            self, target_frame, source_frame, max_age, stable_sec):
+        """After finishing, require map->odom values to stay within tolerance."""
+        if (not self.mapping_done
+                or not self._cartographer_trajectory_finished):
+            return super()._tf_is_stably_recent(
+                target_frame, source_frame, max_age, stable_sec)
+
+        if not super()._tf_is_recent(
+                target_frame, source_frame, max_age=max_age):
+            self._cartographer_return_tf_anchor = None
+            self._cartographer_return_tf_stable_since = 0.0
+            return False
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                target_frame, source_frame, rclpy.time.Time())
+        except Exception as exc:  # noqa: BLE001
+            self._cartographer_return_tf_anchor = None
+            self._cartographer_return_tf_stable_since = 0.0
+            self.get_logger().warn(
+                'could not sample final return-home TF '
+                f'({source_frame}->{target_frame}): {exc}')
+            return False
+
+        current = (
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            self._transform_yaw(transform),
+        )
+        now = time.monotonic()
+        anchor = self._cartographer_return_tf_anchor
+        if anchor is None:
+            self._cartographer_return_tf_anchor = current
+            self._cartographer_return_tf_stable_since = now
+            return False
+
+        translation_delta = math.hypot(
+            current[0] - anchor[0], current[1] - anchor[1])
+        rotation_delta = self._shortest_angle_distance(current[2], anchor[2])
+        if (translation_delta
+                > self.cartographer_finish_tf_translation_tolerance_m
+                or rotation_delta
+                > self.cartographer_finish_tf_rotation_tolerance_rad):
+            self._cartographer_return_tf_anchor = current
+            self._cartographer_return_tf_stable_since = now
+            if now - self._last_cartographer_tf_motion_log >= 1.0:
+                self._last_cartographer_tf_motion_log = now
+                self.get_logger().info(
+                    'final map->odom changed after trajectory finish: '
+                    f'dxy={translation_delta:.3f}m, '
+                    f'dyaw={rotation_delta:.3f}rad; restarting '
+                    'return-home TF settle window')
+            return False
+
+        stable_for = now - self._cartographer_return_tf_stable_since
+        if stable_for < stable_sec:
+            if now - self.last_return_home_wait_log > 1.0:
+                self.last_return_home_wait_log = now
+                self.get_logger().info(
+                    'waiting for final return-home TF to remain fixed '
+                    f'({stable_for:.1f}/{stable_sec:.1f}s)')
+            return False
+        return True
+
+    @staticmethod
+    def _map_origin_yaw(origin):
+        rotation = origin.orientation
+        return math.atan2(
+            2.0 * (
+                rotation.w * rotation.z
+                + rotation.x * rotation.y
+            ),
+            1.0 - 2.0 * (
+                rotation.y * rotation.y
+                + rotation.z * rotation.z
+            ),
+        )
+
+    @staticmethod
+    def _write_temp_file(path, content, binary):
+        temp_path = path.with_name(
+            f'.{path.name}.tmp.{os.getpid()}')
+        mode = 'wb' if binary else 'w'
+        kwargs = {} if binary else {'encoding': 'utf-8'}
+        try:
+            with open(temp_path, mode, **kwargs) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return temp_path
+        except Exception:
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+            raise
+
+    def _save_cached_final_map(self):
+        msg = self.last_map
+        if msg is None:
+            raise RuntimeError('final OccupancyGrid is not available')
+
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        if width <= 0 or height <= 0:
+            raise RuntimeError(
+                f'final OccupancyGrid has invalid size {width}x{height}')
+        if len(msg.data) != width * height:
+            raise RuntimeError(
+                'final OccupancyGrid cell count does not match its size')
+
+        pixels = bytearray(width * height)
+        for target_row, source_row in enumerate(
+                range(height - 1, -1, -1)):
+            source_offset = source_row * width
+            target_offset = target_row * width
+            for col in range(width):
+                value = int(msg.data[source_offset + col])
+                if value < 0:
+                    pixel = 205
+                elif value >= 65:
+                    pixel = 0
+                elif value <= 25:
+                    pixel = 254
+                else:
+                    pixel = 205
+                pixels[target_offset + col] = pixel
+
+        map_stem = Path(os.path.expanduser(self.map_save_path))
+        map_stem.parent.mkdir(parents=True, exist_ok=True)
+        pgm_path = map_stem.with_suffix('.pgm')
+        yaml_path = map_stem.with_suffix('.yaml')
+        pgm = (
+            f'P5\n# CREATOR: stemm_cartographer final map\n'
+            f'{width} {height}\n255\n'
+        ).encode('ascii') + bytes(pixels)
+
+        origin = msg.info.origin
+        yaml = (
+            f'image: {pgm_path.name}\n'
+            'mode: trinary\n'
+            f'resolution: {float(msg.info.resolution):.9g}\n'
+            'origin: ['
+            f'{float(origin.position.x):.9g}, '
+            f'{float(origin.position.y):.9g}, '
+            f'{self._map_origin_yaw(origin):.9g}]\n'
+            'negate: 0\n'
+            'occupied_thresh: 0.65\n'
+            'free_thresh: 0.25\n'
+        )
+
+        pgm_temp = self._write_temp_file(pgm_path, pgm, binary=True)
+        try:
+            yaml_temp = self._write_temp_file(
+                yaml_path, yaml, binary=False)
+        except Exception:
+            try:
+                pgm_temp.unlink()
+            except OSError:
+                pass
+            raise
+
+        try:
+            # YAML is the commit marker and is replaced last.
+            os.replace(pgm_temp, pgm_path)
+            os.replace(yaml_temp, yaml_path)
+        finally:
+            for temp_path in (pgm_temp, yaml_temp):
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+        return pgm_path, yaml_path, width, height
+
+    def _save_final_map_before_return(self):
+        if self._final_map_saved:
+            return True, 'final map is already saved'
+        if (
+            self._final_map_save_attempted
+            and self._final_map_save_error
+        ):
+            return True, (
+                'final map save failed; continuing safe return-home: '
+                f'{self._final_map_save_error}')
+
+        now = time.monotonic()
+        if self._final_map_wait_started_at <= 0.0:
+            self._final_map_wait_started_at = now
+        if self._final_map_finish_revision is None:
+            self._final_map_finish_revision = self._map_revision
+
+        elapsed = now - self._final_map_wait_started_at
+        final_frame_arrived = (
+            self._map_revision > self._final_map_finish_revision)
+        if (
+            (self.last_map is None or not final_frame_arrived)
+            and elapsed < self.final_map_wait_timeout_sec
+        ):
+            self.publish_zero_velocity()
+            self.mode = 'finalizing_map'
+            self.navigation_state = 'return_home_waiting_final_map'
+            return False, (
+                'Cartographer trajectory finished; waiting for the final '
+                f'OccupancyGrid ({elapsed:.1f}/'
+                f'{self.final_map_wait_timeout_sec:.1f}s)')
+
+        if self.last_map is None or not final_frame_arrived:
+            self._final_map_save_attempted = True
+            self._final_map_save_error = (
+                'no post-finish OccupancyGrid arrived within '
+                f'{self.final_map_wait_timeout_sec:.1f}s')
+            self.last_error = (
+                'final map save failed before return-home: '
+                f'{self._final_map_save_error}')
+            self.mode = 'returning_home'
+            self.navigation_state = 'return_home_map_save_failed'
+            self.get_logger().error(self.last_error)
+            return True, self.last_error
+
+        self._final_map_save_attempted = True
+        self.publish_zero_velocity()
+        self.mode = 'finalizing_map'
+        self.navigation_state = 'return_home_saving_final_map'
+        try:
+            pgm_path, yaml_path, width, height = (
+                self._save_cached_final_map())
+        except Exception as exc:  # noqa: BLE001 - safe return still proceeds
+            self._final_map_save_error = str(exc)
+            self.last_error = (
+                f'final map save failed before return-home: {exc}')
+            self.mode = 'returning_home'
+            self.navigation_state = 'return_home_map_save_failed'
+            self.get_logger().error(self.last_error)
+            return True, self.last_error
+
+        self._final_map_saved = True
+        self._final_map_saved_at = time.strftime(
+            '%Y-%m-%dT%H:%M:%S%z')
+        self._final_map_save_error = ''
+        self.last_error = ''
+        self.mode = 'returning_home'
+        self.navigation_state = 'return_home_final_map_saved'
+        self.get_logger().info(
+            'saved final Cartographer map after finish_trajectory: '
+            f'{pgm_path}, {yaml_path}, {width}x{height}')
+        return True, 'final map saved; return-home may begin'
 
     def _dispatch_pending_home_goal(self):
         if (self._goal_transport_fault
@@ -532,6 +1097,12 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 'return-home suppressed because a previous Nav2 action '
                 'state is uncertain; restart the mapping session safely',
             )
+        finished, message = self._finish_cartographer_trajectory_before_return()
+        if not finished:
+            return False, message
+        saved, message = self._save_final_map_before_return()
+        if not saved:
+            return False, message
         return self._run_with_goal_kind(
             'home', super()._dispatch_pending_home_goal)
 
@@ -2266,6 +2837,79 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self.get_logger().warn(self.last_error)
             self.last_charging_log = now
 
+    def save_map_callback(self, request, response):
+        """Keep pre-finish callers from overwriting the final map."""
+        del request
+        if not self.mapping_done:
+            response.success = False
+            response.message = (
+                'map save deferred: call set_mapping_done; the manager will '
+                'save the final map after finish_trajectory')
+            return response
+        if self._final_map_saved:
+            response.success = True
+            response.message = (
+                f'final map already saved: '
+                f'{os.path.expanduser(self.map_save_path)}.yaml')
+            return response
+        response.success = False
+        response.message = (
+            'final map save is still pending in state '
+            f'{self.navigation_state}')
+        if self._final_map_save_error:
+            response.message = (
+                f'final map save failed: {self._final_map_save_error}')
+        return response
+
+    def _request_mapping_cancellation(self, reason, detail):
+        """Begin the existing controlled session shutdown exactly once."""
+        self._mapping_cancel_requested = True
+        self._mapping_cancel_reason = str(reason or 'return_home_failed')
+        self._mapping_cancel_detail = str(detail or '')
+        self._mapping_cancel_shutdown_pending = True
+        # Let the service response/status frame leave the executor before the
+        # launch process group is interrupted; this preserves observability.
+        self._mapping_cancel_shutdown_at = time.monotonic() + 0.2
+        self.pending_home_goal = False
+        self.return_home_requested = False
+        self.auto_explore = False
+        self._clear_recovery_intent(clear_episode=True)
+        self.publish_zero_velocity()
+        self.mode = 'stopped'
+        self.navigation_state = 'mapping_cancel_requested'
+        self.last_error = ''
+        self._write_session_status()
+
+    def cancel_mapping_callback(self, request, response):
+        # Safely leave a return-home failure without pretending it recovered.
+        del request
+        if self._mapping_cancel_requested:
+            response.success = True
+            response.message = (
+                'mapping cancellation is already in progress; '
+                'waiting for the session runner')
+            return response
+
+        if self.shutdown_started:
+            response.success = False
+            response.message = 'Cartographer session shutdown is already underway'
+            return response
+
+        if (
+                not self.mapping_done or
+                self.navigation_state != 'return_home_failed_waiting_manual'):
+            response.success = False
+            response.message = (
+                'cancel_mapping is only available after return-home failure')
+            return response
+
+        self._request_mapping_cancellation(
+            'return_home_failed', str(self.last_error or ''))
+        response.success = True
+        response.message = (
+            'mapping cancellation accepted; waiting for safe session shutdown')
+        return response
+
     def stop_navigation_callback(self, request, response):
         del request
         self.pending_home_goal = False
@@ -2318,6 +2962,13 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
 
     def set_mapping_done_callback(self, request, response):
         requested_done = bool(request.data)
+        if self._mapping_cancel_requested:
+            self.publish_zero_velocity()
+            response.success = False
+            response.message = (
+                'mapping cancellation is in progress; wait for the session '
+                'runner to restore functional services')
+            return response
         if not requested_done:
             if (self._goal_transport_fault
                     or self._spin_transport_fault
@@ -2348,6 +2999,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 f'{self.navigation_state}')
             return response
 
+        self._reset_final_map_save_state()
         was_recovering = self.is_recovering() or self.is_recovery_state()
         spin_was_active = self._spin_phase != 'idle'
         if not spin_was_active:
@@ -2358,6 +3010,20 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 'mapping completion stopped Cartographer recovery motion '
                 'before return-home processing')
 
+        now = time.monotonic()
+        # Keep lightweight unit-test harnesses and legacy direct callers safe:
+        # production initialization always creates this field.
+        if getattr(self, '_mapping_done_requested_at', 0.0) <= 0.0:
+            self._mapping_done_requested_at = now
+            self._mapping_done_requested_at_epoch_ms = int(time.time() * 1000)
+            self._mapping_done_requested_at_iso = time.strftime(
+                '%Y-%m-%dT%H:%M:%S%z')
+            self._return_home_started_at = 0.0
+            self._return_home_started_at_epoch_ms = 0
+            self._return_home_started_at_iso = ''
+            self._mapping_timeout_failure_kind = ''
+            self._mapping_timeout_failure_reason = ''
+            self._mapping_timeout_auto_cancel_at = 0.0
         self.mapping_done = True
         self.auto_explore = False
         self.pending_home_goal = True
@@ -2736,6 +3402,283 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self._rrt_wait_started_at = None
             self.get_logger().info(
                 'accepted RRT frontier as the active exploration source')
+
+
+
+    def _reset_mapping_exit_timeout(self):
+        self._mapping_done_requested_at = 0.0
+        self._mapping_done_requested_at_epoch_ms = 0
+        self._mapping_done_requested_at_iso = ''
+        self._return_home_started_at = 0.0
+        self._return_home_started_at_epoch_ms = 0
+        self._return_home_started_at_iso = ''
+        self._mapping_timeout_failure_kind = ''
+        self._mapping_timeout_failure_reason = ''
+        self._mapping_timeout_auto_cancel_at = 0.0
+
+    def _report_mapping_exit_timeout(self, kind, reason):
+        """Expose a failure briefly, then autonomously cancel safely."""
+        if self._mapping_timeout_failure_kind or self._mapping_cancel_requested:
+            return
+        self._mapping_timeout_failure_kind = str(kind)
+        self._mapping_timeout_failure_reason = str(reason)
+        self.pending_home_goal = False
+        self.return_home_requested = False
+        self.auto_explore = False
+        self._clear_recovery_intent(clear_episode=True)
+        if self.current_goal_handle is not None and self.nav_goal_active:
+            try:
+                self.current_goal_handle.cancel_goal_async()
+            except Exception as exc:  # noqa: BLE001 - shutdown still proceeds
+                self.get_logger().warn(
+                    'best-effort return-home goal cancellation failed: '
+                    f'{exc}')
+        self.publish_zero_velocity()
+        self.mode = 'stopped'
+        self.navigation_state = 'return_home_failed_waiting_manual'
+        self.last_error = self._mapping_timeout_failure_reason
+        self._mapping_timeout_auto_cancel_at = (
+            time.monotonic() + self.mapping_timeout_cancel_delay_sec)
+        self.get_logger().error(
+            f'mapping exit timeout ({kind}): {reason}; controlled '
+            f'cancellation will start in '
+            f'{self.mapping_timeout_cancel_delay_sec:.1f}s')
+        self._write_session_status()
+
+    def _maybe_enforce_mapping_exit_timeout(self):
+        if (
+                not self.mapping_done or self.shutdown_started or
+                self._mapping_cancel_requested or
+                getattr(self, '_mapping_timeout_failure_kind', '')):
+            return
+        now = time.monotonic()
+        # A dispatched/active home goal marks the second, navigation stage.
+        if self.return_home_requested or self.nav_goal_active:
+            if self._return_home_started_at <= 0.0:
+                self._return_home_started_at = now
+                self._return_home_started_at_epoch_ms = int(time.time() * 1000)
+                self._return_home_started_at_iso = time.strftime(
+                    '%Y-%m-%dT%H:%M:%S%z')
+                self.get_logger().info(
+                    'return-home hard timeout armed: '
+                    f'{self.return_home_hard_timeout_sec:.1f}s')
+            if (now - self._return_home_started_at
+                    >= self.return_home_hard_timeout_sec):
+                self._report_mapping_exit_timeout(
+                    'return_home_timeout',
+                    'return-home navigation exceeded %.1fs' %
+                    self.return_home_hard_timeout_sec)
+            return
+        if (
+                self._mapping_done_requested_at > 0.0 and
+                now - self._mapping_done_requested_at
+                >= self.mapping_finish_confirm_timeout_sec):
+            self._report_mapping_exit_timeout(
+                'finish_mapping_timeout',
+                'mapping finalization did not dispatch return-home within '
+                '%.1fs' % self.mapping_finish_confirm_timeout_sec)
+
+    def _maybe_request_mapping_timeout_cancel(self):
+        if (
+                not self._mapping_timeout_failure_kind or
+                self._mapping_cancel_requested or
+                self.shutdown_started or
+                self._mapping_timeout_auto_cancel_at <= 0.0 or
+                time.monotonic() < self._mapping_timeout_auto_cancel_at):
+            return
+        self._mapping_timeout_auto_cancel_at = 0.0
+        self._request_mapping_cancellation(
+            self._mapping_timeout_failure_kind,
+            self._mapping_timeout_failure_reason)
+
+    def _maybe_auto_close_manual_takeover(self, pose):
+        if (
+                not self.manual_takeover_auto_close_enabled
+                or self._mapping_timeout_failure_kind
+                or self.shutdown_started
+                or not self.mapping_done
+                or self.navigation_state != 'return_home_failed_waiting_manual'
+                or self.mode != 'stopped'
+                or self.nav_goal_active
+                or self.goal_send_future is not None
+                or self.pending_home_goal
+                or self.return_home_requested
+                or self.is_recovering()
+                or self._spin_phase != 'idle'):
+            self._manual_recovery_stable_since = 0.0
+            return
+
+        if pose is None:
+            self._manual_recovery_stable_since = 0.0
+            return
+
+        position_error_m = math.hypot(
+            pose.pose.position.x, pose.pose.position.y)
+        if position_error_m > self.manual_takeover_auto_close_distance_m:
+            self._manual_recovery_stable_since = 0.0
+            return
+
+        now = time.monotonic()
+        if self._manual_recovery_stable_since <= 0.0:
+            self._manual_recovery_stable_since = now
+            self.get_logger().info(
+                'manual recovery is near the start pose and stationary; '
+                f'waiting {self.manual_takeover_auto_close_stable_sec:.1f}s '
+                'before closing the mapping session')
+            return
+
+        stable_for = now - self._manual_recovery_stable_since
+        if stable_for < self.manual_takeover_auto_close_stable_sec:
+            return
+
+        self.get_logger().info(
+            'manual recovery confirmed by stable near-start pose '
+            f'({position_error_m:.3f}m for {stable_for:.1f}s); '
+            'closing Cartographer session')
+        self.request_launch_shutdown(
+            'manual recovery confirmed by vehicle state')
+
+    def _maybe_request_mapping_cancel_shutdown(self):
+        if (
+                not self._mapping_cancel_shutdown_pending or
+                self.shutdown_started or
+                time.monotonic() < self._mapping_cancel_shutdown_at):
+            return
+        self._mapping_cancel_shutdown_pending = False
+        self.get_logger().warn(
+            'operator cancelled Cartographer after return-home failure; '
+            'shutting down the isolated session')
+        self.request_launch_shutdown(
+            'operator cancelled mapping after return-home failure')
+
+    def _before_launch_shutdown(self):
+        # Persist a non-terminal transition before SIGINT.  The outer session
+        # runner owns the final closed state because it also restores control
+        # services after the inner Cartographer launch has exited.
+        if self.mapping_done:
+            self._write_session_status()
+
+    def _publish_state_impl(self):
+        super()._publish_state_impl()
+        pose = self.last_pose or self.update_pose()
+        self._maybe_enforce_mapping_exit_timeout()
+        self._maybe_auto_close_manual_takeover(pose)
+        self._maybe_request_mapping_timeout_cancel()
+        self._maybe_request_mapping_cancel_shutdown()
+        self._write_session_status()
+
+    def _read_session_task_id(self):
+        expected_task_id = os.getenv(
+            'STEMM_CARTOGRAPHER_EXPECTED_TASK_ID', ''
+        ).strip()
+        if expected_task_id:
+            # A bridge restart or duplicate MQTT delivery may rewrite the shared
+            # task file. The running session must keep the immutable identity
+            # supplied by its outer session runner.
+            return expected_task_id
+        try:
+            with open(self.session_task_path, 'r', encoding='utf-8') as handle:
+                task_id = json.load(handle).get('taskId', '')
+            return task_id if isinstance(task_id, str) else ''
+        except (OSError, ValueError, json.JSONDecodeError):
+            return ''
+
+    def _write_session_status(self):
+        pose = self.update_pose()
+        position_error_m = None
+        if pose is not None:
+            position_error_m = math.hypot(pose.pose.position.x, pose.pose.position.y)
+        state = str(self.navigation_state or '')
+        failed_waiting = (
+            state == 'return_home_failed_waiting_manual' and
+            not self._mapping_cancel_requested)
+        timeout_failure = bool(
+            getattr(self, '_mapping_timeout_failure_kind', ''))
+        finalizing = self.shutdown_started and self.mapping_done
+        cancel_requested = bool(self._mapping_cancel_requested)
+        if finalizing:
+            phase = 'finalizing'
+        elif cancel_requested:
+            phase = 'canceling'
+        elif failed_waiting:
+            phase = 'return_home_failed'
+        else:
+            phase = 'returning_home' if self.mapping_done else 'mapping'
+        termination_status = (
+            'canceled' if cancel_requested else
+            ('succeeded' if finalizing else '')
+        )
+        termination_reason = (
+            self._mapping_cancel_reason if cancel_requested else
+            ('return_home_complete' if finalizing else '')
+        )
+        payload = {
+            'schemaVersion': 2,
+            'taskId': self._read_session_task_id(),
+            'updatedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+            'updatedAtEpochMs': int(time.time() * 1000),
+            'phase': phase,
+            # Keep both fields during protocol migration. The mini-program
+            # consumes status, while existing bridge consumers read taskStatus.
+            'status': 'running',
+            'taskStatus': 'running',
+            'terminal': False,
+            'sessionActive': True,
+            'processExited': False,
+            'functionalServicesRestored': False,
+            'cancelRequested': cancel_requested,
+            'terminationStatus': termination_status,
+            'terminationReason': termination_reason,
+            'returnHomeFailureReason': (
+                self._mapping_timeout_failure_reason if timeout_failure else
+                (self._mapping_cancel_detail if cancel_requested else
+                 (str(self.last_error or '') if failed_waiting else ''))
+            ),
+            # A failure is published only after retry exhaustion or a bounded
+            # end-mapping/return-home timeout, never for one transient abort.
+            'returnHomeFailureConfirmed': failed_waiting or timeout_failure,
+            'returnHomeFailureKind': (
+                self._mapping_timeout_failure_kind if timeout_failure else
+                ('retry_exhausted' if failed_waiting else '')
+            ),
+            # Wall-clock deadline origins let an online client display a
+            # countdown from the car's authoritative timer.  The monotonic
+            # counterparts remain the sole source for enforcement.
+            'finishRequestedAt': getattr(
+                self, '_mapping_done_requested_at_iso', ''),
+            'finishRequestedAtEpochMs': int(getattr(
+                self, '_mapping_done_requested_at_epoch_ms', 0) or 0),
+            'returnHomeStartedAt': getattr(
+                self, '_return_home_started_at_iso', ''),
+            'returnHomeStartedAtEpochMs': int(getattr(
+                self, '_return_home_started_at_epoch_ms', 0) or 0),
+            'manualTakeoverRequired': failed_waiting,
+            'mappingDone': bool(self.mapping_done),
+            'navigationState': state,
+            'mode': str(self.mode or ''),
+            'returnHomeRetry': int(self.return_home_retry_count),
+            'returnHomeMaxRetries': int(self.return_home_max_retries),
+            'pendingHomeGoal': bool(self.pending_home_goal),
+            'returnHomeRequested': bool(self.return_home_requested),
+            'finalMapSaved': bool(self._final_map_saved),
+            'finalMapSavedAt': self._final_map_saved_at,
+            'finalMapSaveError': self._final_map_save_error,
+            'positionErrorMeters': position_error_m,
+            'pose': self.pose_to_dict(pose),
+            'lastError': str(self.last_error or ''),
+        }
+        try:
+            os.makedirs(os.path.dirname(self.session_status_path), exist_ok=True)
+            tmp = self.session_status_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp, self.session_status_path)
+            self._session_status_write_error = ''
+        except OSError as exc:
+            message = f'cannot write Cartographer session status: {exc}'
+            if message != self._session_status_write_error:
+                self.get_logger().error(message)
+            self._session_status_write_error = message
 
 
 def main(args=None):

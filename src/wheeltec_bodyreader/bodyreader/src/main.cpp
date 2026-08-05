@@ -87,7 +87,13 @@ struct BodyFilterDiagnostics
     uint64_t raw_bodies = 0;
     uint64_t accepted_bodies = 0;
     uint64_t no_raw_body_frames = 0;
+    uint64_t consecutive_no_raw_body_frames = 0;
     uint64_t body_list_errors = 0;
+    uint64_t frame_wait_failures = 0;
+    uint64_t consecutive_frame_wait_failures = 0;
+    int last_frame_wait_status = 0;
+    uint64_t body_frame_errors = 0;
+    int last_body_frame_status = 0;
     uint64_t rejected_distance = 0;
     uint64_t rejected_center = 0;
     uint64_t rejected_joints = 0;
@@ -186,6 +192,19 @@ void maybe_log_body_filter_diagnostics()
     }
 
     const auto& d = g_body_filter_diagnostics;
+    if (d.frame_wait_failures > 0 || d.body_frame_errors > 0)
+    {
+        RCLCPP_WARN(
+            rclcpp::get_logger("body_main"),
+            "ASTRA_DIAG %.1fs frame_wait_failures=%llu consecutive_wait_failures=%llu "
+            "last_wait_status=%d body_frame_errors=%llu last_body_frame_status=%d",
+            elapsed_s,
+            static_cast<unsigned long long>(d.frame_wait_failures),
+            static_cast<unsigned long long>(d.consecutive_frame_wait_failures),
+            d.last_frame_wait_status,
+            static_cast<unsigned long long>(d.body_frame_errors),
+            d.last_body_frame_status);
+    }
     if (d.accepted_bodies > 0)
     {
         RCLCPP_INFO(
@@ -237,10 +256,11 @@ void maybe_log_body_filter_diagnostics()
         RCLCPP_WARN(
             rclcpp::get_logger("body_main"),
             "BODY_FILTER %.1fs frames=%llu raw=0 accepted=0 no_raw_frames=%llu "
-            "list_errors=%llu reason=no_astra_body",
+            "consecutive_no_raw_frames=%llu list_errors=%llu reason=no_astra_body",
             elapsed_s,
             static_cast<unsigned long long>(d.frames),
             static_cast<unsigned long long>(d.no_raw_body_frames),
+            static_cast<unsigned long long>(d.consecutive_no_raw_body_frames),
             static_cast<unsigned long long>(d.body_list_errors));
     }
 
@@ -348,6 +368,11 @@ void output_bodies(astra_bodyframe_t bodyFrame)
     if (bodyList.count <= 0)
     {
         ++g_body_filter_diagnostics.no_raw_body_frames;
+        ++g_body_filter_diagnostics.consecutive_no_raw_body_frames;
+    }
+    else
+    {
+        g_body_filter_diagnostics.consecutive_no_raw_body_frames = 0;
     }
 
     std::unordered_map<int, int> next_valid_body_streaks;
@@ -605,6 +630,7 @@ int main(int argc, char* argv[])
 
         if (rc == ASTRA_STATUS_SUCCESS)
         {
+            g_body_filter_diagnostics.consecutive_frame_wait_failures = 0;
             const auto now = SteadyClock::now();
             const bool process_frame =
                 !rate_limited || now >= next_processing_time;
@@ -614,8 +640,18 @@ int main(int argc, char* argv[])
                 if (body_stream_running)
                 {
                     astra_bodyframe_t bodyFrame;
-                    astra_frame_get_bodyframe(frame, &bodyFrame);
-                    output_bodyframe(bodyFrame);
+                    const astra_status_t body_frame_rc =
+                        astra_frame_get_bodyframe(frame, &bodyFrame);
+                    if (body_frame_rc == ASTRA_STATUS_SUCCESS)
+                    {
+                        output_bodyframe(bodyFrame);
+                    }
+                    else
+                    {
+                        ++g_body_filter_diagnostics.body_frame_errors;
+                        g_body_filter_diagnostics.last_body_frame_status =
+                            static_cast<int>(body_frame_rc);
+                    }
                 }
 
                 if (rgb_stream)
@@ -636,6 +672,15 @@ int main(int argc, char* argv[])
 
             astra_reader_close_frame(&frame);
         }
+        else
+        {
+            ++g_body_filter_diagnostics.frame_wait_failures;
+            ++g_body_filter_diagnostics.consecutive_frame_wait_failures;
+            g_body_filter_diagnostics.last_frame_wait_status =
+                static_cast<int>(rc);
+        }
+
+        maybe_log_body_filter_diagnostics();
 
     } while (shouldContinue && rclcpp::ok());
 

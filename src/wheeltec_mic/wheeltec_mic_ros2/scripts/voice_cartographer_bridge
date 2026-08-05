@@ -29,6 +29,8 @@ from cartographer_voice_policy import (
     motion_is_blocked,
     service_discovery_decision,
     service_request_decision,
+    should_preserve_confirmed_state,
+    success_feedback_audio,
     COMPLETE,
     SEND,
     TIMEOUT,
@@ -59,7 +61,7 @@ class VoiceCartographerBridge(Node):
         self.declare_parameter('service_discovery_timeout_sec', 3.0)
         self.declare_parameter('service_request_timeout_sec', 12.0)
         self.declare_parameter('save_request_timeout_sec', 55.0)
-        self.declare_parameter('start_confirmation_timeout_sec', 75.0)
+        self.declare_parameter('start_confirmation_timeout_sec', 100.0)
         self.declare_parameter('command_cooldown_sec', 1.0)
         self.declare_parameter('dry_run', False)
 
@@ -229,7 +231,7 @@ class VoiceCartographerBridge(Node):
         self._state = STARTING
         self._nav_state = None
         self._nav_state_received_at = 0.0
-        self._publish_feedback('/2d_mapping.wav')
+        self._publish_feedback('/mapping_exploration_start.wav')
         self._publish_state(force=True)
         self.get_logger().info('Accepted voice request to start mapping.')
         self._last_message = '开始建图已受理，正在启动独立建图会话'
@@ -273,7 +275,7 @@ class VoiceCartographerBridge(Node):
             self._state = IDLE
             self.get_logger().error('Mapping session start failed: %s' % message)
             self._last_message = '建图会话启动失败：%s' % message
-            self._publish_feedback('/overmap.wav')
+            self._publish_feedback('/mapping_failure_retry.wav')
             self._publish_state(force=True)
             return
         self._start_confirm_deadline = now + self.start_confirmation_timeout_sec
@@ -316,10 +318,8 @@ class VoiceCartographerBridge(Node):
             'future': None,
             'emergency': bool(emergency),
         }
-        if not emergency:
-            self._publish_feedback('/OK.wav')
         if action == 'end':
-            self._last_message = '结束建图已受理；本操作不会自动保存地图'
+            self._last_message = '结束建图已受理；正在固化并保存最终地图'
             self.get_logger().warn(self._last_message)
         else:
             self._last_message = '建图控制请求已受理：%s' % action
@@ -414,33 +414,28 @@ class VoiceCartographerBridge(Node):
                 (self._nav_state or {}).get('mapping_done')) if emergency else False
             self._cache_nav_transition(
                 'stopped', mapping_done=mapping_done)
-            self._publish_feedback('/stop.wav')
         elif action == 'continue':
             self._state = RUNNING
             self._cache_nav_transition('mapping', mapping_done=False)
-            self._publish_feedback('/OK.wav')
         elif action == 'end':
             self._state = ENDING
             self._cache_nav_transition('returning_home', mapping_done=True)
-            self._publish_feedback('/2d_mapping_close.wav')
-        elif action == 'save':
-            self._publish_feedback('/OK.wav')
+        feedback_audio = success_feedback_audio(action)
+        if feedback_audio is not None:
+            self._publish_feedback(feedback_audio)
         self.get_logger().info(
             'Mapping voice action %s succeeded: %s' % (action, message))
         if action == 'end':
-            self._last_message = '结束建图已执行，正在返航；地图未自动保存'
+            self._last_message = '结束建图已执行；最终地图将保存后再返航'
         else:
             self._last_message = '%s 执行成功：%s' % (action, message)
         self._publish_state(force=True)
 
     def _finish_service_failure(self, message, unavailable):
-        pending = self._pending_service
         self._pending_service = None
         self.get_logger().error(message)
         self._last_message = message
-        if pending is None or not pending.get('emergency'):
-            self._publish_feedback(
-                '/close_node.wav' if unavailable else '/overmap.wav')
+        self._publish_feedback('/mapping_failure_retry.wav')
         self._publish_state(force=True)
 
     def _cache_nav_transition(self, mode, mapping_done):
@@ -453,8 +448,7 @@ class VoiceCartographerBridge(Node):
     def _reject(self, message, unavailable):
         self.get_logger().warn('Reject mapping voice command: %s' % message)
         self._last_message = message
-        self._publish_feedback(
-            '/close_node.wav' if unavailable else '/overmap.wav')
+        self._publish_feedback('/mapping_failure_retry.wav')
 
     def _nav_state_callback(self, msg):
         try:
@@ -555,12 +549,12 @@ class VoiceCartographerBridge(Node):
             self._nav_state,
             nav_fresh,
         )
-        if (
-            not nav_fresh
-            and self._nav_state is not None
-            and self._unit_state == 'active'
-            and self._state in (RUNNING, PAUSED, ENDING)
-        ):
+        if should_preserve_confirmed_state(
+                self._state,
+                self._unit_state,
+                self._lock_held,
+                self._nav_state is not None,
+                nav_fresh):
             # save_map can occupy the manager's single-threaded executor for
             # up to 45 seconds.  Preserve the last externally confirmed state
             # during that bounded call instead of regressing to STARTING.
@@ -600,7 +594,7 @@ class VoiceCartographerBridge(Node):
             self._last_message = '建图会话启动超时，请检查 systemd 日志'
         self._start_confirm_deadline = 0.0
         self._force_starting = False
-        self._publish_feedback('/overmap.wav')
+        self._publish_feedback('/mapping_failure_retry.wav')
         self._recompute_state(now)
 
     def _publish_state(self, force=False):

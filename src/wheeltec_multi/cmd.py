@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import os
 import paramiko 
 import time
 import threading
@@ -26,7 +25,7 @@ ip = [
     ]
 
 username = 'wheeltec' 
-password = os.environ.get("WHEELTEC_SSH_PASSWORD", "") 
+password = 'dongguan' 
 ip_status = []
 input_flag=1
 

@@ -200,6 +200,10 @@ class AutoRecharger(Node):
 		self.nav_goal_response_deadline = None
 		self.nav_goal_response_timeout_sec = 12.0
 		self.nav_last_failure_reason = ''
+		# Goal requests cannot be canceled until Nav2 returns a goal handle.
+		# Keep pending requests alive after task cleanup and cancel them as soon
+		# as their response arrives, preventing orphan goals from driving later.
+		self.cancel_on_accept_futures = set()
 		# Nav2 may stop physically near the charger before its action result is
 		# delivered.  A fresh TF that remains inside this radius allows the
 		# recharge node to hand off to infrared search without waiting tens of
@@ -373,7 +377,60 @@ Ctrl+C/c:关闭自动回充功能并退出.    Ctrl+C/c:Quit the program.
 			return False
 		return True
 
+	def _cancel_goal_when_accepted(self, future, goal_label):
+		self.cancel_on_accept_futures.discard(future)
+		try:
+			goal_handle = future.result()
+		except Exception as exc:
+			print_and_fixRetract(
+				YELLOW+'Pending %s goal response failed during cancel: %s' %
+				(goal_label, exc)+RESET)
+			return
+		if goal_handle is None or not goal_handle.accepted:
+			return
+		try:
+			goal_handle.cancel_goal_async()
+			print_and_fixRetract(
+				YELLOW+'Canceled pending %s goal immediately after acceptance.' %
+				goal_label+RESET)
+		except Exception as exc:
+			print_and_fixRetract(
+				YELLOW+'Failed to cancel accepted %s goal: %s' %
+				(goal_label, exc)+RESET)
+
+	def Schedule_Goal_Cancel_On_Accept(self, future, goal_label):
+		if future is None:
+			return False
+		if future in self.cancel_on_accept_futures:
+			return True
+		self.cancel_on_accept_futures.add(future)
+		if future.done():
+			self._cancel_goal_when_accepted(future, goal_label)
+			return True
+		future.add_done_callback(
+			lambda completed, label=goal_label:
+			self._cancel_goal_when_accepted(completed, label))
+		print_and_fixRetract(
+			YELLOW+'%s goal response is pending; cancellation is armed.' %
+			goal_label+RESET)
+		return True
+
 	def Pub_NavGoal_Cancel(self):
+		"""Cancel only the navigation goal owned by this recharge task."""
+		self.star_getNav_Feedback_Flag = 0
+		self.nav_goal_sent_time = None
+		if self.nav_goal_handle is not None:
+			try:
+				self.nav_goal_handle.cancel_goal_async()
+				return True
+			except Exception as exc:
+				print_and_fixRetract(
+					YELLOW+'Failed to cancel recharge Nav2 goal: '+str(exc)+RESET)
+				return False
+		return self.Schedule_Goal_Cancel_On_Accept(
+			self.nav_goal_future, 'recharge navigation')
+
+	def Pub_All_NavGoals_Cancel(self):
 		"""异步取消 Nav2 目标；主线程不调用 cancel_goal_async，避免阻塞自旋找红外。"""
 		self.star_getNav_Feedback_Flag = 0
 		self.nav_goal_sent_time = None
@@ -852,21 +909,41 @@ Ctrl+C/c:关闭自动回充功能并退出.    Ctrl+C/c:Quit the program.
 				exact_cancel_sent = True
 			except Exception:
 				pass
+		elif self.Schedule_Goal_Cancel_On_Accept(
+			self.nav_goal_future, 'recharge navigation'
+		):
+			exact_cancel_sent = True
 		if self.strict_refine_goal_handle is not None:
 			try:
 				self.strict_refine_goal_handle.cancel_goal_async()
+				exact_cancel_sent = True
 			except Exception:
 				pass
+		elif self.Schedule_Goal_Cancel_On_Accept(
+			self.strict_refine_goal_future, 'recharge refinement'
+		):
+			exact_cancel_sent = True
 		self.Finish_Task()
 		return exact_cancel_sent
 
 	def Finish_Task(self):
 		self.star_getNav_Feedback_Flag = 0
+		if self.nav_goal_handle is not None:
+			try:
+				self.nav_goal_handle.cancel_goal_async()
+			except Exception:
+				pass
+		else:
+			self.Schedule_Goal_Cancel_On_Accept(
+				self.nav_goal_future, 'recharge navigation')
 		if self.strict_refine_goal_handle is not None:
 			try:
 				self.strict_refine_goal_handle.cancel_goal_async()
 			except Exception:
 				pass
+		else:
+			self.Schedule_Goal_Cancel_On_Accept(
+				self.strict_refine_goal_future, 'recharge refinement')
 		self.Clear_Strict_Refinement()
 		self.Reset_Nav_Tracking()
 		self.Reset_Turn_Search_State()
@@ -1018,7 +1095,8 @@ Ctrl+C/c:关闭自动回充功能并退出.    Ctrl+C/c:Quit the program.
 
 	def Fail_Strict_Refinement(self, message):
 		print_and_fixRetract(RED+message+'；停止本次任务并完整退出回充节点，请用户重新发起回充.'+RESET)
-		self.Clear_Strict_Refinement()
+		# Finish_Task arms cancellation for a still-pending strict goal before
+		# clearing refinement state.
 		self.Finish_Task()
 
 	def Poll_Strict_Refinement(self):
@@ -1278,7 +1356,9 @@ Ctrl+C/c:关闭自动回充功能并退出.    Ctrl+C/c:Quit the program.
 		if key=='q' or key=='Q':
 			# 存在3路以上的红外信号,小车姿态接近于对准充电桩,无需导航	
 			if self.red_count>=3:
-				self.Pub_NavGoal_Cancel()
+				# Direct infrared docking intentionally takes motion ownership
+				# from any previous Nav2 goal.
+				self.Pub_All_NavGoals_Cancel()
 				self.chargeflag=1
 				self.Pub_Recharger_Flag()
 				print_and_fixRetract('已捕获到高强度红外信号,使用红外信号对接.(High-intensity infrared signals have been captured and are docked using infrared signals.)')
@@ -1298,7 +1378,10 @@ Ctrl+C/c:关闭自动回充功能并退出.    Ctrl+C/c:Quit the program.
 			self.set_charge_mode(0)
 
 		#电压过低时开启导航自动回充
-		if self.robot['Charging']==0:
+		# Low-battery ownership belongs exclusively to the long-lived monitor.
+		# Keep this legacy block unreachable so it cannot sleep in the manager
+		# executor or submit a duplicate navigation goal.
+		if False and self.robot['Charging']==0:
 			if (self.robot['Type']=='Plus'and self.robot['Voltage']<20) or (self.robot['Type']=='Mini' and self.robot['Voltage']<10):
 				time.sleep(1)
 				self.power_lost_count=self.power_lost_count+1 # 低电量滤波

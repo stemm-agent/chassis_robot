@@ -36,6 +36,7 @@ class VoiceRechargeBridge(Node):
         self.declare_parameter('dock_evidence_hold_sec', 15.0)
         self.declare_parameter('recharge_start_service', '/auto_recharge/start')
         self.declare_parameter('recharge_stop_service', '/auto_recharge/stop')
+        self.declare_parameter('bodyfollow_mode_service', '/bodyfollow/set_enabled')
 
         self.start_commands = set(self.get_parameter('start_commands').value)
         self.cancel_commands = set(self.get_parameter('cancel_commands').value)
@@ -65,6 +66,9 @@ class VoiceRechargeBridge(Node):
         self.recharge_stop_service = str(
             self.get_parameter('recharge_stop_service').value
         )
+        self.bodyfollow_mode_service = str(
+            self.get_parameter('bodyfollow_mode_service').value
+        )
         self.ros2_command = shutil.which('ros2') or '/opt/ros/humble/bin/ros2'
 
         self._navigate_process = None
@@ -85,7 +89,7 @@ class VoiceRechargeBridge(Node):
             Trigger, self.recharge_stop_service
         )
         self.follow_control_client = self.create_client(
-            SetBool, '/voice_summon/set_body_follow_enabled'
+            SetBool, self.bodyfollow_mode_service
         )
         self.feedback_pub = self.create_publisher(String, 'feedback_audio', 10)
         self.voice_sub = self.create_subscription(
@@ -353,14 +357,15 @@ class VoiceRechargeBridge(Node):
             return
         if self.dry_run:
             self.get_logger().info(
-                'Dry run: would call /voice_summon/set_body_follow_enabled data=%s'
-                % bool(enabled)
+                'Dry run: would call %s data=%s'
+                % (self.bodyfollow_mode_service, bool(enabled))
             )
             return
 
         if not self.follow_control_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error(
-                '/voice_summon/set_body_follow_enabled service is unavailable'
+                'Body follow mode service is unavailable: %s'
+                % self.bodyfollow_mode_service
             )
             return
 

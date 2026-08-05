@@ -8,7 +8,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from std_msgs.msg import Bool, Int8, String, UInt32
+from std_msgs.msg import Bool, String, UInt32
 from std_srvs.srv import SetBool
 
 
@@ -23,6 +23,8 @@ class VoiceSummonCoordinator(Node):
         self.declare_parameter('odom_topic', '/odom_combined')
         self.declare_parameter('body_posture_topic', '/body_posture_yolo_validated')
         self.declare_parameter('mode_topic', '/mode')
+        self.declare_parameter('bodyfollow_mode_service', '/bodyfollow/set_enabled')
+        self.declare_parameter('mode_service_retry_s', 0.5)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('feedback_topic', 'feedback_audio')
         self.declare_parameter('follow_control_service', '/voice_summon/set_body_follow_enabled')
@@ -92,8 +94,8 @@ class VoiceSummonCoordinator(Node):
             0.05, float(self.get_parameter('odom_fresh_timeout_s').value))
         self.mic_yaw_offset_rad = math.radians(
             float(self.get_parameter('mic_yaw_offset_deg').value))
-        self.mode_pause = int(self.get_parameter('mode_pause').value)
-        self.mode_follow = int(self.get_parameter('mode_follow').value)
+        self.mode_service_retry_s = max(
+            0.1, float(self.get_parameter('mode_service_retry_s').value))
         self.follow_distance_m = float(self.get_parameter('follow_distance_m').value)
         self.follow_complete_tolerance_m = float(self.get_parameter('follow_complete_tolerance_m').value)
         self.follow_complete_stable_s = float(self.get_parameter('follow_complete_stable_s').value)
@@ -131,11 +133,18 @@ class VoiceSummonCoordinator(Node):
         self.last_command_at = {}
         self.last_feedback_at = {}
         self.last_summon_started_at = 0.0
-        self.last_pause_publish = 0.0
         self.mapping_motion_blocked = False
+        self.desired_follow_enabled = None
+        self.desired_follow_reason = ''
+        self.mode_request_inflight = False
+        self.last_mode_request_at = 0.0
+        self.last_mode_service_warning_at = 0.0
 
-        mode_topic = self.get_parameter('mode_topic').value
-        self.mode_pub = self.create_publisher(Int8, mode_topic, 10)
+        # /mode used to be published directly from this node.  It is now an
+        # internal state bus owned by bodyfollow_mode_controller; voice only
+        # sends a SetBool request and retries if that controller is absent.
+        self.mode_service_name = self.get_parameter('bodyfollow_mode_service').value
+        self.mode_service_client = self.create_client(SetBool, self.mode_service_name)
         self.cmd_vel_pub = self.create_publisher(Twist, self.get_parameter('cmd_vel_topic').value, 10)
         self.feedback_pub = self.create_publisher(String, self.get_parameter('feedback_topic').value, 10)
 
@@ -182,7 +191,7 @@ class VoiceSummonCoordinator(Node):
         self.get_logger().info(
             'voice_summon_coordinator ready: summon=%s pause=%s enable_turn=%s '
             'angle_timeout=%.1fs odom=%s max_wz=%.2f tol=%.1fdeg '
-            'mode_pause=%d mode_follow=%d follow_distance=%.2fm stable=%.1fs'
+            'mode_service=%s follow_distance=%.2fm stable=%.1fs'
             % (
                 sorted(self.summon_commands),
                 sorted(self.pause_commands),
@@ -191,8 +200,7 @@ class VoiceSummonCoordinator(Node):
                 self.get_parameter('odom_topic').value,
                 self.turn_angular_speed_rad_s,
                 math.degrees(self.turn_tolerance_rad),
-                self.mode_pause,
-                self.mode_follow,
+                self.mode_service_name,
                 self.follow_distance_m,
                 self.follow_complete_stable_s,
             )
@@ -268,7 +276,8 @@ class VoiceSummonCoordinator(Node):
             return response
         self._set_follow_enabled(enabled, 'setbool_service', monitor_completion=False)
         response.success = True
-        response.message = 'body follow %s' % ('enabled' if enabled else 'disabled')
+        response.message = 'body follow %s request queued' % (
+            'enabled' if enabled else 'disabled')
         return response
 
     def _mapping_motion_blocked_callback(self, msg):
@@ -590,6 +599,7 @@ class VoiceSummonCoordinator(Node):
         self.last_turn_progress_log = 0.0
 
     def _timer_callback(self):
+        self._try_send_mode_request()
         if self.mapping_motion_blocked:
             return
         now = time.monotonic()
@@ -604,10 +614,6 @@ class VoiceSummonCoordinator(Node):
         if self.state == 'following' and self.follow_monitor_enabled:
             self._check_follow_complete(now)
             return
-
-        if self.state == 'idle' and self.publish_pause_while_idle:
-            if now - self.last_pause_publish >= self.pause_heartbeat_s:
-                self._publish_mode(self.mode_pause, 'idle_pause_heartbeat')
 
     def _check_follow_complete(self, now):
         if (
@@ -658,23 +664,82 @@ class VoiceSummonCoordinator(Node):
         if enabled:
             self.state = 'following' if monitor_completion else 'idle'
             self._publish_stop_cmd()
-            self._publish_mode(self.mode_follow, reason)
-            self.get_logger().info('Body follow enabled: %s monitor=%s' % (reason, monitor_completion))
+            self._request_follow_service(True, reason)
+            self.get_logger().info(
+                'Body follow enable requested: %s monitor=%s' % (reason, monitor_completion))
             return
 
         self.state = 'idle'
         self._reset_turn_tracking()
         self._publish_stop_cmd()
-        self._publish_mode(self.mode_pause, reason)
-        self.get_logger().info('Body follow disabled: %s' % reason)
+        self._request_follow_service(False, reason)
+        self.get_logger().info('Body follow disable requested: %s' % reason)
 
-    def _publish_mode(self, value, reason):
-        msg = Int8()
-        msg.data = int(value)
-        self.mode_pub.publish(msg)
-        if int(value) == self.mode_pause:
-            self.last_pause_publish = time.monotonic()
-        self.get_logger().debug('Publish /mode=%d reason=%s' % (value, reason))
+    def _request_follow_service(self, enabled, reason):
+        self.desired_follow_enabled = bool(enabled)
+        self.desired_follow_reason = str(reason)
+        self._try_send_mode_request()
+
+    def _try_send_mode_request(self):
+        if self.desired_follow_enabled is None or self.mode_request_inflight:
+            return
+
+        now = time.monotonic()
+        if now - self.last_mode_request_at < self.mode_service_retry_s:
+            return
+        self.last_mode_request_at = now
+
+        if not self.mode_service_client.service_is_ready():
+            if now - self.last_mode_service_warning_at >= 5.0:
+                self.last_mode_service_warning_at = now
+                self.get_logger().error(
+                    'Body follow mode service unavailable: %s; will retry desired=%s reason=%s'
+                    % (
+                        self.mode_service_name,
+                        self.desired_follow_enabled,
+                        self.desired_follow_reason,
+                    )
+                )
+            return
+
+        request = SetBool.Request()
+        request.data = self.desired_follow_enabled
+        requested_enabled = self.desired_follow_enabled
+        requested_reason = self.desired_follow_reason
+        self.mode_request_inflight = True
+        future = self.mode_service_client.call_async(request)
+        future.add_done_callback(
+            lambda completed, enabled=requested_enabled, reason=requested_reason:
+            self._mode_service_response(completed, enabled, reason))
+
+    def _mode_service_response(self, future, requested_enabled, requested_reason):
+        self.mode_request_inflight = False
+        try:
+            response = future.result()
+        except Exception as exc:  # Service transport failure: retry through timer.
+            self.get_logger().error(
+                'Body follow mode service call failed desired=%s reason=%s: %s'
+                % (requested_enabled, requested_reason, exc))
+            return
+
+        if not response.success:
+            self.get_logger().error(
+                'Body follow mode service rejected desired=%s reason=%s: %s'
+                % (requested_enabled, requested_reason, response.message))
+            return
+
+        self.get_logger().info(
+            'Body follow mode service applied enabled=%s reason=%s: %s'
+            % (requested_enabled, requested_reason, response.message))
+        if self.desired_follow_enabled == requested_enabled:
+            # This is the newest desired state, so a single acknowledged
+            # service call is enough.  Keep retrying only on failure or when
+            # another request replaced it while the call was in flight.
+            self.desired_follow_enabled = None
+            self.desired_follow_reason = ''
+            return
+        # A newer request arrived while this one was in flight.
+        self._try_send_mode_request()
 
     def _publish_stop_cmd(self):
         self.cmd_vel_pub.publish(Twist())

@@ -148,6 +148,8 @@ public:
     goal_position_tolerance_m_ = declare_parameter<double>("goal_position_tolerance_m", 0.45);
     goal_yaw_tolerance_rad_ = declare_parameter<double>("goal_yaw_tolerance_rad", 0.45);
     lost_timeout_s_ = declare_parameter<double>("lost_timeout_s", 1.0);
+    body_invalid_grace_s_ =
+      std::max(0.0, declare_parameter<double>("body_invalid_grace_s", 0.45));
     tf_timeout_s_ = declare_parameter<double>("tf_timeout_s", 0.20);
     max_retreat_goal_m_ = declare_parameter<double>("max_retreat_goal_m", 0.8);
     target_memory_timeout_s_ = declare_parameter<double>("target_memory_timeout_s", 8.0);
@@ -208,6 +210,8 @@ public:
     visual_max_linear_mps_ = declare_parameter<double>("visual_max_linear_mps", 0.75);
     visual_max_angular_rps_ = declare_parameter<double>("visual_max_angular_rps", 1.0);
     visual_linear_accel_limit_ = declare_parameter<double>("visual_linear_accel_limit", 0.90);
+    visual_reverse_accel_limit_ =
+      declare_parameter<double>("visual_reverse_accel_limit", 1.80);
     visual_linear_decel_limit_ = declare_parameter<double>("visual_linear_decel_limit", 0.35);
     visual_angular_accel_limit_ = declare_parameter<double>("visual_angular_accel_limit", 0.9);
     visual_allow_reverse_ = declare_parameter<bool>("visual_allow_reverse", true);
@@ -283,6 +287,7 @@ public:
     last_failed_goal_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_spin_send_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_body_time_ = this->now();
+    invalid_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_person_map_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_clear_person_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_cmd_time_ = this->now();
@@ -363,13 +368,42 @@ private:
     const bool valid_lock = msg->lock_status == 2;
     const bool valid_depth = msg->centerofmass_z > 100.0f;
     if (valid_lock && valid_depth) {
+      if (has_body_ && invalid_body_since_.nanoseconds() != 0) {
+        const double invalid_duration_s =
+          (this->now() - invalid_body_since_).seconds();
+        RCLCPP_INFO(
+          get_logger(), "Body observation recovered after %.3fs invalid interval",
+          invalid_duration_s);
+      }
+      invalid_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       latest_body_ = *msg;
       has_body_ = true;
       last_body_time_ = this->now();
       ++body_generation_;
     } else {
-      has_body_ = false;
-      reset_visual_clear_takeover_confirmation();
+      const auto now = this->now();
+      if (invalid_body_since_.nanoseconds() == 0) {
+        invalid_body_since_ = now;
+      }
+      const double invalid_duration_s = (now - invalid_body_since_).seconds();
+
+      if (has_body_ && invalid_duration_s < body_invalid_grace_s_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 250,
+          "Transient invalid body interval ignored: age=%.3fs grace=%.3fs "
+          "lock_status=%d depth_mm=%.0f",
+          invalid_duration_s, body_invalid_grace_s_, msg->lock_status, msg->centerofmass_z);
+        return;
+      }
+
+      if (has_body_) {
+        has_body_ = false;
+        reset_visual_clear_takeover_confirmation();
+        RCLCPP_WARN(
+          get_logger(),
+          "Body loss confirmed after %.3fs invalid interval: lock_status=%d depth_mm=%.0f",
+          invalid_duration_s, msg->lock_status, msg->centerofmass_z);
+      }
     }
   }
 
@@ -1178,9 +1212,11 @@ private:
     const bool speeding_up =
       !reversing_direction &&
       std::fabs(linear_target) > std::fabs(last_direct_cmd_.linear.x);
+    const double accel_limit = desired.linear.x < 0.0 ?
+      visual_reverse_accel_limit_ : visual_linear_accel_limit_;
     const double decel_limit = decel_limit_override >= 0.0 ?
       decel_limit_override : visual_linear_decel_limit_;
-    const double linear_limit = speeding_up ? visual_linear_accel_limit_ : decel_limit;
+    const double linear_limit = speeding_up ? accel_limit : decel_limit;
     const double max_linear_delta = std::max(0.0, linear_limit) * dt;
     const double max_angular_delta = std::max(0.0, visual_angular_accel_limit_) * dt;
 
@@ -1285,7 +1321,9 @@ private:
     if (!visual_hold_active_ && desired.linear.x != 0.0) {
       const double braking_distance_m = std::max(
         0.0, std::fabs(raw_distance_error_m) - distance_deadband_m);
-      const double braking_accel_mps2 = std::max(1e-3, visual_linear_accel_limit_);
+      const double braking_accel_mps2 = std::max(
+        1e-3, desired.linear.x < 0.0 ?
+        visual_reverse_accel_limit_ : visual_linear_accel_limit_);
       const double braking_speed_mps =
         std::sqrt(2.0 * braking_accel_mps2 * braking_distance_m);
       desired.linear.x = std::copysign(
@@ -1321,7 +1359,8 @@ private:
     }
 
     const double decel_limit = decel_limit_override >= 0.0 ?
-      decel_limit_override : visual_linear_accel_limit_;
+      decel_limit_override :
+      (desired.linear.x < 0.0 ? visual_reverse_accel_limit_ : visual_linear_accel_limit_);
     const auto cmd = smooth_direct_cmd(desired, now, decel_limit);
     visual_cmd_pub_->publish(cmd);
     last_visual_error_angle_ = error_x_angle;
@@ -2355,6 +2394,7 @@ private:
   double goal_position_tolerance_m_;
   double goal_yaw_tolerance_rad_;
   double lost_timeout_s_;
+  double body_invalid_grace_s_;
   double tf_timeout_s_;
   double max_retreat_goal_m_;
   double target_memory_timeout_s_;
@@ -2397,6 +2437,7 @@ private:
   double visual_max_linear_mps_;
   double visual_max_angular_rps_;
   double visual_linear_accel_limit_;
+  double visual_reverse_accel_limit_;
   double visual_linear_decel_limit_;
   double visual_angular_accel_limit_;
   double camera_offset_x_m_;
@@ -2456,6 +2497,7 @@ private:
   uint64_t visual_clear_takeover_last_body_generation_{0};
 
   rclcpp::Time last_body_time_;
+  rclcpp::Time invalid_body_since_;
   rclcpp::Time last_person_map_time_;
   rclcpp::Time last_clear_person_time_;
   rclcpp::Time last_goal_send_time_;

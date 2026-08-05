@@ -7,7 +7,7 @@ import rclpy
 import yaml
 from geometry_msgs.msg import Twist
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Int8, String
+from std_msgs.msg import Bool, Int8, String
 from std_srvs.srv import Trigger
 
 from auto_recharge_ros2.auto_recharger import (
@@ -20,6 +20,8 @@ from auto_recharge_ros2.auto_recharger import (
 START_SERVICE = '/auto_recharge/start'
 STOP_SERVICE = '/auto_recharge/stop'
 STATUS_TOPIC = '/auto_recharge/status'
+RESULT_TOPIC = '/auto_recharge/result'
+MAPPING_MOTION_GATE_TOPIC = '/stemm_cartographer/motion_blocked'
 
 
 def _load_robot_config(autorecharger):
@@ -58,11 +60,22 @@ class RechargeManager(AutoRecharger):
         self.nav2_wait_deadline = None
         self.last_terminal_state = 'startup'
         self.task_finished = True
+        self.mapping_motion_blocked = False
+        self.mapping_gate_received = False
 
         status_qos = QoSProfile(depth=1)
         status_qos.reliability = ReliabilityPolicy.RELIABLE
         status_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.status_pub = self.create_publisher(String, STATUS_TOPIC, status_qos)
+        result_qos = QoSProfile(depth=10)
+        result_qos.reliability = ReliabilityPolicy.RELIABLE
+        self.result_pub = self.create_publisher(String, RESULT_TOPIC, result_qos)
+        self.mapping_gate_sub = self.create_subscription(
+            Bool,
+            MAPPING_MOTION_GATE_TOPIC,
+            self._mapping_motion_gate_callback,
+            status_qos,
+        )
         self.start_service = self.create_service(
             Trigger, START_SERVICE, self._start_callback
         )
@@ -74,8 +87,15 @@ class RechargeManager(AutoRecharger):
         self._publish_status('IDLE', force=True)
         self.get_logger().info(
             'Persistent recharge manager ready: start=%s stop=%s status=%s; '
-            'Nav2 and localization are not started or reset by this node.'
-            % (START_SERVICE, STOP_SERVICE, STATUS_TOPIC)
+            'result=%s mapping_gate=%s; Nav2 and localization are not '
+            'started or reset by this node.'
+            % (
+                START_SERVICE,
+                STOP_SERVICE,
+                STATUS_TOPIC,
+                RESULT_TOPIC,
+                MAPPING_MOTION_GATE_TOPIC,
+            )
         )
 
     def _publish_status(self, status, force=False):
@@ -87,9 +107,22 @@ class RechargeManager(AutoRecharger):
         self.status_pub.publish(msg)
         self.get_logger().info('Recharge manager state: %s' % status)
 
+    def _publish_result(self, result):
+        msg = String()
+        msg.data = result
+        self.result_pub.publish(msg)
+        self.get_logger().info('Recharge manager result: %s' % result)
+
     def _start_callback(self, _request, response):
-        if self.manager_active:
+        if self.mapping_motion_blocked:
             response.success = False
+            response.message = (
+                'Cartographer mapping owns motion; recharge request is deferred.'
+            )
+            return response
+        if self.manager_active:
+            # Make retries idempotent when the first service response was lost.
+            response.success = True
             response.message = '回充任务已在执行，当前状态: %s' % self._status
             return response
 
@@ -117,6 +150,8 @@ class RechargeManager(AutoRecharger):
         self.waiting_for_nav2 = False
         self.nav2_wait_deadline = None
         self.last_terminal_state = 'CANCELED' if was_active else 'already idle'
+        if was_active:
+            self._publish_result('CANCELED:STOP_REQUEST')
         self._publish_status('IDLE', force=True)
         response.success = True
         response.message = (
@@ -127,6 +162,15 @@ class RechargeManager(AutoRecharger):
         return response
 
     def _begin_recharge(self):
+        if self.mapping_motion_blocked:
+            self.Cancel_Current_Task()
+            self.manager_active = False
+            self.waiting_for_nav2 = False
+            self.nav2_wait_deadline = None
+            self.last_terminal_state = 'CANCELED_MAPPING'
+            self._publish_result('CANCELED:MAPPING')
+            self._publish_status('IDLE', force=True)
+            return
         self.waiting_for_nav2 = False
         self.nav2_wait_deadline = None
 
@@ -140,6 +184,7 @@ class RechargeManager(AutoRecharger):
         if self.task_finished:
             self.last_terminal_state = 'FAILED_TO_START'
             self.manager_active = False
+            self._publish_result('FAILED:FAILED_TO_START')
             self._publish_status('IDLE', force=True)
             return
         self._update_active_status()
@@ -186,6 +231,7 @@ class RechargeManager(AutoRecharger):
                 self.manager_active = False
                 self.waiting_for_nav2 = False
                 self.nav2_wait_deadline = None
+                self._publish_result('FAILED:NAV2_UNAVAILABLE')
                 self._publish_status('IDLE', force=True)
             return
 
@@ -193,13 +239,48 @@ class RechargeManager(AutoRecharger):
         if self.task_finished:
             self.last_terminal_state = self.nav_last_failure_reason or 'FINISHED'
             self.manager_active = False
+            if self.robot['Charging'] == 1:
+                self._publish_result(
+                    'SUCCEEDED:%s' % self.last_terminal_state
+                )
+            else:
+                self._publish_result(
+                    'FAILED:%s' % self.last_terminal_state
+                )
             self._publish_status('IDLE', force=True)
             return
         self._update_active_status()
 
+    def _mapping_motion_gate_callback(self, msg):
+        blocked = bool(msg.data)
+        changed = blocked != self.mapping_motion_blocked
+        self.mapping_gate_received = True
+        self.mapping_motion_blocked = blocked
+        if changed:
+            self.get_logger().info(
+                'Cartographer motion gate changed: blocked=%s' % blocked
+            )
+        if not blocked or not self.manager_active:
+            return
+
+        self.Cancel_Current_Task()
+        self.manager_active = False
+        self.waiting_for_nav2 = False
+        self.nav2_wait_deadline = None
+        self.last_terminal_state = 'CANCELED_MAPPING'
+        self._publish_result('CANCELED:MAPPING')
+        self._publish_status('IDLE', force=True)
+
     def shutdown_manager(self):
         if self.manager_active:
             self.Cancel_Current_Task()
+        cancel_deadline = time.monotonic() + 2.0
+        while (
+            rclpy.ok()
+            and self.cancel_on_accept_futures
+            and time.monotonic() < cancel_deadline
+        ):
+            rclpy.spin_once(self, timeout_sec=0.1)
         try:
             self.nav_controller.destroy_node()
         except Exception:

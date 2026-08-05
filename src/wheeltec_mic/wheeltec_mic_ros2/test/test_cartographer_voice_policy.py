@@ -13,6 +13,8 @@ from cartographer_voice_policy import (
     motion_is_blocked,
     service_discovery_decision,
     service_request_decision,
+    should_preserve_confirmed_state,
+    success_feedback_audio,
     COMPLETE,
     SEND,
     TIMEOUT,
@@ -94,6 +96,27 @@ class CartographerVoicePolicyTest(unittest.TestCase):
         self.assertTrue(motion_is_blocked(STARTING, 'inactive', False))
         self.assertTrue(motion_is_blocked(IDLE, 'active', False))
         self.assertTrue(motion_is_blocked(IDLE, 'inactive', True))
+
+    def test_confirmed_state_survives_nav_gap_while_lock_is_held(self):
+        self.assertTrue(should_preserve_confirmed_state(
+            RUNNING, 'inactive', True, True, False))
+        self.assertTrue(should_preserve_confirmed_state(
+            PAUSED, 'inactive', True, True, False))
+        self.assertFalse(should_preserve_confirmed_state(
+            STARTING, 'inactive', True, True, False))
+        self.assertFalse(should_preserve_confirmed_state(
+            RUNNING, 'inactive', False, True, False))
+        self.assertFalse(should_preserve_confirmed_state(
+            RUNNING, 'inactive', True, True, True))
+
+    def test_success_feedback_audio(self):
+        self.assertEqual('/OK.wav', success_feedback_audio('save'))
+        self.assertEqual('/OK.wav', success_feedback_audio('pause'))
+        self.assertEqual(
+            '/mapping_return_home.wav',
+            success_feedback_audio('end'),
+        )
+        self.assertEqual('/OK.wav', success_feedback_audio('continue'))
 
 
 if __name__ == '__main__':

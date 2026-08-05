@@ -3,7 +3,8 @@ from threading import RLock
 
 import pytest
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped, Twist
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import PoseStamped, Transform, Twist
 from lifecycle_msgs.msg import State
 
 import stemm_cartographer_exploration.cartographer_manager as manager_module
@@ -132,6 +133,19 @@ class FakePublisher:
         self.messages.append(message)
 
 
+class FakeTransformBroadcaster:
+    def __init__(self):
+        self.transforms = []
+
+    def sendTransform(self, transform):
+        self.transforms.append(transform)
+
+
+class FakeClock:
+    def now(self):
+        return SimpleNamespace(to_msg=Time)
+
+
 class ManagerHarness(StemmCartographerNav2Manager):
     def __init__(self):
         pass
@@ -201,6 +215,22 @@ def make_manager():
     manager._spin_cancel_reason = None
     manager._spin_transport_fault = False
     manager._cartographer_spin_active = False
+    manager.cartographer_finish_client = FakeClient()
+    manager.cartographer_trajectory_id = 0
+    manager.cartographer_finish_timeout_sec = 10.0
+    manager.cartographer_finish_tf_translation_tolerance_m = 0.01
+    manager.cartographer_finish_tf_rotation_tolerance_rad = 0.01
+    manager._cartographer_finish_future = None
+    manager._cartographer_finish_started_at = 0.0
+    manager._cartographer_trajectory_finished = False
+    manager._cartographer_return_tf_anchor = None
+    manager._cartographer_return_tf_stable_since = 0.0
+    manager._last_cartographer_tf_motion_log = 0.0
+    manager._frozen_return_map_to_odom = None
+    manager._frozen_return_tf_broadcaster = FakeTransformBroadcaster()
+    manager.get_clock = lambda: FakeClock()
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: _tf_sample())
     manager._costmap_clear_clients = {}
     manager._costmap_clear_futures = []
     manager.spin_client = FakeSpinClient()
@@ -242,7 +272,14 @@ def make_manager():
     manager.return_home_quiet_sec = 2.0
     manager.return_home_ready_after = 0.0
     manager.return_home_tf_stable_since = 0.0
+    manager.last_return_home_wait_log = 0.0
     manager.return_home_retry_count = 0
+    manager.return_home_max_retries = 3
+    manager.return_home_retry_delay_sec = 2.0
+    manager._map_revision = 0
+    manager._final_map_finish_revision = None
+    manager._final_map_wait_started_at = 0.0
+    manager._mapping_cancel_requested = False
     manager.nav_goal_active = False
     manager.goal_send_future = None
     manager.goal_result_future = None
@@ -322,6 +359,7 @@ class FakeClient:
 
     def call_async(self, _request):
         self.call_count += 1
+        self.last_request = _request
         self.last_future = FakeFuture()
         return self.last_future
 
@@ -682,6 +720,121 @@ def test_mapping_done_stops_recovery_before_home_dispatch():
     assert manager.zero_count == 1
 
 
+def _finish_response(code=0, message='finished'):
+    return SimpleNamespace(
+        status=SimpleNamespace(code=code, message=message))
+
+
+def test_mapping_done_finishes_cartographer_before_home_dispatch(monkeypatch):
+    manager = make_manager()
+    manager._save_final_map_before_return = lambda: (
+        True, 'final map already saved')
+    dispatched = []
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        '_dispatch_pending_home_goal',
+        lambda _self: (dispatched.append('home') or (True, 'home dispatched')),
+    )
+
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=True), SimpleNamespace())
+
+    assert manager.cartographer_finish_client.call_count == 1
+    assert manager.cartographer_finish_client.last_request.trajectory_id == 0
+    assert dispatched == []
+
+    manager.cartographer_finish_client.last_future.resolve(_finish_response())
+    started, message = manager._dispatch_pending_home_goal()
+
+    assert started
+    assert message == 'home dispatched'
+    assert manager._cartographer_trajectory_finished
+    assert dispatched == ['home']
+
+
+def test_finished_cartographer_rebroadcasts_final_map_to_odom():
+    manager = make_manager()
+    sampled = _tf_sample(x=0.31, y=-0.27)
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: sampled)
+    manager._cartographer_finish_future = FakeFuture(
+        done=True, result_value=_finish_response())
+
+    finished, _ = manager._finish_cartographer_trajectory_before_return()
+
+    assert finished
+    assert manager._cartographer_trajectory_finished
+    assert manager._frozen_return_map_to_odom.header.frame_id == 'map'
+    assert manager._frozen_return_map_to_odom.child_frame_id == 'odom_combined'
+    assert manager._frozen_return_map_to_odom.transform.translation.x == 0.31
+    assert manager._frozen_return_map_to_odom.transform.translation.y == -0.27
+    assert len(manager._frozen_return_tf_broadcaster.transforms) == 1
+
+
+def test_cartographer_finish_failure_retries_before_home_dispatch(monkeypatch):
+    manager = make_manager()
+    dispatched = []
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        '_dispatch_pending_home_goal',
+        lambda _self: (dispatched.append('home') or (True, 'home dispatched')),
+    )
+
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=True), SimpleNamespace())
+    manager.cartographer_finish_client.last_future.resolve(
+        _finish_response(2, 'trajectory is not active'))
+    started, message = manager._dispatch_pending_home_goal()
+
+    assert not started
+    assert 'was rejected' in message
+    assert 'retrying return-home 1/3' in message
+    assert manager.navigation_state == 'return_home_retry_recovery'
+    assert manager.mode == 'returning_home'
+    assert manager.pending_home_goal
+    assert dispatched == []
+
+
+def _tf_sample(x=0.0, y=0.0):
+    transform = Transform()
+    transform.translation.x = x
+    transform.translation.y = y
+    transform.rotation.w = 1.0
+    return SimpleNamespace(
+        header=SimpleNamespace(frame_id='map'),
+        child_frame_id='odom_combined',
+        transform=transform)
+
+
+def test_finished_cartographer_requires_final_tf_settle_window(monkeypatch):
+    manager = make_manager()
+    manager.mapping_done = True
+    manager._cartographer_trajectory_finished = True
+    samples = [_tf_sample()]
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: samples[0])
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        '_tf_is_recent',
+        lambda *_args, **_kwargs: True,
+    )
+
+    assert not manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+    now[0] += 1.4
+    assert not manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+    now[0] += 0.2
+    assert manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+
+    samples[0] = _tf_sample(x=0.02)
+    assert not manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+
+
 def test_mapping_done_waits_for_terminal_result_before_home(monkeypatch):
     now = [10.0]
     monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
@@ -728,7 +881,10 @@ def test_home_precheck_recovery_never_uses_exploration_spin(monkeypatch):
         lambda _self: calls.append('inherited_home_recovery'),
     )
     manager = make_manager()
+    manager._save_final_map_before_return = lambda: (
+        True, 'final map already saved')
     manager.mapping_done = True
+    manager._cartographer_trajectory_finished = True
     manager.auto_explore = False
     manager.pending_home_goal = True
     manager._active_goal_kind = 'exploration_manager'
@@ -2222,3 +2378,36 @@ def test_rrt_projection_rejects_area_without_known_free_cell():
     assert projected is None
     assert not changed
     assert 'no safe known-free projection' in error
+
+def test_return_home_setup_failures_are_retried_before_manual_takeover(
+        monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    manager.return_home_max_retries = 3
+    manager.return_home_retry_delay_sec = 2.0
+    manager._final_map_finish_revision = None
+    manager._final_map_wait_started_at = 0.0
+
+    started, message = manager._fail_return_home_before_dispatch(
+        'temporary Cartographer TF gap')
+
+    assert not started
+    assert 'retrying return-home 1/3' in message
+    assert manager.return_home_retry_count == 1
+    assert manager.pending_home_goal
+    assert not manager.return_home_requested
+    assert manager.mode == 'returning_home'
+    assert manager.navigation_state == 'return_home_retry_recovery'
+    assert manager.return_home_ready_after == pytest.approx(102.0)
+
+    manager.return_home_retry_count = manager.return_home_max_retries
+    started, message = manager._fail_return_home_before_dispatch(
+        'persistent Cartographer TF gap')
+
+    assert not started
+    assert 'failed after 3 retries' in message
+    assert manager.return_home_retry_count == 4
+    assert not manager.pending_home_goal
+    assert manager.mode == 'stopped'
+    assert manager.navigation_state == 'return_home_failed_waiting_manual'

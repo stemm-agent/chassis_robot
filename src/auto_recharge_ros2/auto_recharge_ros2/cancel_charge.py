@@ -109,9 +109,12 @@ class CancelChargeNode(Node):
         )
 
         manager_stop_confirmed = self._request_manager_stop()
-        # Keep the legacy broad action cancellation as a compatibility safety
-        # net for a goal whose response/handle had not reached the manager yet.
-        self._cancel_navigation_goal()
+        # The manager now arms exact cancellation even while its goal response
+        # is pending.  Broad cancellation is reserved for an active recharge
+        # task whose manager stop request could not be confirmed, so an idle
+        # "cancel recharge" command cannot cancel unrelated navigation.
+        if task_was_active and not manager_stop_confirmed:
+            self._cancel_navigation_goal()
         self._publish_chassis_security(True)
         self._stop_robot()
         # Exit the MCU's automatic-recharge mode before sending a normal

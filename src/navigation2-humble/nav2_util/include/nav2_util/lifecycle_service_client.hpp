@@ -51,7 +51,9 @@ public:
   /**
    * Throws std::runtime_error on failure
    */
-  uint8_t get_state(const std::chrono::seconds timeout = std::chrono::seconds(2));
+  // ControllerServer may take several seconds to finish its mapping-specific configure callback.
+  // Avoid treating the transiently busy GetState endpoint as absent.
+  uint8_t get_state(const std::chrono::seconds timeout = std::chrono::seconds(10));
 
 protected:
   rclcpp::Node::SharedPtr node_;

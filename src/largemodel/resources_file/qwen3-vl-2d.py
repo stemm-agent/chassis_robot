@@ -206,7 +206,7 @@ def inference_with_api(prompt, sys_prompt="You are a helpful assistant.", model_
     client = OpenAI(
         # 若没有配置环境变量，请用阿里云百炼API Key将下行替换为：api_key="sk-xxx",
         # api_key=os.getenv("api_key"),
-        api_key=os.environ.get("QWEN_API_KEY", ""),
+        api_key="sk-d0d3dfdd77e448c28c8b70ac76a544cc",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
     )
     local_img = "image.png" 

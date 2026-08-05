@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Read-only collection logger for bearing-only voice summon calibration."""
+
+import json
+import math
+import os
+import statistics
+import time
+
+import rclpy
+from bodyreader_msg.msg import Bodyposture
+from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from std_msgs.msg import Int8, String, UInt32
+
+
+def wrap(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_from_quaternion(q):
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
+class VoiceSummonShadowLogger(Node):
+    """Observes production summon sessions; never publishes motion or mode."""
+
+    def __init__(self):
+        super().__init__('voice_summon_shadow_logger')
+        self.declare_parameter('enabled', True)
+        self.declare_parameter('summon_commands', ['小车过来'])
+        self.declare_parameter('awake_angle_topic', 'awake_angle')
+        self.declare_parameter('voice_words_topic', 'voice_words')
+        self.declare_parameter('odom_topic', '/odom_combined')
+        self.declare_parameter('mode_topic', '/mode')
+        self.declare_parameter('body_posture_topic', '/body_posture_yolo_validated')
+        self.declare_parameter('mode_follow', 2)
+        self.declare_parameter('angle_fresh_timeout_s', 15.0)
+        self.declare_parameter('mode2_timeout_s', 15.0)
+        self.declare_parameter('truth_capture_timeout_s', 4.0)
+        self.declare_parameter('truth_min_samples', 4)
+        self.declare_parameter('truth_stable_s', 0.50)
+        self.declare_parameter('max_displacement_m', 0.10)
+        self.declare_parameter('mic_yaw_offset_deg', -20.0)
+        self.declare_parameter('log_dir', '/home/wheeltec/.ros/voice_summon_shadow')
+        self.declare_parameter('log_filename', 'records.jsonl')
+
+        self.enabled = bool(self.get_parameter('enabled').value)
+        self.summon_commands = set(self.get_parameter('summon_commands').value)
+        self.angle_fresh_timeout_s = float(self.get_parameter('angle_fresh_timeout_s').value)
+        self.mode2_timeout_s = float(self.get_parameter('mode2_timeout_s').value)
+        self.truth_capture_timeout_s = float(self.get_parameter('truth_capture_timeout_s').value)
+        self.truth_min_samples = int(self.get_parameter('truth_min_samples').value)
+        self.truth_stable_s = float(self.get_parameter('truth_stable_s').value)
+        self.max_displacement_m = float(self.get_parameter('max_displacement_m').value)
+        self.mic_yaw_offset_rad = math.radians(float(self.get_parameter('mic_yaw_offset_deg').value))
+        log_dir = os.path.abspath(str(self.get_parameter('log_dir').value))
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        self.log_path = os.path.join(log_dir, str(self.get_parameter('log_filename').value))
+
+        self.latest_odom = None
+        self.latest_odom_monotonic = 0.0
+        self.latest_angle = None
+        self.latest_angle_ref = None
+        self.latest_angle_monotonic = 0.0
+        self.session = None
+        self.sequence = 0
+
+        self.create_subscription(UInt32, self.get_parameter('awake_angle_topic').value, self._angle_cb, 20)
+        self.create_subscription(String, self.get_parameter('voice_words_topic').value, self._voice_cb, 20)
+        self.create_subscription(Odometry, self.get_parameter('odom_topic').value, self._odom_cb, 30)
+        self.create_subscription(Int8, self.get_parameter('mode_topic').value, self._mode_cb, 20)
+        self.create_subscription(Bodyposture, self.get_parameter('body_posture_topic').value, self._body_cb, 30)
+        self.status_pub = self.create_publisher(String, '/voice_summon/shadow_status', 10)
+        self.create_timer(0.10, self._timer_cb)
+        self.get_logger().info('Voice summon shadow logger ready: %s' % self.log_path)
+
+    def _odom_cb(self, msg):
+        pose = msg.pose.pose
+        self.latest_odom = {
+            'x_m': float(pose.position.x),
+            'y_m': float(pose.position.y),
+            'yaw_rad': yaw_from_quaternion(pose.orientation),
+        }
+        self.latest_odom_monotonic = time.monotonic()
+
+    def _angle_cb(self, msg):
+        now = time.monotonic()
+        self.latest_angle = int(msg.data) % 360
+        self.latest_angle_monotonic = now
+        self.latest_angle_ref = dict(self.latest_odom) if self.latest_odom else None
+
+    def _voice_cb(self, msg):
+        command = msg.data.strip()
+        if command not in self.summon_commands or not self.enabled:
+            return
+        now = time.monotonic()
+        if self.session is not None:
+            self._write_record('superseded_by_new_summon')
+        self.sequence += 1
+        fresh_angle = self.latest_angle is not None and now - self.latest_angle_monotonic <= self.angle_fresh_timeout_s
+        self.session = {
+            'session_id': 'shadow-%d-%04d' % (int(time.time() * 1000), self.sequence),
+            'command': command,
+            'command_unix_s': time.time(),
+            'command_monotonic': now,
+            'state': 'await_mode2',
+            'awake_angle_deg': self.latest_angle if fresh_angle else None,
+            'wake_pose': dict(self.latest_angle_ref) if fresh_angle and self.latest_angle_ref else None,
+            'command_pose': dict(self.latest_odom) if self.latest_odom else None,
+            'samples': [],
+            'body_id': None,
+        }
+        self._publish_status('session_started')
+
+    def _mode_cb(self, msg):
+        if self.session is None or self.session['state'] != 'await_mode2':
+            return
+        if int(msg.data) != int(self.get_parameter('mode_follow').value) or self.latest_odom is None:
+            return
+        now = time.monotonic()
+        turn_done_pose = dict(self.latest_odom)
+        wake_pose = self.session['wake_pose']
+        awake_angle = self.session['awake_angle_deg']
+        target_yaw = None
+        actual_turn = None
+        target_error = None
+        if wake_pose is not None and awake_angle is not None:
+            relative_deg = awake_angle if awake_angle <= 180 else awake_angle - 360
+            target_yaw = wrap(wake_pose['yaw_rad'] - math.radians(relative_deg) + self.mic_yaw_offset_rad)
+            actual_turn = wrap(turn_done_pose['yaw_rad'] - wake_pose['yaw_rad'])
+            target_error = wrap(turn_done_pose['yaw_rad'] - target_yaw)
+        self.session.update({
+            'state': 'capture_truth',
+            'turn_done_monotonic': now,
+            'turn_done_pose': turn_done_pose,
+            'target_yaw_rad': target_yaw,
+            'actual_turn_rad': actual_turn,
+            'turn_target_error_rad': target_error,
+        })
+        self._publish_status('turn_done_capture_open')
+
+    def _body_cb(self, msg):
+        session = self.session
+        if session is None or session['state'] != 'capture_truth' or self.latest_odom is None:
+            return
+        if msg.lock_status != 2 or msg.centerofmass_z <= 100.0:
+            return
+        now = time.monotonic()
+        origin = session['turn_done_pose']
+        displacement = math.hypot(self.latest_odom['x_m'] - origin['x_m'], self.latest_odom['y_m'] - origin['y_m'])
+        if displacement > self.max_displacement_m:
+            return
+        body_id = int(msg.bodyid)
+        if session['body_id'] is not None and body_id != session['body_id']:
+            session['samples'] = []
+        session['body_id'] = body_id
+        x_m = float(msg.centerofmass_x) * 0.001
+        z_m = float(msg.centerofmass_z) * 0.001
+        session['samples'].append({
+            'body_id': body_id,
+            'distance_m': math.hypot(x_m, z_m),
+            'relative_bearing_rad': math.atan2(x_m, z_m),
+            'displacement_m': displacement,
+            'monotonic': now,
+        })
+        samples = session['samples']
+        if len(samples) >= self.truth_min_samples and now - samples[0]['monotonic'] >= self.truth_stable_s:
+            self._write_record('visual_truth_stable')
+
+    def _timer_cb(self):
+        if self.session is None:
+            return
+        now = time.monotonic()
+        if self.session['state'] == 'await_mode2' and now - self.session['command_monotonic'] > self.mode2_timeout_s:
+            self._write_record('mode2_timeout')
+        elif self.session['state'] == 'capture_truth' and now - self.session['turn_done_monotonic'] > self.truth_capture_timeout_s:
+            self._write_record('visual_truth_timeout')
+
+    def _write_record(self, outcome):
+        session = self.session
+        if session is None:
+            return
+        samples = session['samples']
+        record = {key: value for key, value in session.items() if key not in ('samples', 'state')}
+        record['outcome'] = outcome
+        record['recorded_unix_s'] = time.time()
+        record['sample_count'] = len(samples)
+        if samples:
+            record['visual_body_id'] = session['body_id']
+            record['visual_distance_m'] = statistics.median(item['distance_m'] for item in samples)
+            record['visual_relative_bearing_rad'] = statistics.median(item['relative_bearing_rad'] for item in samples)
+            record['max_capture_displacement_m'] = max(item['displacement_m'] for item in samples)
+        with open(self.log_path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+        self.get_logger().info('Shadow record %s outcome=%s samples=%d' % (record['session_id'], outcome, len(samples)))
+        self._publish_status(outcome)
+        self.session = None
+
+    def _publish_status(self, state):
+        msg = String()
+        msg.data = state
+        self.status_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VoiceSummonShadowLogger()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
