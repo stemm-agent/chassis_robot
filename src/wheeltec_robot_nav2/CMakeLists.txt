@@ -22,6 +22,8 @@ find_package(ament_cmake REQUIRED)
 find_package(nav2_bringup REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -33,6 +35,13 @@ ament_target_dependencies(amcl_tf_guard
   tf2
   tf2_geometry_msgs
   tf2_ros
+)
+
+add_executable(amcl_noise_scheduler src/amcl_noise_scheduler.cpp)
+ament_target_dependencies(amcl_noise_scheduler
+  rclcpp
+  nav_msgs
+  sensor_msgs
 )
 
 if(BUILD_TESTING)
@@ -56,6 +65,7 @@ install(
 
 install(
   TARGETS amcl_tf_guard
+  amcl_noise_scheduler
   DESTINATION lib/${PROJECT_NAME}
 )
 

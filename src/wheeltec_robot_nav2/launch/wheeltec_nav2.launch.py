@@ -40,6 +40,7 @@ def generate_launch_description():
     # Only enable it for the profile whose AMCL tf_broadcast is disabled below.
     enable_amcl_tf_guard = LaunchConfiguration('enable_amcl_tf_guard')
     guard_default = 'true' if car_mode == 'four_wheel_diff' else 'false'
+    enable_amcl_noise_scheduler = LaunchConfiguration('enable_amcl_noise_scheduler')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -59,6 +60,10 @@ def generate_launch_description():
             'enable_amcl_tf_guard',
             default_value=guard_default,
             description='Publish guarded map to odom_combined TF from AMCL poses'),
+        DeclareLaunchArgument(
+            'enable_amcl_noise_scheduler',
+            default_value='false',
+            description='Dynamically tune AMCL motion and laser noise after validation'),
         Node(
             name='waypoint_cycle',
             package='nav2_waypoint_cycle',
@@ -94,6 +99,20 @@ def generate_launch_description():
                 'max_odom_yaw_correction': 0.35,
             }],
             condition=IfCondition(enable_amcl_tf_guard),
+        ),
+        Node(
+            name='amcl_noise_scheduler',
+            package='wheeltec_nav2',
+            executable='amcl_noise_scheduler',
+            output='screen',
+            parameters=[{
+                'amcl_node': '/amcl',
+                'odom_topic': '/odom_combined',
+                'scan_topic': '/scan',
+                'max_linear_speed': 0.5,
+                'max_angular_speed': 2.0,
+            }],
+            condition=IfCondition(enable_amcl_noise_scheduler),
         ),
         
         IncludeLaunchDescription(
