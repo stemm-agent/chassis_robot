@@ -36,6 +36,11 @@ def generate_launch_description():
         param_dir, f'param_{car_mode}.yaml'))
     print(os.path.join(param_dir, f'param_{car_mode}.yaml'))
 
+    # AMCL calculates /amcl_pose while this node owns map -> odom_combined.
+    # Only enable it for the profile whose AMCL tf_broadcast is disabled below.
+    enable_amcl_tf_guard = LaunchConfiguration('enable_amcl_tf_guard')
+    guard_default = 'true' if car_mode == 'four_wheel_diff' else 'false'
+
     return LaunchDescription([
         DeclareLaunchArgument(
             'map',
@@ -50,6 +55,10 @@ def generate_launch_description():
             'enable_lasertracker',
             default_value='true',
             description='Start the shared laser tracker with Nav2'),
+        DeclareLaunchArgument(
+            'enable_amcl_tf_guard',
+            default_value=guard_default,
+            description='Publish guarded map to odom_combined TF from AMCL poses'),
         Node(
             name='waypoint_cycle',
             package='nav2_waypoint_cycle',
@@ -65,6 +74,26 @@ def generate_launch_description():
             executable='lasertracker',
             output='screen',
             condition=IfCondition(enable_lasertracker),
+        ),
+        Node(
+            name='amcl_tf_guard',
+            package='wheeltec_nav2',
+            executable='amcl_tf_guard',
+            output='screen',
+            parameters=[{
+                'global_frame': 'map',
+                'odom_frame': 'odom_combined',
+                'base_frame': 'base_footprint',
+                # Keep these aligned with the four_wheel_diff MPPI limits.
+                'max_linear_speed': 0.5,
+                'max_angular_speed': 2.0,
+                'max_linear_acceleration': 1.5,
+                'max_angular_acceleration': 1.5,
+                # Conservative localization correction bounds for corridor aliases.
+                'max_odom_correction': 0.30,
+                'max_odom_yaw_correction': 0.35,
+            }],
+            condition=IfCondition(enable_amcl_tf_guard),
         ),
         
         IncludeLaunchDescription(

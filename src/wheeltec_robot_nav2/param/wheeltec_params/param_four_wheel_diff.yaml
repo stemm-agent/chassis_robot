@@ -33,13 +33,16 @@ amcl:
 
     save_pose_rate: 0.5             #将最后估计的姿势和协方差存储到参数服务器的最大速率（Hz）
     sigma_hit: 0.2                 #模型的 z_hit 部分中使用的高斯模型的标准差
-    tf_broadcast: true              #将其设置为 false 以防止 amcl 发布全局框架和里程计框架之间的变换
+    # map -> odom_combined is published by amcl_tf_guard.  This prevents
+    # an ambiguous corridor observation from directly jumping Nav2's TF.
+    tf_broadcast: false
     transform_tolerance: 1.0        #发布转换的容差
     update_min_a: 0.2              #执行过滤器更新之前需要进行旋转运动。
     update_min_d: 0.25             #执行过滤器更新之前需要进行平移运动
-    z_hit: 0.5                      #模型的 z_hit 部分的混合权重，所有使用的 z 权重之和必须为 1。
+    # The four likelihood weights below are normalized to one.
+    z_hit: 0.70
     z_max: 0.05                    #模型的 z_max 部分的混合权重，所有使用的 z 权重之和必须为 1。
-    z_rand: 0.5                   #模型的 z_rand 部分的混合权重，所有使用的 z 权重之和必须为 1。
+    z_rand: 0.20
     z_short: 0.05                   #模型中 z_short 部分的混合权重，所有使用的 z 权重之和必须为 1。
     scan_topic: scan                #要订阅的激光雷达
 

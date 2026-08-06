@@ -20,6 +20,20 @@ add_compile_options(-g)
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(nav2_bringup REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+
+add_executable(amcl_tf_guard src/amcl_tf_guard.cpp)
+ament_target_dependencies(amcl_tf_guard
+  rclcpp
+  geometry_msgs
+  tf2
+  tf2_geometry_msgs
+  tf2_ros
+)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -38,6 +52,11 @@ endif()
 install(
   DIRECTORY behavior_trees launch map param rviz
   DESTINATION share/${PROJECT_NAME}
+)
+
+install(
+  TARGETS amcl_tf_guard
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 ament_package()
