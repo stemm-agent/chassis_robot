@@ -17,6 +17,7 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool, Trigger
 
 from cartographer_voice_policy import (
+    apply_pause_latch,
     ENDING,
     IDLE,
     PAUSED,
@@ -29,6 +30,8 @@ from cartographer_voice_policy import (
     motion_is_blocked,
     service_discovery_decision,
     service_request_decision,
+    should_preserve_confirmed_state,
+    success_feedback_audio,
     COMPLETE,
     SEND,
     TIMEOUT,
@@ -54,12 +57,20 @@ class VoiceCartographerBridge(Node):
             '/usr/local/sbin/stemm-cartographer-session-control')
         self.declare_parameter(
             'session_lock_file', '/tmp/stemm-cartographer-exploration.lock')
+        self.declare_parameter(
+            'session_status_path',
+            '/home/wheeltec/.local/state/stemm-cartographer-session.json')
         self.declare_parameter('status_poll_sec', 0.5)
         self.declare_parameter('nav_state_fresh_sec', 3.0)
+        self.declare_parameter('session_status_fresh_sec', 3.0)
+        self.declare_parameter('external_resume_stable_sec', 0.5)
         self.declare_parameter('service_discovery_timeout_sec', 3.0)
         self.declare_parameter('service_request_timeout_sec', 12.0)
         self.declare_parameter('save_request_timeout_sec', 55.0)
-        self.declare_parameter('start_confirmation_timeout_sec', 75.0)
+        # The slowest verified startup reached the mapping-ready state
+        # just after 100s under load. Leave margin for a clean,
+        # deterministic readiness result instead of a false failure.
+        self.declare_parameter('start_confirmation_timeout_sec', 120.0)
         self.declare_parameter('command_cooldown_sec', 1.0)
         self.declare_parameter('dry_run', False)
 
@@ -68,10 +79,16 @@ class VoiceCartographerBridge(Node):
             self.get_parameter('session_control_helper').value)
         self.session_lock_file = str(
             self.get_parameter('session_lock_file').value)
+        self.session_status_path = str(
+            self.get_parameter('session_status_path').value)
         self.status_poll_sec = max(
             0.2, float(self.get_parameter('status_poll_sec').value))
         self.nav_state_fresh_sec = max(
             1.0, float(self.get_parameter('nav_state_fresh_sec').value))
+        self.session_status_fresh_sec = max(
+            0.5, float(self.get_parameter('session_status_fresh_sec').value))
+        self.external_resume_stable_sec = max(
+            0.1, float(self.get_parameter('external_resume_stable_sec').value))
         self.service_discovery_timeout_sec = max(
             0.1,
             float(self.get_parameter('service_discovery_timeout_sec').value),
@@ -104,6 +121,17 @@ class VoiceCartographerBridge(Node):
         self._start_future = None
         self._start_confirm_deadline = 0.0
         self._force_starting = False
+        # Nav2 changes mode while it cancels a goal. A successful voice
+        # pause must remain a PAUSED session until continue/end/close.
+        self._voice_pause_latched = False
+        self._voice_pause_latched_at_epoch_ms = 0
+        # A mini-program resume calls the manager service directly, so it does
+        # not pass through this bridge's ``continue`` callback.  Track a
+        # separately observed, stable manager/session resume before clearing
+        # the voice pause latch; never infer a resume from one transient frame.
+        self._external_resume_candidate_since = 0.0
+        self._session_status = None
+        self._session_status_error = ''
         self._emergency_pause_queued = False
         self._status_future = None
         self._next_status_poll_at = 0.0
@@ -226,10 +254,12 @@ class VoiceCartographerBridge(Node):
             return
 
         self._force_starting = True
+        self._voice_pause_latched = False
+        self._voice_pause_latched_at_epoch_ms = 0
         self._state = STARTING
         self._nav_state = None
         self._nav_state_received_at = 0.0
-        self._publish_feedback('/2d_mapping.wav')
+        self._publish_feedback('/mapping_exploration_start.wav')
         self._publish_state(force=True)
         self.get_logger().info('Accepted voice request to start mapping.')
         self._last_message = '开始建图已受理，正在启动独立建图会话'
@@ -273,7 +303,7 @@ class VoiceCartographerBridge(Node):
             self._state = IDLE
             self.get_logger().error('Mapping session start failed: %s' % message)
             self._last_message = '建图会话启动失败：%s' % message
-            self._publish_feedback('/overmap.wav')
+            self._publish_feedback('/mapping_failure_retry.wav')
             self._publish_state(force=True)
             return
         self._start_confirm_deadline = now + self.start_confirmation_timeout_sec
@@ -316,10 +346,8 @@ class VoiceCartographerBridge(Node):
             'future': None,
             'emergency': bool(emergency),
         }
-        if not emergency:
-            self._publish_feedback('/OK.wav')
         if action == 'end':
-            self._last_message = '结束建图已受理；本操作不会自动保存地图'
+            self._last_message = '结束建图已受理；正在固化并保存最终地图'
             self.get_logger().warn(self._last_message)
         else:
             self._last_message = '建图控制请求已受理：%s' % action
@@ -409,38 +437,39 @@ class VoiceCartographerBridge(Node):
         emergency = bool(pending.get('emergency'))
         self._pending_service = None
         if action == 'pause':
+            self._voice_pause_latched = True
+            self._voice_pause_latched_at_epoch_ms = int(time.time() * 1000)
             self._state = PAUSED
             mapping_done = bool(
                 (self._nav_state or {}).get('mapping_done')) if emergency else False
             self._cache_nav_transition(
                 'stopped', mapping_done=mapping_done)
-            self._publish_feedback('/stop.wav')
         elif action == 'continue':
+            self._voice_pause_latched = False
+            self._voice_pause_latched_at_epoch_ms = 0
             self._state = RUNNING
             self._cache_nav_transition('mapping', mapping_done=False)
-            self._publish_feedback('/OK.wav')
         elif action == 'end':
+            self._voice_pause_latched = False
+            self._voice_pause_latched_at_epoch_ms = 0
             self._state = ENDING
             self._cache_nav_transition('returning_home', mapping_done=True)
-            self._publish_feedback('/2d_mapping_close.wav')
-        elif action == 'save':
-            self._publish_feedback('/OK.wav')
+        feedback_audio = success_feedback_audio(action)
+        if feedback_audio is not None:
+            self._publish_feedback(feedback_audio)
         self.get_logger().info(
             'Mapping voice action %s succeeded: %s' % (action, message))
         if action == 'end':
-            self._last_message = '结束建图已执行，正在返航；地图未自动保存'
+            self._last_message = '结束建图已执行；最终地图将保存后再返航'
         else:
             self._last_message = '%s 执行成功：%s' % (action, message)
         self._publish_state(force=True)
 
     def _finish_service_failure(self, message, unavailable):
-        pending = self._pending_service
         self._pending_service = None
         self.get_logger().error(message)
         self._last_message = message
-        if pending is None or not pending.get('emergency'):
-            self._publish_feedback(
-                '/close_node.wav' if unavailable else '/overmap.wav')
+        self._publish_feedback('/mapping_failure_retry.wav')
         self._publish_state(force=True)
 
     def _cache_nav_transition(self, mode, mapping_done):
@@ -453,8 +482,7 @@ class VoiceCartographerBridge(Node):
     def _reject(self, message, unavailable):
         self.get_logger().warn('Reject mapping voice command: %s' % message)
         self._last_message = message
-        self._publish_feedback(
-            '/close_node.wav' if unavailable else '/overmap.wav')
+        self._publish_feedback('/mapping_failure_retry.wav')
 
     def _nav_state_callback(self, msg):
         try:
@@ -488,6 +516,19 @@ class VoiceCartographerBridge(Node):
         self._check_start_confirmation(now)
         self._publish_state()
 
+    def _read_session_status(self):
+        """Read the atomically written manager status as resume evidence."""
+        try:
+            with open(self.session_status_path, 'r', encoding='utf-8') as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            return None, ''
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            return None, str(exc)
+        if not isinstance(payload, dict):
+            return None, 'session status is not a JSON object'
+        return payload, ''
+
     def _query_external_status(self):
         try:
             completed = subprocess.run(
@@ -505,7 +546,14 @@ class VoiceCartographerBridge(Node):
                 completed.stderr.strip() or 'systemctl show failed')
         except (OSError, subprocess.SubprocessError) as exc:
             unit_state, error = 'unknown', str(exc)
-        return unit_state, self._session_lock_is_held(), error
+        session_status, session_error = self._read_session_status()
+        return (
+            unit_state,
+            self._session_lock_is_held(),
+            error,
+            session_status,
+            session_error,
+        )
 
     def _session_lock_is_held(self):
         fd = None
@@ -534,7 +582,13 @@ class VoiceCartographerBridge(Node):
         future = self._status_future
         self._status_future = None
         try:
-            unit_state, lock_held, error = future.result()
+            (
+                unit_state,
+                lock_held,
+                error,
+                session_status,
+                session_error,
+            ) = future.result()
         except Exception as exc:  # noqa: BLE001
             self._status_error = str(exc)
             return
@@ -542,7 +596,74 @@ class VoiceCartographerBridge(Node):
             self._unit_state = unit_state
         self._lock_held = bool(lock_held)
         self._status_error = error
+        self._session_status = session_status
+        self._session_status_error = session_error
         self._recompute_state(now)
+
+    def _observe_external_resume(self, now, nav_fresh):
+        """Return true only for a stable resume issued outside voice control.
+
+        ``/stemm_cartographer/start_mapping`` is intentionally shared by the
+        voice and mini-program paths.  A voice pause leaves this bridge with a
+        protective latch.  The mini-program's direct service call clears the
+        manager's latch but cannot clear ours, so require both independent
+        observations before releasing it here.
+        """
+        session = self._session_status
+        nav = self._nav_state if isinstance(self._nav_state, dict) else {}
+        nav_mode = str(nav.get('mode') or '').strip().lower()
+        session_mode = str(
+            session.get('mode') if isinstance(session, dict) else ''
+        ).strip().lower()
+        session_phase = str(
+            session.get('phase') if isinstance(session, dict) else ''
+        ).strip().lower()
+        updated_at = (
+            session.get('updatedAtEpochMs')
+            if isinstance(session, dict) else 0
+        )
+        resume_accepted_at = (
+            session.get('resumeAcceptedAtEpochMs')
+            if isinstance(session, dict) else 0
+        )
+        try:
+            session_age_sec = time.time() - (float(updated_at) / 1000.0)
+        except (TypeError, ValueError):
+            session_age_sec = float('inf')
+        try:
+            resume_is_newer_than_pause = (
+                int(resume_accepted_at)
+                >= self._voice_pause_latched_at_epoch_ms > 0
+            )
+        except (TypeError, ValueError):
+            resume_is_newer_than_pause = False
+
+        active_modes = {'mapping', 'navigating', 'exploring', 'exploration'}
+        candidate = (
+            self._voice_pause_latched
+            and self._pending_service is None
+            and nav_fresh
+            and (self._unit_state in ('active', 'activating') or self._lock_held)
+            and isinstance(session, dict)
+            and session.get('sessionActive') is True
+            and session.get('terminal') is not True
+            and session.get('voicePaused') is False
+            and resume_is_newer_than_pause
+            and session_phase == 'mapping'
+            and nav_mode in active_modes
+            and session_mode in active_modes
+            and -1.0 <= session_age_sec <= self.session_status_fresh_sec
+        )
+        if not candidate:
+            self._external_resume_candidate_since = 0.0
+            return False
+        if self._external_resume_candidate_since <= 0.0:
+            self._external_resume_candidate_since = now
+            return False
+        return (
+            now - self._external_resume_candidate_since
+            >= self.external_resume_stable_sec
+        )
 
     def _recompute_state(self, now):
         nav_fresh = (
@@ -555,16 +676,34 @@ class VoiceCartographerBridge(Node):
             self._nav_state,
             nav_fresh,
         )
-        if (
-            not nav_fresh
-            and self._nav_state is not None
-            and self._unit_state == 'active'
-            and self._state in (RUNNING, PAUSED, ENDING)
-        ):
+        if should_preserve_confirmed_state(
+                self._state,
+                self._unit_state,
+                self._lock_held,
+                self._nav_state is not None,
+                nav_fresh):
             # save_map can occupy the manager's single-threaded executor for
             # up to 45 seconds.  Preserve the last externally confirmed state
             # during that bounded call instead of regressing to STARTING.
             derived = self._state
+        if self._voice_pause_latched:
+            if self._observe_external_resume(now, nav_fresh):
+                self._voice_pause_latched = False
+                self._voice_pause_latched_at_epoch_ms = 0
+                self._external_resume_candidate_since = 0.0
+                self._last_message = '建图已由外部控制恢复'
+                self.get_logger().info(
+                    'Recovered mapping voice pause latch from stable '
+                    'external resume evidence.'
+                )
+            elif derived in (IDLE, ENDING):
+                self._voice_pause_latched = False
+                self._voice_pause_latched_at_epoch_ms = 0
+                self._external_resume_candidate_since = 0.0
+            else:
+                derived = apply_pause_latch(derived, True)
+        else:
+            self._external_resume_candidate_since = 0.0
         if self._force_starting and derived in (IDLE, STARTING):
             derived = STARTING
         elif derived in (RUNNING, PAUSED, ENDING):
@@ -600,7 +739,7 @@ class VoiceCartographerBridge(Node):
             self._last_message = '建图会话启动超时，请检查 systemd 日志'
         self._start_confirm_deadline = 0.0
         self._force_starting = False
-        self._publish_feedback('/overmap.wav')
+        self._publish_feedback('/mapping_failure_retry.wav')
         self._recompute_state(now)
 
     def _publish_state(self, force=False):
@@ -612,7 +751,8 @@ class VoiceCartographerBridge(Node):
             if self._pending_service is not None else '')
         signature = (
             self._state, blocked, self._unit_state, self._lock_held,
-            pending_action, self._status_error, self._last_message,
+            self._voice_pause_latched, pending_action,
+            self._status_error, self._last_message,
         )
         if (
             not force
@@ -631,6 +771,7 @@ class VoiceCartographerBridge(Node):
                 'motion_blocked': blocked,
                 'unit_state': self._unit_state,
                 'lock_held': self._lock_held,
+                'pause_latched': self._voice_pause_latched,
                 'pending_action': pending_action,
                 'nav_mode': (
                     self._nav_state.get('mode')

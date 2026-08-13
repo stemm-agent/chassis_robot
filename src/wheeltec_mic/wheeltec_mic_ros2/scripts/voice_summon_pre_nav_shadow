@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Read-only single-bearing pre-navigation waypoint shadow collector.
+
+This node never publishes cmd_vel, /mode, or any Nav2 action goal.  It
+records the first-stage waypoint chosen from the validated V9 bearing-only
+candidate order after each fresh /awake_angle observation.
+"""
+
+import json
+import math
+import os
+import tempfile
+import time
+from pathlib import Path
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.time import Time
+from std_msgs.msg import String, UInt32
+from tf2_ros import Buffer, TransformException, TransformListener
+
+
+# Exact first-stage order produced by V9 single_bearing_core in open space.
+# Scores are audit values only; no Nav2 cost, route length, ETA, or motion
+# command is used by this shadow collector.
+V9_FIRST_STAGE = (
+    (2.9, 0.0, 0.7838768),
+    (2.0, 0.0, 0.7370214),
+    (3.8, 0.0, 0.7298858),
+    (1.4, 0.0, 0.6535049),
+    (0.9, 0.0, 0.5633382),
+    (4.8, 0.0, 0.5608315),
+    (5.8, 0.0, 0.3436422),
+    (5.8, -12.0, 0.3003745),
+    (5.8, 12.0, 0.3003745),
+    (6.9, -12.0, 0.2851859),
+    (6.9, 12.0, 0.2851859),
+    (4.8, -12.0, 0.2365808),
+)
+
+DEFAULT_RANGES_M = (0.9, 1.4, 2.0, 2.9, 3.8, 4.8, 5.8, 6.9, 8.0, 9.0)
+DEFAULT_OFFSETS_DEG = (0.0, -3.0, 3.0, -6.0, 6.0, -9.0, 9.0, -12.0, 12.0)
+
+
+def wrap(angle_rad):
+    return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def yaw_from_quaternion(q):
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+    )
+
+
+class PreNavShadowCollector(Node):
+    """Collect up to N map-frame candidates from microphone wake bearings."""
+
+    def __init__(self):
+        super().__init__('voice_summon_pre_nav_shadow')
+        self.declare_parameter('enabled', True)
+        self.declare_parameter('max_samples', 30)
+        self.declare_parameter('awake_angle_topic', '/awake_angle')
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('mic_yaw_offset_deg', -20.0)
+        self.declare_parameter('bearing_sigma_deg', 3.0)
+        self.declare_parameter('minimum_sample_interval_s', 2.0)
+        self.declare_parameter('transform_timeout_s', 8.0)
+        self.declare_parameter(
+            'output_path',
+            '/home/wheeltec/.ros/voice_summon_shadow/pre_nav_shadow_30.json',
+        )
+        self.declare_parameter('reset_output', False)
+
+        self.enabled = bool(self.get_parameter('enabled').value)
+        self.max_samples = max(1, int(self.get_parameter('max_samples').value))
+        self.map_frame = str(self.get_parameter('map_frame').value)
+        self.base_frame = str(self.get_parameter('base_frame').value)
+        self.mic_yaw_offset_deg = float(self.get_parameter('mic_yaw_offset_deg').value)
+        self.bearing_sigma_deg = float(self.get_parameter('bearing_sigma_deg').value)
+        self.minimum_sample_interval_s = max(
+            0.0, float(self.get_parameter('minimum_sample_interval_s').value)
+        )
+        self.transform_timeout_s = max(
+            0.1, float(self.get_parameter('transform_timeout_s').value)
+        )
+        self.output_path = Path(str(self.get_parameter('output_path').value)).expanduser()
+        self.output_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        self.samples = [] if bool(self.get_parameter('reset_output').value) else self._load_samples()
+        self.pending = None
+        self.last_accepted_monotonic = 0.0
+        self.last_wait_status = 0.0
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.create_subscription(
+            UInt32, str(self.get_parameter('awake_angle_topic').value), self._angle_cb, 20
+        )
+        self.status_pub = self.create_publisher(
+            String, '/voice_summon/pre_nav_shadow_status', 10
+        )
+        self.decision_pub = self.create_publisher(
+            String, '/voice_summon/pre_nav_shadow_decision', 10
+        )
+        self.create_timer(0.10, self._timer_cb)
+        self._atomic_write()
+        self._publish_status('ready')
+        self.get_logger().info(
+            'Read-only pre-nav shadow ready: %s (%d/%d samples)'
+            % (self.output_path, len(self.samples), self.max_samples)
+        )
+
+    def _load_samples(self):
+        if not self.output_path.exists():
+            return []
+        try:
+            data = json.loads(self.output_path.read_text(encoding='utf-8'))
+            entries = data.get('samples', [])
+            if isinstance(entries, list):
+                return entries[: self.max_samples]
+        except (OSError, ValueError, TypeError) as error:
+            self.get_logger().warning('existing_output_ignored:%s' % type(error).__name__)
+        return []
+
+    def _angle_cb(self, msg):
+        if not self.enabled:
+            return
+        if len(self.samples) >= self.max_samples:
+            self._publish_status('quota_reached')
+            return
+        now = time.monotonic()
+        if self.pending is not None:
+            self._publish_status('sample_pending')
+            return
+        if now - self.last_accepted_monotonic < self.minimum_sample_interval_s:
+            self._publish_status('angle_debounced')
+            return
+        self.pending = {
+            'awake_angle_deg_raw': int(msg.data) % 360,
+            'received_unix_s': time.time(),
+            'received_monotonic_s': now,
+        }
+        self._try_capture()
+
+    def _timer_cb(self):
+        if self.pending is not None:
+            self._try_capture()
+
+    def _try_capture(self):
+        pending = self.pending
+        if pending is None:
+            return
+        now = time.monotonic()
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, Time()
+            )
+        except TransformException as error:
+            if now - pending['received_monotonic_s'] >= self.transform_timeout_s:
+                self.get_logger().warning('sample_dropped_no_map_tf:%s' % type(error).__name__)
+                self.pending = None
+                self._publish_status('dropped_no_map_tf')
+            elif now - self.last_wait_status >= 1.0:
+                self.last_wait_status = now
+                self._publish_status('waiting_for_map_tf')
+            return
+
+        sample = self._build_sample(pending, transform)
+        self.samples.append(sample)
+        self.pending = None
+        self.last_accepted_monotonic = now
+        self._atomic_write()
+        msg = String()
+        msg.data = json.dumps(sample, ensure_ascii=False, separators=(',', ':'))
+        self.decision_pub.publish(msg)
+        self._publish_status('sample_collected')
+        self.get_logger().info(
+            'sample=%d/%d angle=%d selected=(%.3f, %.3f, %.3f)'
+            % (
+                len(self.samples),
+                self.max_samples,
+                sample['input']['awake_angle_deg_raw'],
+                sample['selected_pre_nav_pose']['x_m'],
+                sample['selected_pre_nav_pose']['y_m'],
+                sample['selected_pre_nav_pose']['yaw_rad'],
+            )
+        )
+        if len(self.samples) >= self.max_samples:
+            self._publish_status('quota_reached')
+
+    def _build_sample(self, pending, transform):
+        translation = transform.transform.translation
+        orientation = transform.transform.rotation
+        robot_yaw = yaw_from_quaternion(orientation)
+        raw = int(pending['awake_angle_deg_raw'])
+        signed_deg = raw if raw <= 180 else raw - 360
+        bearing_map_rad = wrap(
+            robot_yaw
+            - math.radians(signed_deg)
+            + math.radians(self.mic_yaw_offset_deg)
+        )
+        ranked = [
+            self._candidate(translation.x, translation.y, bearing_map_rad, distance, offset, score)
+            for distance, offset, score in V9_FIRST_STAGE
+        ]
+        selected = dict(ranked[0])
+        selected['selection_rank'] = 1
+        selected['selected'] = True
+        return {
+            'sample_id': len(self.samples) + 1,
+            'recorded_unix_s': time.time(),
+            'frame_id': self.map_frame,
+            'input': {
+                'awake_angle_deg_raw': raw,
+                'awake_angle_deg_signed': signed_deg,
+                'mic_yaw_offset_deg': self.mic_yaw_offset_deg,
+                'bearing_sigma_deg': self.bearing_sigma_deg,
+                'received_unix_s': pending['received_unix_s'],
+            },
+            'robot_pose_map': {
+                'x_m': round(float(translation.x), 6),
+                'y_m': round(float(translation.y), 6),
+                'yaw_rad': round(robot_yaw, 6),
+                'tf_stamp_sec': int(transform.header.stamp.sec),
+                'tf_stamp_nanosec': int(transform.header.stamp.nanosec),
+            },
+            'bearing_map_rad': round(bearing_map_rad, 6),
+            'selected_pre_nav_pose': selected,
+            'ranked_pre_nav_candidates': ranked,
+            'shadow_safety_contract': {
+                'navigate_to_pose_sent': False,
+                'compute_path_sent': False,
+                'cmd_vel_published': False,
+                'mode_published': False,
+                'selection_uses_nav2_cost_or_path_length': False,
+                'note': (
+                    'This collection mode only records V9 first-stage candidate '
+                    'coordinates. Nav2 feasibility and navigation are intentionally '
+                    'not invoked.'
+                ),
+            },
+        }
+
+    @staticmethod
+    def _candidate(robot_x, robot_y, bearing, distance, offset_deg, score):
+        heading = wrap(bearing + math.radians(offset_deg))
+        center_x = robot_x + distance * math.cos(bearing)
+        center_y = robot_y + distance * math.sin(bearing)
+        x = robot_x + distance * math.cos(heading)
+        y = robot_y + distance * math.sin(heading)
+        # For offset=0 the simulator's atan2(center-candidate) degenerates to
+        # atan2(0, 0). Use the acoustic heading so the real goal orientation is
+        # physically meaningful while x/y remain identical to V9.
+        yaw = bearing if abs(offset_deg) < 1.0e-9 else math.atan2(center_y - y, center_x - x)
+        return {
+            'x_m': round(x, 6),
+            'y_m': round(y, 6),
+            'yaw_rad': round(wrap(yaw), 6),
+            'range_m': distance,
+            'offset_deg': offset_deg,
+            'v9_open_space_score': score,
+            'selected': False,
+        }
+
+    def _atomic_write(self):
+        payload = {
+            'schema_version': 1,
+            'collector': 'voice_summon_pre_nav_shadow',
+            'mode': 'read_only_awake_angle_trigger',
+            'max_samples': self.max_samples,
+            'sample_count': len(self.samples),
+            'algorithm': {
+                'name': 'single_bearing_v9_first_stage',
+                'candidate_ranges_m': list(DEFAULT_RANGES_M),
+                'candidate_offsets_deg': list(DEFAULT_OFFSETS_DEG),
+                'range_prior_mean_m': 4.8,
+                'range_prior_sigma_m': 2.1,
+                'camera_fov_deg': 62.2,
+            },
+            'samples': self.samples,
+        }
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=self.output_path.name + '.', suffix='.tmp', dir=str(self.output_path.parent)
+        )
+        try:
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.write('\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.output_path)
+            os.chmod(self.output_path, 0o600)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _publish_status(self, state):
+        msg = String()
+        msg.data = json.dumps(
+            {
+                'state': state,
+                'sample_count': len(self.samples),
+                'max_samples': self.max_samples,
+                'output_path': str(self.output_path),
+                'read_only': True,
+            },
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        self.status_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PreNavShadowCollector()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

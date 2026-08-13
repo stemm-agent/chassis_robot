@@ -35,6 +35,7 @@
 #include <vector>
 
 rclcpp::Publisher<bodyreader_msg::msg::Bodylist>::SharedPtr bodylist_Pub;
+rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr raw_body_count_Pub;
 rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_Pub;
 
 namespace
@@ -64,6 +65,38 @@ std::atomic<bool> g_restart_body_stream_requested{false};
 
 std::unordered_map<int, int> g_valid_body_streaks;
 
+// ===== 骨架源头滤波: centerOfMass EMA 平滑 (Phase 1) =====
+struct SmoothedBodyState
+{
+    float center_x = 0.0f;
+    float center_y = 0.0f;
+    float center_z = 0.0f;
+    int   last_seen_frame = -1;
+};
+float g_position_smoothing_alpha = 0.45f;    // EMA 系数, 越小越平滑
+int   g_smoothed_body_timeout_frames = 15;   // 连续消失多少帧后清除历史
+std::unordered_map<int, SmoothedBodyState> g_smoothed_bodies;
+int   g_frame_counter = 0;                   // 全局帧计数器
+
+// ===== 骨架源头滤波: bodyid 跨帧持续性 (Phase 2) =====
+struct BodyTrackingRecord
+{
+    float last_x = 0.0f;
+    float last_y = 0.0f;
+    float last_z = 0.0f;
+    int   last_frame = -1;
+    int   consecutive_frames = 0;
+    int   matched_frame = -1;   // 本帧已匹配标记，防止同帧多 body 抢同一 track
+};
+float g_body_id_match_max_dist_mm = 500.0f;   // 最近邻匹配最大距离(mm)
+float g_body_id_match_max_angle_rad = 0.35f;  // 最近邻匹配最大角度差(rad)
+int   g_track_timeout_frames = 10;            // track 超时帧数
+std::unordered_map<int, BodyTrackingRecord> g_body_tracks;  // key = 持久 bodyid
+int   g_next_persistent_body_id = 1000;       // 持久 id 从 1000 开始
+
+// ===== 骨架源头滤波: 单帧跳变钳制 (Phase 3) =====
+float g_max_jump_mm = 200.0f;                 // 单帧允许的最大位移(mm)
+
 struct BodyFilterEvaluation
 {
     float center_z_mm = 0.0f;
@@ -87,7 +120,13 @@ struct BodyFilterDiagnostics
     uint64_t raw_bodies = 0;
     uint64_t accepted_bodies = 0;
     uint64_t no_raw_body_frames = 0;
+    uint64_t consecutive_no_raw_body_frames = 0;
     uint64_t body_list_errors = 0;
+    uint64_t frame_wait_failures = 0;
+    uint64_t consecutive_frame_wait_failures = 0;
+    int last_frame_wait_status = 0;
+    uint64_t body_frame_errors = 0;
+    int last_body_frame_status = 0;
     uint64_t rejected_distance = 0;
     uint64_t rejected_center = 0;
     uint64_t rejected_joints = 0;
@@ -186,6 +225,19 @@ void maybe_log_body_filter_diagnostics()
     }
 
     const auto& d = g_body_filter_diagnostics;
+    if (d.frame_wait_failures > 0 || d.body_frame_errors > 0)
+    {
+        RCLCPP_WARN(
+            rclcpp::get_logger("body_main"),
+            "ASTRA_DIAG %.1fs frame_wait_failures=%llu consecutive_wait_failures=%llu "
+            "last_wait_status=%d body_frame_errors=%llu last_body_frame_status=%d",
+            elapsed_s,
+            static_cast<unsigned long long>(d.frame_wait_failures),
+            static_cast<unsigned long long>(d.consecutive_frame_wait_failures),
+            d.last_frame_wait_status,
+            static_cast<unsigned long long>(d.body_frame_errors),
+            d.last_body_frame_status);
+    }
     if (d.accepted_bodies > 0)
     {
         RCLCPP_INFO(
@@ -237,10 +289,11 @@ void maybe_log_body_filter_diagnostics()
         RCLCPP_WARN(
             rclcpp::get_logger("body_main"),
             "BODY_FILTER %.1fs frames=%llu raw=0 accepted=0 no_raw_frames=%llu "
-            "list_errors=%llu reason=no_astra_body",
+            "consecutive_no_raw_frames=%llu list_errors=%llu reason=no_astra_body",
             elapsed_s,
             static_cast<unsigned long long>(d.frames),
             static_cast<unsigned long long>(d.no_raw_body_frames),
+            static_cast<unsigned long long>(d.consecutive_no_raw_body_frames),
             static_cast<unsigned long long>(d.body_list_errors));
     }
 
@@ -342,12 +395,30 @@ void output_bodies(astra_bodyframe_t bodyFrame)
         return;
     }
 
+    // Publish the SDK result before any follow-specific filtering.  The
+    // identity bridge uses this only to distinguish an empty Astra body list
+    // from a body rejected by distance, centering, joint, or stability rules.
+    if (raw_body_count_Pub)
+    {
+        std_msgs::msg::Int8 raw_body_count_msg;
+        const int raw_body_count = std::max(0, bodyList.count);
+        raw_body_count_msg.data = static_cast<int8_t>(
+            std::min(raw_body_count, static_cast<int>(std::numeric_limits<int8_t>::max())));
+        raw_body_count_Pub->publish(raw_body_count_msg);
+    }
+
+    ++g_frame_counter;
     ++g_body_filter_diagnostics.frames;
     g_body_filter_diagnostics.raw_bodies +=
         static_cast<uint64_t>(std::max(0, bodyList.count));
     if (bodyList.count <= 0)
     {
         ++g_body_filter_diagnostics.no_raw_body_frames;
+        ++g_body_filter_diagnostics.consecutive_no_raw_body_frames;
+    }
+    else
+    {
+        g_body_filter_diagnostics.consecutive_no_raw_body_frames = 0;
     }
 
     std::unordered_map<int, int> next_valid_body_streaks;
@@ -387,14 +458,128 @@ void output_bodies(astra_bodyframe_t bodyFrame)
             continue;
         }
 
+        const astra_vector3f_t* centerofmass = &body->centerOfMass;
+
+        // ===== Phase 1 + Phase 3: centerOfMass EMA 平滑 + 单帧跳变钳制 =====
+        const float alpha = g_position_smoothing_alpha;
+        const float one_minus_alpha = 1.0f - alpha;
+        const int native_body_id = body->id;
+
+        float smoothed_x = centerofmass->x;
+        float smoothed_y = centerofmass->y;
+        float smoothed_z = centerofmass->z;
+
+        auto smooth_it = g_smoothed_bodies.find(native_body_id);
+        if (smooth_it == g_smoothed_bodies.end())
+        {
+            // 首次出现：直接用原始值初始化
+            SmoothedBodyState init;
+            init.center_x = centerofmass->x;
+            init.center_y = centerofmass->y;
+            init.center_z = centerofmass->z;
+            init.last_seen_frame = g_frame_counter;
+            g_smoothed_bodies[native_body_id] = init;
+        }
+        else
+        {
+            // Phase 3: 单帧跳变钳制。仅当上一帧该 body 存在且跳变超过阈值时，
+            // 跳过本次 EMA 更新，沿用上一帧平滑值（不丢弃 body）。
+            const float jump_dx = centerofmass->x - smooth_it->second.center_x;
+            const float jump_dz = centerofmass->z - smooth_it->second.center_z;
+            const float jump_dist = std::sqrt(jump_dx * jump_dx + jump_dz * jump_dz);
+            if (jump_dist > g_max_jump_mm)
+            {
+                // 野值帧：保留上一帧平滑位置，仅刷新时间戳
+                smooth_it->second.last_seen_frame = g_frame_counter;
+            }
+            else
+            {
+                // EMA 更新
+                smooth_it->second.center_x =
+                    alpha * centerofmass->x + one_minus_alpha * smooth_it->second.center_x;
+                smooth_it->second.center_y =
+                    alpha * centerofmass->y + one_minus_alpha * smooth_it->second.center_y;
+                smooth_it->second.center_z =
+                    alpha * centerofmass->z + one_minus_alpha * smooth_it->second.center_z;
+                smooth_it->second.last_seen_frame = g_frame_counter;
+            }
+            smoothed_x = smooth_it->second.center_x;
+            smoothed_y = smooth_it->second.center_y;
+            smoothed_z = smooth_it->second.center_z;
+        }
+        // ===== Phase 1 + Phase 3 结束 =====
+
+        // ===== Phase 2: bodyid 跨帧持续性 (最近邻关联) =====
+        // 基于 EMA 平滑后的位置做最近邻匹配，把稳定物理人映射到持久 bodyid。
+        const float current_x = smoothed_x;
+        const float current_y = smoothed_y;
+        const float current_z = smoothed_z;
+        constexpr float kPi = 3.14159265358979323846f;
+        int matched_persistent_id = -1;
+        float best_match_dist = g_body_id_match_max_dist_mm;
+
+        for (const auto& track : g_body_tracks)
+        {
+            if (track.second.matched_frame == g_frame_counter)
+            {
+                continue;  // 本帧已被其他 body 匹配
+            }
+            if (g_frame_counter - track.second.last_frame > g_track_timeout_frames)
+            {
+                continue;  // 超时 track 不参与匹配
+            }
+            const float dx = current_x - track.second.last_x;
+            const float dz = current_z - track.second.last_z;
+            const float dist = std::sqrt(dx * dx + dz * dz);
+            const float angle_now = std::atan2(current_x, current_z);
+            const float angle_prev = std::atan2(track.second.last_x, track.second.last_z);
+            float d_angle = std::fabs(angle_now - angle_prev);
+            if (d_angle > kPi)
+            {
+                d_angle = 2.0f * kPi - d_angle;
+            }
+            if (dist < best_match_dist && d_angle < g_body_id_match_max_angle_rad)
+            {
+                best_match_dist = dist;
+                matched_persistent_id = track.first;
+            }
+        }
+
+        int final_bodyid;
+        if (matched_persistent_id > 0)
+        {
+            // 匹配到已有 track：沿用持久 id 并更新位置
+            final_bodyid = matched_persistent_id;
+            BodyTrackingRecord& rec = g_body_tracks[matched_persistent_id];
+            rec.last_x = current_x;
+            rec.last_y = current_y;
+            rec.last_z = current_z;
+            rec.last_frame = g_frame_counter;
+            rec.matched_frame = g_frame_counter;
+            ++rec.consecutive_frames;
+        }
+        else
+        {
+            // 新出现的人：分配新持久 id
+            final_bodyid = g_next_persistent_body_id++;
+            BodyTrackingRecord rec;
+            rec.last_x = current_x;
+            rec.last_y = current_y;
+            rec.last_z = current_z;
+            rec.last_frame = g_frame_counter;
+            rec.matched_frame = g_frame_counter;
+            rec.consecutive_frames = 1;
+            g_body_tracks[final_bodyid] = rec;
+        }
+        // ===== Phase 2 结束 =====
+
         // Pixels in the body mask with the same value as bodyId are
         // from the same body.
-        bodylist_msg.bodies[filtered_body_count].bodyid = body->id;
+        bodylist_msg.bodies[filtered_body_count].bodyid = final_bodyid;
         //printf("+++++++++++++++bodyId = %d\n", bodyId);
-        const astra_vector3f_t* centerofmass = &body->centerOfMass;
-        bodylist_msg.bodies[filtered_body_count].centerofmass.x = centerofmass->x;
-        bodylist_msg.bodies[filtered_body_count].centerofmass.y = centerofmass->y;
-        bodylist_msg.bodies[filtered_body_count].centerofmass.z = centerofmass->z;
+        bodylist_msg.bodies[filtered_body_count].centerofmass.x = smoothed_x;
+        bodylist_msg.bodies[filtered_body_count].centerofmass.y = smoothed_y;
+        bodylist_msg.bodies[filtered_body_count].centerofmass.z = smoothed_z;
         for (int j = 0; j < kJointCount; ++j)
         { 
           const astra_joint_t* joint = &body->joints[j];
@@ -415,6 +600,40 @@ void output_bodies(astra_bodyframe_t bodyFrame)
     }
 
     g_valid_body_streaks = std::move(next_valid_body_streaks);
+
+    // ===== 清理超时的 EMA 平滑状态与 bodyid track (防止内存泄漏) =====
+    if (g_frame_counter % 30 == 0)
+    {
+        for (auto it = g_smoothed_bodies.begin();
+             it != g_smoothed_bodies.end(); )
+        {
+            if (g_frame_counter - it->second.last_seen_frame >
+                g_smoothed_body_timeout_frames)
+            {
+                it = g_smoothed_bodies.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        for (auto it = g_body_tracks.begin();
+             it != g_body_tracks.end(); )
+        {
+            if (g_frame_counter - it->second.last_frame >
+                g_track_timeout_frames)
+            {
+                it = g_body_tracks.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+    // ===== 清理结束 =====
+
     bodylist_msg.count = filtered_body_count;
     bodylist_Pub->publish(bodylist_msg);
     maybe_log_body_filter_diagnostics();
@@ -453,6 +672,12 @@ int main(int argc, char* argv[])
     node->declare_parameter<int>("min_stable_frames", 3);
     node->declare_parameter<bool>("body_filter_diagnostics_enabled", true);
     node->declare_parameter<double>("body_filter_diagnostics_period_s", 2.0);
+    node->declare_parameter<double>("position_smoothing_alpha", 0.45);
+    node->declare_parameter<int>("smoothed_body_timeout_frames", 15);
+    node->declare_parameter<double>("body_id_match_max_dist_mm", 500.0);
+    node->declare_parameter<double>("body_id_match_max_angle_rad", 0.35);
+    node->declare_parameter<int>("track_timeout_frames", 10);
+    node->declare_parameter<double>("max_jump_mm", 200.0);
     node->get_parameter("rgb_stream", rgb_stream);
     node->get_parameter("body_stream", body_stream);
     node->get_parameter("mode_gated_body_stream", mode_gated_body_stream);
@@ -473,9 +698,28 @@ int main(int argc, char* argv[])
     node->get_parameter(
         "body_filter_diagnostics_period_s", g_body_filter_diagnostics_period_s);
 
+    double position_smoothing_alpha = g_position_smoothing_alpha;
+    double body_id_match_max_dist_mm = g_body_id_match_max_dist_mm;
+    double body_id_match_max_angle_rad = g_body_id_match_max_angle_rad;
+    double max_jump_mm = g_max_jump_mm;
+    node->get_parameter("position_smoothing_alpha", position_smoothing_alpha);
+    node->get_parameter("smoothed_body_timeout_frames", g_smoothed_body_timeout_frames);
+    node->get_parameter("body_id_match_max_dist_mm", body_id_match_max_dist_mm);
+    node->get_parameter("body_id_match_max_angle_rad", body_id_match_max_angle_rad);
+    node->get_parameter("track_timeout_frames", g_track_timeout_frames);
+    node->get_parameter("max_jump_mm", max_jump_mm);
+
     g_min_body_distance_mm = static_cast<float>(min_body_distance_mm);
     g_max_body_distance_mm = static_cast<float>(max_body_distance_mm);
     g_max_abs_center_ratio = static_cast<float>(max_abs_center_ratio);
+    g_position_smoothing_alpha = static_cast<float>(position_smoothing_alpha);
+    g_position_smoothing_alpha =
+        std::max(0.05f, std::min(1.0f, g_position_smoothing_alpha));
+    g_body_id_match_max_dist_mm = static_cast<float>(body_id_match_max_dist_mm);
+    g_body_id_match_max_angle_rad = static_cast<float>(body_id_match_max_angle_rad);
+    g_max_jump_mm = static_cast<float>(max_jump_mm);
+    g_smoothed_body_timeout_frames = std::max(1, g_smoothed_body_timeout_frames);
+    g_track_timeout_frames = std::max(1, g_track_timeout_frames);
 
     rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr mode_sub;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr body_stream_restart_sub;
@@ -524,6 +768,8 @@ int main(int argc, char* argv[])
     {
         bodylist_Pub =
             node->create_publisher<bodyreader_msg::msg::Bodylist>("/bodylist", 1);
+        raw_body_count_Pub = node->create_publisher<std_msgs::msg::Int8>(
+            "/body_main/raw_body_count", rclcpp::QoS(1).best_effort());
         if (!mode_gated_body_stream)
         {
             body_stream_running =
@@ -534,6 +780,10 @@ int main(int argc, char* argv[])
     if (rgb_stream)
     {
         image_Pub = node->create_publisher<sensor_msgs::msg::Image>("/image_raw", 1);
+          const astra_status_t mirror_status = astra_imagestream_set_mirroring(colorStream, false);
+          if (mirror_status != ASTRA_STATUS_SUCCESS) {
+              RCLCPP_WARN(node->get_logger(), "Unable to disable RGB stream mirroring (status=%d)", static_cast<int>(mirror_status));
+          }
         astra_stream_start(colorStream);
     }
 
@@ -553,6 +803,8 @@ int main(int argc, char* argv[])
             g_restart_body_stream_requested.exchange(false, std::memory_order_relaxed))
         {
             g_valid_body_streaks.clear();
+            g_smoothed_bodies.clear();
+            g_body_tracks.clear();
             bodyreader_msg::msg::Bodylist empty_bodylist;
             empty_bodylist.count = 0;
             bodylist_Pub->publish(empty_bodylist);
@@ -574,6 +826,8 @@ int main(int argc, char* argv[])
                 if (should_run && !body_stream_running)
                 {
                     g_valid_body_streaks.clear();
+                    g_smoothed_bodies.clear();
+                    g_body_tracks.clear();
                     body_stream_running =
                         astra_stream_start(bodyStream) == ASTRA_STATUS_SUCCESS;
                 }
@@ -582,6 +836,8 @@ int main(int argc, char* argv[])
                     astra_stream_stop(bodyStream);
                     body_stream_running = false;
                     g_valid_body_streaks.clear();
+                    g_smoothed_bodies.clear();
+                    g_body_tracks.clear();
 
                     bodyreader_msg::msg::Bodylist empty_bodylist;
                     empty_bodylist.count = 0;
@@ -605,6 +861,7 @@ int main(int argc, char* argv[])
 
         if (rc == ASTRA_STATUS_SUCCESS)
         {
+            g_body_filter_diagnostics.consecutive_frame_wait_failures = 0;
             const auto now = SteadyClock::now();
             const bool process_frame =
                 !rate_limited || now >= next_processing_time;
@@ -614,8 +871,18 @@ int main(int argc, char* argv[])
                 if (body_stream_running)
                 {
                     astra_bodyframe_t bodyFrame;
-                    astra_frame_get_bodyframe(frame, &bodyFrame);
-                    output_bodyframe(bodyFrame);
+                    const astra_status_t body_frame_rc =
+                        astra_frame_get_bodyframe(frame, &bodyFrame);
+                    if (body_frame_rc == ASTRA_STATUS_SUCCESS)
+                    {
+                        output_bodyframe(bodyFrame);
+                    }
+                    else
+                    {
+                        ++g_body_filter_diagnostics.body_frame_errors;
+                        g_body_filter_diagnostics.last_body_frame_status =
+                            static_cast<int>(body_frame_rc);
+                    }
                 }
 
                 if (rgb_stream)
@@ -636,6 +903,15 @@ int main(int argc, char* argv[])
 
             astra_reader_close_frame(&frame);
         }
+        else
+        {
+            ++g_body_filter_diagnostics.frame_wait_failures;
+            ++g_body_filter_diagnostics.consecutive_frame_wait_failures;
+            g_body_filter_diagnostics.last_frame_wait_status =
+                static_cast<int>(rc);
+        }
+
+        maybe_log_body_filter_diagnostics();
 
     } while (shouldContinue && rclcpp::ok());
 
@@ -654,6 +930,7 @@ int main(int argc, char* argv[])
     astra_terminate();
 
     bodylist_Pub.reset();
+    raw_body_count_Pub.reset();
     image_Pub.reset();
     body_stream_restart_sub.reset();
     mode_sub.reset();

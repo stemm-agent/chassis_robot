@@ -27,12 +27,14 @@ find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
+find_package(vision_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
+find_package(action_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(serial REQUIRED)
 find_package(wheeltec_mic_msg REQUIRED)
@@ -53,7 +55,7 @@ add_executable(call_recognition src/call_recognition.cpp)
 ament_target_dependencies(call_recognition rclcpp std_msgs wheeltec_mic_msg)
 
 add_executable(command_recognition src/command_recognition.cpp)
-ament_target_dependencies(command_recognition rclcpp rclcpp_action std_msgs wheeltec_mic_msg geometry_msgs nav2_msgs)
+ament_target_dependencies(command_recognition rclcpp rclcpp_action std_msgs wheeltec_mic_msg geometry_msgs nav2_msgs action_msgs)
 target_link_libraries(command_recognition rt)
 
 add_executable(node_feedback src/node_feedback.cpp)
@@ -82,6 +84,12 @@ install(PROGRAMS
   scripts/voice_cartographer_bridge
   scripts/nav2_start_feedback_monitor
   scripts/voice_summon_coordinator
+  scripts/voice_summon_coordinator_bearing_nav
+  scripts/voice_summon_bearing_nav_progress_watchdog
+  scripts/voice_summon_bearing_nav_yolo_preempt
+  scripts/voice_summon_shadow_logger
+  scripts/voice_summon_bearing_search_shadow
+  scripts/voice_summon_pre_nav_shadow
   DESTINATION lib/${PROJECT_NAME})
 
 install(FILES

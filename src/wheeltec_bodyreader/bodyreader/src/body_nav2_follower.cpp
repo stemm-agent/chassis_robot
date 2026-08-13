@@ -21,6 +21,7 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/int8.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_srvs/srv/set_bool.hpp"
 #include "tf2/LinearMath/Quaternion.h"
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -127,6 +128,8 @@ public:
     has_avoidance_gate_goal_(false),
     avoidance_motion_logged_(false),
     has_calibration_reference_(false),
+    motion_enabled_(true),
+    motion_gate_stop_published_(false),
     goal_sequence_(0),
     spin_sequence_(0),
     tf_buffer_(std::make_shared<tf2_ros::Buffer>(this->get_clock())),
@@ -136,6 +139,8 @@ public:
     spin_action_name_ = declare_parameter<std::string>("spin_action_name", "/spin");
     scan_topic_ = declare_parameter<std::string>("scan_topic", "/scan");
     visual_cmd_topic_ = declare_parameter<std::string>("visual_cmd_topic", "/cmd_vel");
+    motion_gate_service_name_ = declare_parameter<std::string>(
+      "motion_gate_service", "/body_nav2_follower/set_motion_enabled");
     global_frame_ = declare_parameter<std::string>("global_frame", "map");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_footprint");
     body_frame_id_ = declare_parameter<std::string>("body_frame_id", "");
@@ -148,6 +153,8 @@ public:
     goal_position_tolerance_m_ = declare_parameter<double>("goal_position_tolerance_m", 0.45);
     goal_yaw_tolerance_rad_ = declare_parameter<double>("goal_yaw_tolerance_rad", 0.45);
     lost_timeout_s_ = declare_parameter<double>("lost_timeout_s", 1.0);
+    body_invalid_grace_s_ =
+      std::max(0.0, declare_parameter<double>("body_invalid_grace_s", 0.45));
     tf_timeout_s_ = declare_parameter<double>("tf_timeout_s", 0.20);
     max_retreat_goal_m_ = declare_parameter<double>("max_retreat_goal_m", 0.8);
     target_memory_timeout_s_ = declare_parameter<double>("target_memory_timeout_s", 8.0);
@@ -208,6 +215,8 @@ public:
     visual_max_linear_mps_ = declare_parameter<double>("visual_max_linear_mps", 0.75);
     visual_max_angular_rps_ = declare_parameter<double>("visual_max_angular_rps", 1.0);
     visual_linear_accel_limit_ = declare_parameter<double>("visual_linear_accel_limit", 0.90);
+    visual_reverse_accel_limit_ =
+      declare_parameter<double>("visual_reverse_accel_limit", 1.80);
     visual_linear_decel_limit_ = declare_parameter<double>("visual_linear_decel_limit", 0.35);
     visual_angular_accel_limit_ = declare_parameter<double>("visual_angular_accel_limit", 0.9);
     visual_allow_reverse_ = declare_parameter<bool>("visual_allow_reverse", true);
@@ -230,6 +239,7 @@ public:
       declare_parameter<int>("shutdown_stop_publish_period_ms", 30);
     mode_required_ = declare_parameter<int>("mode_required", 2);
     mode_ = declare_parameter<int>("initial_mode", 1);
+    motion_enabled_ = declare_parameter<bool>("motion_enabled", true);
 
     nav_client_ = rclcpp_action::create_client<NavigateToPose>(this, nav_action_name_);
     spin_client_ = rclcpp_action::create_client<Spin>(this, spin_action_name_);
@@ -241,6 +251,12 @@ public:
     mode_sub_ = create_subscription<std_msgs::msg::Int8>(
       "/mode", 10,
       std::bind(&BodyNav2Follower::mode_callback, this, std::placeholders::_1));
+
+    motion_gate_service_ = create_service<std_srvs::srv::SetBool>(
+      motion_gate_service_name_,
+      std::bind(
+        &BodyNav2Follower::motion_gate_callback, this,
+        std::placeholders::_1, std::placeholders::_2));
 
     cmd_sub_ = create_subscription<geometry_msgs::msg::Twist>(
       "/cmd_vel", 20,
@@ -283,6 +299,7 @@ public:
     last_failed_goal_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_spin_send_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_body_time_ = this->now();
+    invalid_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_person_map_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_clear_person_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_cmd_time_ = this->now();
@@ -297,9 +314,9 @@ public:
     last_visual_error_distance_ = 0.0;
     RCLCPP_INFO(
       get_logger(),
-      "BodyNav2Follower hybrid ready: action=%s spin=%s scan=%s visual_cmd=%s follow_distance=%.2fm",
+      "BodyNav2Follower hybrid ready: action=%s spin=%s scan=%s visual_cmd=%s follow_distance=%.2fm motion_gate=%s",
       nav_action_name_.c_str(), spin_action_name_.c_str(), scan_topic_.c_str(),
-      visual_cmd_topic_.c_str(), follow_distance_m_);
+      visual_cmd_topic_.c_str(), follow_distance_m_, motion_gate_service_name_.c_str());
   }
 
   void request_shutdown_stop(const std::string & reason)
@@ -363,13 +380,42 @@ private:
     const bool valid_lock = msg->lock_status == 2;
     const bool valid_depth = msg->centerofmass_z > 100.0f;
     if (valid_lock && valid_depth) {
+      if (has_body_ && invalid_body_since_.nanoseconds() != 0) {
+        const double invalid_duration_s =
+          (this->now() - invalid_body_since_).seconds();
+        RCLCPP_INFO(
+          get_logger(), "Body observation recovered after %.3fs invalid interval",
+          invalid_duration_s);
+      }
+      invalid_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       latest_body_ = *msg;
       has_body_ = true;
       last_body_time_ = this->now();
       ++body_generation_;
     } else {
-      has_body_ = false;
-      reset_visual_clear_takeover_confirmation();
+      const auto now = this->now();
+      if (invalid_body_since_.nanoseconds() == 0) {
+        invalid_body_since_ = now;
+      }
+      const double invalid_duration_s = (now - invalid_body_since_).seconds();
+
+      if (has_body_ && invalid_duration_s < body_invalid_grace_s_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 250,
+          "Transient invalid body interval ignored: age=%.3fs grace=%.3fs "
+          "lock_status=%d depth_mm=%.0f",
+          invalid_duration_s, body_invalid_grace_s_, msg->lock_status, msg->centerofmass_z);
+        return;
+      }
+
+      if (has_body_) {
+        has_body_ = false;
+        reset_visual_clear_takeover_confirmation();
+        RCLCPP_WARN(
+          get_logger(),
+          "Body loss confirmed after %.3fs invalid interval: lock_status=%d depth_mm=%.0f",
+          invalid_duration_s, msg->lock_status, msg->centerofmass_z);
+      }
     }
   }
 
@@ -387,6 +433,36 @@ private:
       reset_visual_controller();
       paused_stop_published_ = publish_stop_cmd("paused_by_mode");
     }
+  }
+
+  // The voice bearing search needs current visual observations but must not
+  // allow this follower to submit a competing Nav2 goal.  This service gates
+  // only actuation; subscriptions and identity tracking remain live.  Its
+  // default is enabled, so existing callers retain their exact behavior.
+  void motion_gate_callback(
+    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std_srvs::srv::SetBool::Response> response)
+  {
+    const bool requested_enabled = request->data;
+    motion_enabled_ = requested_enabled;
+    if (!motion_enabled_) {
+      cancel_goal("motion_gate_disabled");
+      cancel_spin("motion_gate_disabled");
+      reset_avoidance_episode();
+      avoidance_rearm_required_ = false;
+      reset_visual_controller();
+      motion_gate_stop_published_ = publish_stop_cmd("motion_gate_disabled");
+      publish_state("motion_gate_observe_only");
+    } else {
+      motion_gate_stop_published_ = false;
+      publish_state("motion_gate_enabled");
+    }
+    response->success = true;
+    response->message = requested_enabled ?
+      "body follower motion enabled" : "body follower observation-only";
+    RCLCPP_INFO(
+      get_logger(), "Body follower motion gate: %s",
+      requested_enabled ? "enabled" : "observation-only");
   }
 
   void cmd_callback(const geometry_msgs::msg::Twist::SharedPtr msg)
@@ -1178,9 +1254,11 @@ private:
     const bool speeding_up =
       !reversing_direction &&
       std::fabs(linear_target) > std::fabs(last_direct_cmd_.linear.x);
+    const double accel_limit = desired.linear.x < 0.0 ?
+      visual_reverse_accel_limit_ : visual_linear_accel_limit_;
     const double decel_limit = decel_limit_override >= 0.0 ?
       decel_limit_override : visual_linear_decel_limit_;
-    const double linear_limit = speeding_up ? visual_linear_accel_limit_ : decel_limit;
+    const double linear_limit = speeding_up ? accel_limit : decel_limit;
     const double max_linear_delta = std::max(0.0, linear_limit) * dt;
     const double max_angular_delta = std::max(0.0, visual_angular_accel_limit_) * dt;
 
@@ -1285,7 +1363,9 @@ private:
     if (!visual_hold_active_ && desired.linear.x != 0.0) {
       const double braking_distance_m = std::max(
         0.0, std::fabs(raw_distance_error_m) - distance_deadband_m);
-      const double braking_accel_mps2 = std::max(1e-3, visual_linear_accel_limit_);
+      const double braking_accel_mps2 = std::max(
+        1e-3, desired.linear.x < 0.0 ?
+        visual_reverse_accel_limit_ : visual_linear_accel_limit_);
       const double braking_speed_mps =
         std::sqrt(2.0 * braking_accel_mps2 * braking_distance_m);
       desired.linear.x = std::copysign(
@@ -1321,7 +1401,8 @@ private:
     }
 
     const double decel_limit = decel_limit_override >= 0.0 ?
-      decel_limit_override : visual_linear_accel_limit_;
+      decel_limit_override :
+      (desired.linear.x < 0.0 ? visual_reverse_accel_limit_ : visual_linear_accel_limit_);
     const auto cmd = smooth_direct_cmd(desired, now, decel_limit);
     visual_cmd_pub_->publish(cmd);
     last_visual_error_angle_ = error_x_angle;
@@ -1415,7 +1496,7 @@ private:
       return;
     }
 
-      if (respect_mode_topic_ && mode_ != mode_required_) {
+    if (respect_mode_topic_ && mode_ != mode_required_) {
         publish_paused_calibration(now);
         cancel_goal("mode_paused");
         cancel_spin("mode_paused");
@@ -1427,6 +1508,23 @@ private:
         }
         return;
     }
+
+    if (!motion_enabled_) {
+      // Keep consuming body/scan callbacks for the voice coordinator, while
+      // guaranteeing that this node sends neither visual cmd_vel nor Nav2
+      // goals until the coordinator explicitly releases it.
+      cancel_goal("motion_gate_observe_only");
+      cancel_spin("motion_gate_observe_only");
+      reset_avoidance_episode();
+      avoidance_rearm_required_ = false;
+      reset_visual_controller();
+      if (!motion_gate_stop_published_) {
+        motion_gate_stop_published_ = publish_stop_cmd("motion_gate_observe_only");
+      }
+      publish_state("motion_gate_observe_only");
+      return;
+    }
+    motion_gate_stop_published_ = false;
 
     geometry_msgs::msg::PoseStamped goal;
     NavGoalKind goal_kind = NavGoalKind::NORMAL;
@@ -2342,6 +2440,7 @@ private:
   std::string spin_action_name_;
   std::string scan_topic_;
   std::string visual_cmd_topic_;
+  std::string motion_gate_service_name_;
   std::string global_frame_;
   std::string base_frame_;
   std::string body_frame_id_;
@@ -2355,6 +2454,7 @@ private:
   double goal_position_tolerance_m_;
   double goal_yaw_tolerance_rad_;
   double lost_timeout_s_;
+  double body_invalid_grace_s_;
   double tf_timeout_s_;
   double max_retreat_goal_m_;
   double target_memory_timeout_s_;
@@ -2397,6 +2497,7 @@ private:
   double visual_max_linear_mps_;
   double visual_max_angular_rps_;
   double visual_linear_accel_limit_;
+  double visual_reverse_accel_limit_;
   double visual_linear_decel_limit_;
   double visual_angular_accel_limit_;
   double camera_offset_x_m_;
@@ -2450,12 +2551,15 @@ private:
   bool has_avoidance_gate_goal_;
   bool avoidance_motion_logged_;
   bool has_calibration_reference_;
+  bool motion_enabled_;
+  bool motion_gate_stop_published_;
   uint64_t goal_sequence_;
   uint64_t spin_sequence_;
   uint64_t body_generation_{0};
   uint64_t visual_clear_takeover_last_body_generation_{0};
 
   rclcpp::Time last_body_time_;
+  rclcpp::Time invalid_body_since_;
   rclcpp::Time last_person_map_time_;
   rclcpp::Time last_clear_person_time_;
   rclcpp::Time last_goal_send_time_;
@@ -2491,6 +2595,7 @@ private:
   rclcpp_action::Client<Spin>::SharedPtr spin_client_;
   rclcpp::Subscription<bodyreader_msg::msg::Bodyposture>::SharedPtr body_sub_;
   rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr mode_sub_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr motion_gate_service_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr

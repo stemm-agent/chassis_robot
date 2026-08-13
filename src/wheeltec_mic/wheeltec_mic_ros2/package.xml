@@ -11,6 +11,7 @@
 
   <depend>rclcpp</depend>
   <depend>rclcpp_action</depend>
+  <depend>action_msgs</depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
@@ -20,6 +21,7 @@
   <depend>serial</depend>
   <depend>nav2_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>vision_msgs</depend>
   <depend>wheeltec_mic_msg</depend>
   <depend>tf2</depend>
   <depend>turn_on_wheeltec_robot</depend>
@@ -40,4 +42,3 @@
     <build_type>ament_cmake</build_type>
   </export>
 </package>
-

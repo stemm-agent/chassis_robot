@@ -136,6 +136,7 @@ ament_target_dependencies(body_nav2_follower
   nav2_msgs
   sensor_msgs
   std_msgs
+  std_srvs
   tf2
   tf2_ros
   tf2_geometry_msgs
@@ -145,6 +146,14 @@ add_executable(body_nav2_profile_guard src/body_nav2_profile_guard.cpp)
 ament_target_dependencies(body_nav2_profile_guard
   rclcpp
   std_msgs
+)
+
+# Single authoritative service endpoint for body-follow mode.  It owns /mode.
+add_executable(bodyfollow_mode_controller src/bodyfollow_mode_controller.cpp)
+ament_target_dependencies(bodyfollow_mode_controller
+  rclcpp
+  std_msgs
+  std_srvs
 )
 
 add_executable(body_nav2_stage0_monitor src/body_nav2_stage0_monitor.cpp)
@@ -197,7 +206,7 @@ target_link_libraries(image_trans astra astra_core astra_core_api)
 install(PROGRAMS scripts/display.py scripts/compressed.py DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS
-main bodydata_process follower follower_no_avoider interaction feedback body_avoider collision_guard body_nav2_follower body_nav2_profile_guard body_nav2_stage0_monitor body_identity_bridge torso_trt_demo image_trans
+main bodydata_process follower follower_no_avoider interaction feedback body_avoider collision_guard body_nav2_follower body_nav2_profile_guard bodyfollow_mode_controller body_nav2_stage0_monitor body_identity_bridge torso_trt_demo image_trans
 
 DESTINATION lib/${PROJECT_NAME}
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}

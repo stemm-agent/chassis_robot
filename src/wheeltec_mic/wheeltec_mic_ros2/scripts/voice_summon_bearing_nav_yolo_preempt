@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""Session-scoped RGB person preemption for bearing-navigation summon goals.
+
+This node has no Nav2-action client and never publishes base velocity.  It
+only converts two consecutive RGB torso/person detections into one event for
+the voice-summon coordinator.  The coordinator remains solely responsible for
+cancelling its own NavigateToPose goal and choosing the next state.
+"""
+
+import json
+import time
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from std_msgs.msg import String
+from vision_msgs.msg import Detection2DArray
+
+
+class BearingNavYoloPreempt(Node):
+    def __init__(self):
+        super().__init__('voice_summon_bearing_nav_yolo_preempt')
+        self.declare_parameter('detections_topic', '/torso_trt_demo/detections')
+        self.declare_parameter(
+            'control_topic', '/voice_summon/bearing_nav_yolo_preempt/control')
+        self.declare_parameter(
+            'event_topic', '/voice_summon/bearing_nav_yolo_preempt/event')
+        self.declare_parameter('required_consecutive_frames', 2)
+        self.declare_parameter('max_frame_gap_s', 0.5)
+        self.declare_parameter(
+            'person_class_ids', ['torso', 'locked_torso', 'person', '0'])
+
+        self.detections_topic = str(self.get_parameter('detections_topic').value)
+        self.required_consecutive_frames = max(
+            1, int(self.get_parameter('required_consecutive_frames').value))
+        self.max_frame_gap_s = max(
+            0.05, float(self.get_parameter('max_frame_gap_s').value))
+        self.person_class_ids = {
+            str(value).strip().lower()
+            for value in self.get_parameter('person_class_ids').value
+        }
+
+        self.active_session = None
+        self.consecutive_frames = 0
+        self.last_detection_monotonic = None
+        self.event_sent = False
+
+        control_topic = str(self.get_parameter('control_topic').value)
+        event_topic = str(self.get_parameter('event_topic').value)
+        self.event_pub = self.create_publisher(String, event_topic, 10)
+        self.control_sub = self.create_subscription(
+            String, control_topic, self._control_callback, 10)
+        self.detections_sub = self.create_subscription(
+            Detection2DArray, self.detections_topic, self._detections_callback, 20)
+        self.get_logger().info(
+            'VOICE_BEARING_YOLO_PREEMPT ready detections=%s frames=%d max_gap_s=%.2f '
+            'classes=%s'
+            % (
+                self.detections_topic,
+                self.required_consecutive_frames,
+                self.max_frame_gap_s,
+                sorted(self.person_class_ids),
+            ))
+
+    def _reset(self):
+        self.consecutive_frames = 0
+        self.last_detection_monotonic = None
+        self.event_sent = False
+
+    def _control_callback(self, msg):
+        try:
+            control = json.loads(msg.data)
+            active = bool(control.get('active', False))
+            session = int(control.get('session'))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn('Ignore malformed bearing YOLO-preempt control: %s' % exc)
+            return
+
+        if active:
+            self.active_session = session
+            self._reset()
+            self.get_logger().info(
+                'VOICE_BEARING_YOLO_PREEMPT armed session=%d required_frames=%d'
+                % (session, self.required_consecutive_frames))
+            return
+
+        if self.active_session is None or self.active_session == session:
+            self.get_logger().info(
+                'VOICE_BEARING_YOLO_PREEMPT disarmed session=%s'
+                % self.active_session)
+            self.active_session = None
+            self._reset()
+
+    def _is_person_frame(self, msg):
+        for detection in msg.detections:
+            for result in detection.results:
+                hypothesis = getattr(result, 'hypothesis', None)
+                class_id = str(getattr(hypothesis, 'class_id', '')).strip().lower()
+                if class_id in self.person_class_ids:
+                    return True
+        return False
+
+    def _detections_callback(self, msg):
+        if self.active_session is None or self.event_sent:
+            return
+
+        now = time.monotonic()
+        if (
+                self.last_detection_monotonic is not None
+                and now - self.last_detection_monotonic > self.max_frame_gap_s):
+            self.consecutive_frames = 0
+
+        if self._is_person_frame(msg):
+            self.consecutive_frames += 1
+            self.last_detection_monotonic = now
+            if self.consecutive_frames < self.required_consecutive_frames:
+                self.get_logger().info(
+                    'VOICE_BEARING_YOLO_PREEMPT candidate session=%d frames=%d/%d'
+                    % (
+                        self.active_session,
+                        self.consecutive_frames,
+                        self.required_consecutive_frames,
+                    ))
+                return
+
+            event = String()
+            event.data = json.dumps(
+                {
+                    'consecutive_frames': self.consecutive_frames,
+                    'event': 'person_detected',
+                    'session': self.active_session,
+                },
+                separators=(',', ':'),
+                sort_keys=True,
+            )
+            self.event_pub.publish(event)
+            self.event_sent = True
+            self.get_logger().warn(
+                'VOICE_BEARING_YOLO_PREEMPT person_detected session=%d frames=%d'
+                % (self.active_session, self.consecutive_frames))
+            return
+
+        self.consecutive_frames = 0
+        self.last_detection_monotonic = now
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BearingNavYoloPreempt()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

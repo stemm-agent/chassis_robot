@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Translation-only progress watchdog for bearing-nav goals.
+
+Nav2's SimpleProgressChecker is a controller plugin on this chassis and does
+not publish a topic.  This node is intentionally passive: it receives a
+session-scoped start/stop command from voice_summon_coordinator, observes only
+odometry, and emits a single stalled event.  It never sends cmd_vel, cancels a
+goal, or touches any other Nav2 request itself.
+"""
+
+import json
+import math
+import time
+
+import rclpy
+from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from std_msgs.msg import String
+
+
+class BearingNavProgressWatchdog(Node):
+    def __init__(self):
+        super().__init__('voice_summon_bearing_nav_progress_watchdog')
+        self.declare_parameter('odom_topic', '/odom_combined')
+        self.declare_parameter(
+            'control_topic',
+            '/voice_summon/bearing_nav_progress_watchdog/control')
+        self.declare_parameter(
+            'event_topic',
+            '/voice_summon/bearing_nav_progress_watchdog/event')
+        self.declare_parameter('movement_window_s', 10.0)
+        self.declare_parameter('minimum_translation_m', 0.15)
+        self.declare_parameter('odom_fresh_timeout_s', 1.0)
+        self.declare_parameter('timer_period_s', 0.10)
+
+        self.movement_window_s = max(
+            1.0, float(self.get_parameter('movement_window_s').value))
+        self.minimum_translation_m = max(
+            0.01, float(self.get_parameter('minimum_translation_m').value))
+        self.odom_fresh_timeout_s = max(
+            0.1, float(self.get_parameter('odom_fresh_timeout_s').value))
+        timer_period_s = max(
+            0.02, float(self.get_parameter('timer_period_s').value))
+
+        self.latest_x = None
+        self.latest_y = None
+        self.latest_odom_at = None
+        self.active_session = None
+        self.anchor_x = None
+        self.anchor_y = None
+        self.anchor_at = None
+        self.event_sent = False
+        self.last_odom_warning_at = 0.0
+
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            self.get_parameter('odom_topic').value,
+            self._odom_callback,
+            20,
+        )
+        self.control_sub = self.create_subscription(
+            String,
+            self.get_parameter('control_topic').value,
+            self._control_callback,
+            10,
+        )
+        self.event_pub = self.create_publisher(
+            String,
+            self.get_parameter('event_topic').value,
+            10,
+        )
+        self.timer = self.create_timer(timer_period_s, self._timer_callback)
+        self.get_logger().info(
+            'bearing-nav progress watchdog ready: odom=%s window_s=%.1f min_translation_m=%.2f'
+            % (
+                self.get_parameter('odom_topic').value,
+                self.movement_window_s,
+                self.minimum_translation_m,
+            ))
+
+    def _odom_callback(self, msg):
+        self.latest_x = float(msg.pose.pose.position.x)
+        self.latest_y = float(msg.pose.pose.position.y)
+        self.latest_odom_at = time.monotonic()
+        if self.active_session is not None and self.anchor_at is None:
+            self._set_anchor(self.latest_odom_at)
+
+    def _control_callback(self, msg):
+        try:
+            control = json.loads(msg.data)
+            session = int(control.get('session'))
+            active = bool(control.get('active'))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn('Ignore malformed bearing watchdog control: %s' % exc)
+            return
+
+        if not active:
+            if self.active_session is None or session == self.active_session:
+                self._reset()
+                self.get_logger().info(
+                    'VOICE_BEARING_PROGRESS_WATCHDOG stopped session=%d' % session)
+            return
+
+        self.active_session = session
+        self.event_sent = False
+        self.anchor_x = None
+        self.anchor_y = None
+        self.anchor_at = None
+        if self._odom_is_fresh(time.monotonic()):
+            self._set_anchor(time.monotonic())
+        self.get_logger().info(
+            'VOICE_BEARING_PROGRESS_WATCHDOG started session=%d' % session)
+
+    def _reset(self):
+        self.active_session = None
+        self.anchor_x = None
+        self.anchor_y = None
+        self.anchor_at = None
+        self.event_sent = False
+
+    def _set_anchor(self, now):
+        self.anchor_x = self.latest_x
+        self.anchor_y = self.latest_y
+        self.anchor_at = now
+
+    def _odom_is_fresh(self, now):
+        return (
+            self.latest_x is not None
+            and self.latest_y is not None
+            and self.latest_odom_at is not None
+            and now - self.latest_odom_at <= self.odom_fresh_timeout_s)
+
+    def _timer_callback(self):
+        if self.active_session is None or self.event_sent:
+            return
+        now = time.monotonic()
+        if not self._odom_is_fresh(now):
+            if now - self.last_odom_warning_at >= 5.0:
+                self.last_odom_warning_at = now
+                self.get_logger().warn(
+                    'Bearing-nav progress watchdog waiting for fresh odometry')
+            return
+        if self.anchor_at is None:
+            self._set_anchor(now)
+            return
+
+        translation_m = math.hypot(
+            self.latest_x - self.anchor_x,
+            self.latest_y - self.anchor_y)
+        elapsed_s = now - self.anchor_at
+        if translation_m >= self.minimum_translation_m:
+            self.get_logger().info(
+                'VOICE_BEARING_PROGRESS_WATCHDOG progress translation_m=%.3f elapsed_s=%.2f'
+                % (translation_m, elapsed_s))
+            self._set_anchor(now)
+            return
+        if elapsed_s < self.movement_window_s:
+            return
+
+        event = String()
+        event.data = json.dumps(
+            {
+                'event': 'stalled',
+                'elapsed_s': round(elapsed_s, 3),
+                'session': int(self.active_session),
+                'translation_m': round(translation_m, 4),
+            },
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+        self.event_pub.publish(event)
+        self.event_sent = True
+        self.get_logger().warn(
+            'VOICE_BEARING_PROGRESS_WATCHDOG stalled session=%d translation_m=%.3f elapsed_s=%.2f'
+            % (self.active_session, translation_m, elapsed_s))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = BearingNavProgressWatchdog()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+if __name__ == '__main__':
+    main()

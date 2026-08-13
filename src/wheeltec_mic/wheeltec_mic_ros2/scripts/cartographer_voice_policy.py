@@ -31,6 +31,13 @@ ALLOWED_STATES = {
 ACTIVE_UNIT_STATES = {'active', 'activating', 'deactivating', 'reloading'}
 ENDING_MODES = {'returning_home', 'shutdown'}
 PAUSED_MODES = {'paused', 'stopped'}
+CONFIRMED_ACTIVE_STATES = {RUNNING, PAUSED, ENDING}
+SUCCESS_FEEDBACK_AUDIO = {
+    'pause': '/OK.wav',
+    'save': '/OK.wav',
+    'continue': '/OK.wav',
+    'end': '/mapping_return_home.wav',
+}
 WAIT = 'wait'
 SEND = 'send'
 COMPLETE = 'complete'
@@ -95,3 +102,35 @@ def motion_is_blocked(state, unit_state='inactive', lock_held=False):
         or unit_state in ACTIVE_UNIT_STATES
         or bool(lock_held)
     )
+
+
+def should_preserve_confirmed_state(
+        current_state, unit_state, lock_held,
+        nav_state_present, nav_state_fresh):
+    """Keep a confirmed mapping state across a bounded nav-state gap.
+
+    The managed mapping session can legitimately hold its lock while the
+    systemd unit reports ``inactive``.  Treat either signal as proof that the
+    session is still active, otherwise a short nav-state gap incorrectly
+    regresses RUNNING/PAUSED/ENDING to STARTING and rejects valid commands.
+    """
+    return (
+        bool(nav_state_present)
+        and not nav_state_fresh
+        and (
+            unit_state in ACTIVE_UNIT_STATES
+            or bool(lock_held)
+        )
+        and current_state in CONFIRMED_ACTIVE_STATES
+    )
+
+
+def apply_pause_latch(derived_state, pause_latched):
+    """Keep a confirmed pause through transient Nav2 state changes."""
+    if pause_latched and derived_state not in (IDLE, ENDING):
+        return PAUSED
+    return derived_state
+
+
+def success_feedback_audio(action):
+    return SUCCESS_FEEDBACK_AUDIO.get(action)

@@ -1,0 +1,2125 @@
+#!/usr/bin/env python3
+import json
+import math
+import time
+
+import rclpy
+from action_msgs.msg import GoalStatus
+from bodyreader_msg.msg import Bodyposture
+from geometry_msgs.msg import PoseStamped, Twist
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from nav_msgs.msg import Odometry
+from rcl_interfaces.msg import SetParametersResult
+from rclpy.action import ActionClient
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.time import Time
+from std_msgs.msg import Bool, String, UInt32
+from std_srvs.srv import SetBool
+from tf2_ros import Buffer, TransformException, TransformListener
+
+
+# V9 first-stage candidate order.  The score is an audit value only: the
+# production implementation never feeds a Nav2 path length, cost, or ETA back
+# into this order.  Nav2 is used solely as a binary reachability gate.
+V9_FIRST_STAGE = (
+    (2.9, 0.0, 0.7838768),
+    (2.0, 0.0, 0.7370214),
+    (3.8, 0.0, 0.7298858),
+    (1.4, 0.0, 0.6535049),
+    (0.9, 0.0, 0.5633382),
+    (4.8, 0.0, 0.5608315),
+    (5.8, 0.0, 0.3436422),
+    (5.8, -12.0, 0.3003745),
+    (5.8, 12.0, 0.3003745),
+    (6.9, -12.0, 0.2851859),
+    (6.9, 12.0, 0.2851859),
+    (4.8, -12.0, 0.2365808),
+)
+
+
+class VoiceSummonCoordinator(Node):
+    def __init__(self):
+        super().__init__('voice_summon_coordinator')
+
+        self.declare_parameter('summon_commands', ['小车过来'])
+        self.declare_parameter('pause_commands', ['小车停', '关闭跟随'])
+        self.declare_parameter('voice_words_topic', 'voice_words')
+        self.declare_parameter('awake_angle_topic', 'awake_angle')
+        self.declare_parameter('odom_topic', '/odom_combined')
+        self.declare_parameter('body_posture_topic', '/body_posture_yolo_validated')
+        self.declare_parameter('mode_topic', '/mode')
+        self.declare_parameter('bodyfollow_mode_service', '/bodyfollow/set_enabled')
+        self.declare_parameter('mode_service_retry_s', 0.5)
+        self.declare_parameter('mode_service_call_timeout_s', 2.0)
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('feedback_topic', 'feedback_audio')
+        self.declare_parameter('follow_control_service', '/voice_summon/set_body_follow_enabled')
+        self.declare_parameter('search_feedback_audio', '/search_voice.wav')
+        self.declare_parameter('enable_turn_to_sound', True)
+        self.declare_parameter('enable_follow_without_fresh_angle', False)
+        self.declare_parameter('angle_fresh_timeout_s', 15.0)
+        self.declare_parameter('command_cooldown_s', 1.5)
+        self.declare_parameter('summon_lockout_s', 8.0)
+        self.declare_parameter('feedback_cooldown_s', 2.0)
+        self.declare_parameter('turn_angular_speed_rad_s', 0.5)
+        self.declare_parameter('min_turn_angle_deg', 5.0)
+        self.declare_parameter('max_turn_angle_deg', 180.0)
+        self.declare_parameter('turn_timeout_s', 12.0)
+        self.declare_parameter('turn_kp', 1.2)
+        self.declare_parameter('turn_min_angular_speed_rad_s', 0.12)
+        self.declare_parameter('turn_max_angular_accel_rad_s2', 0.8)
+        self.declare_parameter('turn_tolerance_deg', 3.0)
+        self.declare_parameter('turn_settle_time_s', 0.30)
+        self.declare_parameter('stop_angular_speed_rad_s', 0.05)
+        self.declare_parameter('stop_stable_time_s', 0.25)
+        self.declare_parameter('wait_stop_timeout_s', 2.0)
+        self.declare_parameter('odom_fresh_timeout_s', 0.25)
+        self.declare_parameter('mic_yaw_offset_deg', -20.0)
+        self.declare_parameter('mode_pause', 1)
+        self.declare_parameter('mode_follow', 2)
+        self.declare_parameter('follow_distance_m', 1.5)
+        self.declare_parameter('follow_complete_tolerance_m', 0.2)
+        self.declare_parameter('follow_complete_stable_s', 2.0)
+        self.declare_parameter('body_fresh_timeout_s', 0.8)
+        self.declare_parameter('publish_pause_on_start', True)
+        self.declare_parameter('publish_pause_while_idle', False)
+        self.declare_parameter('pause_heartbeat_s', 1.0)
+        self.declare_parameter('timer_period_s', 0.02)
+
+        # Bearing-only fallback.  It is deliberately isolated from Nav2's
+        # route-cost model: candidate ranking is fixed above and Nav2 only
+        # answers whether an endpoint has a path under its own current map and
+        # inflation configuration.
+        self.declare_parameter('enable_bearing_nav_fallback', True)
+        # All V9 endpoint distances are multiplied by this factor.  Ranking,
+        # bearing offsets and the binary Nav2 feasibility decision are left
+        # unchanged, so this is geometrical spacing rather than route costing.
+        self.declare_parameter('bearing_candidate_distance_scale', 1.3)
+        # Dynamic obstacles are deliberately handled without consuming Nav2 path
+        # length or cost.  When this many consecutive on-axis endpoints are
+        # rejected by ComputePathToPose, insert bearing-constrained lateral
+        # alternatives around those same acoustic ranges.
+        self.declare_parameter('bearing_dynamic_lateral_enabled', True)
+        self.declare_parameter('bearing_dynamic_lateral_reject_threshold', 2)
+        self.declare_parameter(
+            'bearing_dynamic_lateral_offsets_deg', [-12.0, 12.0])
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('motion_gate_service', '/body_nav2_follower/set_motion_enabled')
+        self.declare_parameter('compute_path_action_name', '/compute_path_to_pose')
+        self.declare_parameter('navigate_action_name', '/navigate_to_pose')
+        self.declare_parameter('visual_acquire_grace_s', 0.8)
+        self.declare_parameter('search_sweep_deg', 25.0)
+        self.declare_parameter('search_sweep_cycles', 2)
+        self.declare_parameter('search_angular_speed_rad_s', 0.30)
+        # This is a safety ceiling for the complete two-cycle visual scan, not
+        # a target duration.  On the real chassis the six commanded segments
+        # can take about 20 s before the final settle interval, so 20 s could
+        # pre-empt the Nav2 fallback exactly as the scan completed.
+        self.declare_parameter('search_timeout_s', 45.0)
+        self.declare_parameter('nav_server_timeout_s', 2.0)
+        self.declare_parameter('nav_timeout_s', 45.0)
+        self.declare_parameter('nav_cancel_timeout_s', 2.0)
+        # The Nav2 SimpleProgressChecker does not expose a ROS topic on this
+        # chassis.  A dedicated observer owns the equivalent translation-only
+        # watchdog and reports only events for this bearing-nav session.
+        self.declare_parameter(
+            'bearing_nav_progress_control_topic',
+            '/voice_summon/bearing_nav_progress_watchdog/control')
+        self.declare_parameter(
+            'bearing_nav_progress_event_topic',
+            '/voice_summon/bearing_nav_progress_watchdog/event')
+        self.declare_parameter('stuck_search_lateral_epsilon_m', 0.15)
+        self.declare_parameter('stuck_search_half_span_deg', 90.0)
+        self.declare_parameter('stuck_search_timeout_s', 25.0)
+        self.declare_parameter('stuck_full_turn_speed_multiplier', 1.5)
+        self.declare_parameter('stuck_full_turn_timeout_s', 20.0)
+        # RGB torso detections are intentionally used only to preempt this
+        # node's own bearing-navigation goal.  Validated 3-D body posture is
+        # still required before body-follow actuation is released.
+        self.declare_parameter(
+            'bearing_nav_yolo_preempt_control_topic',
+            '/voice_summon/bearing_nav_yolo_preempt/control')
+        self.declare_parameter(
+            'bearing_nav_yolo_preempt_event_topic',
+            '/voice_summon/bearing_nav_yolo_preempt/event')
+        self.declare_parameter('yolo_preempt_body_wait_s', 2.0)
+
+        self.summon_commands = set(self.get_parameter('summon_commands').value)
+        self.pause_commands = set(self.get_parameter('pause_commands').value)
+        self.enable_turn_to_sound = bool(self.get_parameter('enable_turn_to_sound').value)
+        self.enable_follow_without_fresh_angle = bool(
+            self.get_parameter('enable_follow_without_fresh_angle').value)
+        self.angle_fresh_timeout_s = float(self.get_parameter('angle_fresh_timeout_s').value)
+        self.command_cooldown_s = float(self.get_parameter('command_cooldown_s').value)
+        self.summon_lockout_s = float(self.get_parameter('summon_lockout_s').value)
+        self.feedback_cooldown_s = float(self.get_parameter('feedback_cooldown_s').value)
+        self.turn_angular_speed_rad_s = abs(float(self.get_parameter('turn_angular_speed_rad_s').value))
+        self.min_turn_angle_deg = float(self.get_parameter('min_turn_angle_deg').value)
+        self.max_turn_angle_deg = float(self.get_parameter('max_turn_angle_deg').value)
+        self.turn_timeout_s = max(1.0, float(self.get_parameter('turn_timeout_s').value))
+        self.turn_kp = max(0.0, float(self.get_parameter('turn_kp').value))
+        self.turn_min_angular_speed_rad_s = abs(float(
+            self.get_parameter('turn_min_angular_speed_rad_s').value))
+        self.turn_min_angular_speed_rad_s = min(
+            self.turn_min_angular_speed_rad_s, self.turn_angular_speed_rad_s)
+        self.turn_max_angular_accel_rad_s2 = max(
+            0.1, abs(float(self.get_parameter('turn_max_angular_accel_rad_s2').value)))
+        self.turn_tolerance_rad = math.radians(max(
+            0.5, float(self.get_parameter('turn_tolerance_deg').value)))
+        self.turn_settle_time_s = max(
+            0.05, float(self.get_parameter('turn_settle_time_s').value))
+        self.stop_angular_speed_rad_s = max(
+            0.01, abs(float(self.get_parameter('stop_angular_speed_rad_s').value)))
+        self.stop_stable_time_s = max(
+            0.05, float(self.get_parameter('stop_stable_time_s').value))
+        self.wait_stop_timeout_s = max(
+            0.5, float(self.get_parameter('wait_stop_timeout_s').value))
+        self.odom_fresh_timeout_s = max(
+            0.05, float(self.get_parameter('odom_fresh_timeout_s').value))
+        self.mic_yaw_offset_rad = math.radians(
+            float(self.get_parameter('mic_yaw_offset_deg').value))
+        self.mode_service_retry_s = max(
+            0.1, float(self.get_parameter('mode_service_retry_s').value))
+        self.mode_service_call_timeout_s = max(
+            0.2, float(self.get_parameter('mode_service_call_timeout_s').value))
+        self.follow_distance_m = float(self.get_parameter('follow_distance_m').value)
+        self.follow_complete_tolerance_m = float(self.get_parameter('follow_complete_tolerance_m').value)
+        self.follow_complete_stable_s = float(self.get_parameter('follow_complete_stable_s').value)
+        self.body_fresh_timeout_s = float(self.get_parameter('body_fresh_timeout_s').value)
+        self.publish_pause_on_start = bool(self.get_parameter('publish_pause_on_start').value)
+        self.publish_pause_while_idle = bool(self.get_parameter('publish_pause_while_idle').value)
+        self.pause_heartbeat_s = float(self.get_parameter('pause_heartbeat_s').value)
+        timer_period_s = float(self.get_parameter('timer_period_s').value)
+        self.enable_bearing_nav_fallback = bool(
+            self.get_parameter('enable_bearing_nav_fallback').value)
+        self.map_frame = str(self.get_parameter('map_frame').value)
+        self.base_frame = str(self.get_parameter('base_frame').value)
+        self.motion_gate_service_name = str(self.get_parameter('motion_gate_service').value)
+        self.compute_path_action_name = str(self.get_parameter('compute_path_action_name').value)
+        self.navigate_action_name = str(self.get_parameter('navigate_action_name').value)
+        self.visual_acquire_grace_s = max(
+            0.05, float(self.get_parameter('visual_acquire_grace_s').value))
+        self.search_sweep_rad = math.radians(max(
+            1.0, float(self.get_parameter('search_sweep_deg').value)))
+        self.search_sweep_cycles = max(
+            1, int(self.get_parameter('search_sweep_cycles').value))
+        self.search_angular_speed_rad_s = max(
+            0.05, abs(float(self.get_parameter('search_angular_speed_rad_s').value)))
+        self.search_timeout_s = max(
+            2.0, float(self.get_parameter('search_timeout_s').value))
+        self.nav_server_timeout_s = max(
+            0.2, float(self.get_parameter('nav_server_timeout_s').value))
+        self.nav_timeout_s = max(
+            3.0, float(self.get_parameter('nav_timeout_s').value))
+        self.nav_cancel_timeout_s = max(
+            0.2, float(self.get_parameter('nav_cancel_timeout_s').value))
+        candidate_distance_scale = float(
+            self.get_parameter('bearing_candidate_distance_scale').value)
+        if not math.isfinite(candidate_distance_scale) or candidate_distance_scale <= 0.0:
+            raise ValueError(
+                'bearing_candidate_distance_scale must be finite and > 0')
+        self.bearing_candidate_distance_scale = candidate_distance_scale
+        self.bearing_dynamic_lateral_enabled = bool(
+            self.get_parameter('bearing_dynamic_lateral_enabled').value)
+        self.bearing_dynamic_lateral_reject_threshold = max(
+            1, int(self.get_parameter('bearing_dynamic_lateral_reject_threshold').value))
+        lateral_offsets = []
+        for raw_offset in self.get_parameter(
+                'bearing_dynamic_lateral_offsets_deg').value:
+            offset = float(raw_offset)
+            if not math.isfinite(offset) or abs(offset) < 1.0 or abs(offset) > 45.0:
+                raise ValueError(
+                    'bearing_dynamic_lateral_offsets_deg must be finite and within '
+                    '[-45, -1] or [1, 45] degrees')
+            if not any(abs(offset - existing) < 1.0e-6 for existing in lateral_offsets):
+                lateral_offsets.append(offset)
+        if not lateral_offsets:
+            raise ValueError('bearing_dynamic_lateral_offsets_deg must not be empty')
+        self.bearing_dynamic_lateral_offsets_deg = tuple(lateral_offsets)
+        self.bearing_nav_progress_control_topic = str(
+            self.get_parameter('bearing_nav_progress_control_topic').value)
+        self.bearing_nav_progress_event_topic = str(
+            self.get_parameter('bearing_nav_progress_event_topic').value)
+        self.stuck_search_lateral_epsilon_m = max(
+            0.01, float(self.get_parameter('stuck_search_lateral_epsilon_m').value))
+        self.stuck_search_half_span_rad = math.radians(max(
+            1.0, min(180.0, float(
+                self.get_parameter('stuck_search_half_span_deg').value))))
+        self.stuck_search_timeout_s = max(
+            3.0, float(self.get_parameter('stuck_search_timeout_s').value))
+        self.stuck_full_turn_speed_multiplier = max(
+            1.0, float(self.get_parameter('stuck_full_turn_speed_multiplier').value))
+        self.stuck_full_turn_timeout_s = max(
+            5.0, float(self.get_parameter('stuck_full_turn_timeout_s').value))
+        self.bearing_nav_yolo_preempt_control_topic = str(
+            self.get_parameter('bearing_nav_yolo_preempt_control_topic').value)
+        self.bearing_nav_yolo_preempt_event_topic = str(
+            self.get_parameter('bearing_nav_yolo_preempt_event_topic').value)
+        self.yolo_preempt_body_wait_s = max(
+            0.1, float(self.get_parameter('yolo_preempt_body_wait_s').value))
+        self.add_on_set_parameters_callback(self._parameter_update_callback)
+
+        self.latest_angle_deg = None
+        self.latest_angle_monotonic = None
+        self.latest_angle_reference_yaw = None
+        self.latest_odom_yaw = None
+        self.latest_odom_x = None
+        self.latest_odom_y = None
+        self.latest_odom_angular_z = 0.0
+        self.latest_odom_monotonic = None
+        self.latest_body_id = None
+        self.latest_body_distance_m = None
+        self.latest_body_monotonic = None
+        self.state = 'idle'
+        self.follow_enabled = False
+        self.follow_monitor_enabled = False
+        self.follow_stable_body_id = None
+        self.follow_stable_since = 0.0
+        self.turn_target_yaw = None
+        self.turn_start_yaw = None
+        self.turn_relative_angle_rad = 0.0
+        self.wait_stop_deadline_monotonic = 0.0
+        self.stop_stable_since = 0.0
+        self.turn_started_monotonic = 0.0
+        self.turn_deadline_monotonic = 0.0
+        self.turn_settle_since = 0.0
+        self.last_turn_control_monotonic = 0.0
+        self.last_turn_command_wz = 0.0
+        self.last_turn_progress_log = 0.0
+        self.last_command_at = {}
+        self.last_feedback_at = {}
+        self.last_summon_started_at = 0.0
+        self.mapping_motion_blocked = False
+        self.desired_follow_enabled = None
+        self.desired_follow_reason = ''
+        self.mode_request_inflight = False
+        self.mode_request_sequence = 0
+        self.mode_request_deadline = 0.0
+        self.last_mode_request_at = 0.0
+        self.last_mode_service_warning_at = 0.0
+        self.visual_mode_ready_deadline = 0.0
+
+        # The locked bearing is expressed in odom_combined and captured only
+        # once, at wake reception.  Later map-frame candidates are derived by
+        # combining it with the live map->base and odom heading, so the robot
+        # never relies on a later microphone observation.
+        self.locked_bearing_odom_yaw = None
+        self.locked_bearing_odom_origin_x = None
+        self.locked_bearing_odom_origin_y = None
+        self.search_targets_odom_yaw = []
+        self.search_target_index = 0
+        self.search_target_yaw = None
+        self.search_deadline_monotonic = 0.0
+        self.search_settle_since = 0.0
+        self.search_last_control_monotonic = 0.0
+        self.search_last_command_wz = 0.0
+        self.search_completion_action = 'path_check'
+        # The initial visual sweep builds the fixed candidate queue.  A sweep
+        # after reaching one queue member must instead advance that same queue.
+        self.visual_search_completion_action = 'path_check'
+        self.candidate_advance_reason = ''
+        self.search_label = 'primary'
+        self.search_active_angular_speed_rad_s = self.search_angular_speed_rad_s
+        self.acquire_deadline_monotonic = 0.0
+        self.bearing_session = 0
+        self.pending_bearing_body = False
+        self.motion_gate_desired = None
+        self.motion_gate_inflight = False
+        self.motion_gate_next = None
+        self.bearing_candidates = []
+        self.bearing_candidate_index = 0
+        self.bearing_on_axis_rejections = []
+        self.bearing_dynamic_lateral_inserted = False
+        self.selected_bearing_candidate = None
+        self.compute_goal_handle = None
+        self.bearing_nav_goal_handle = None
+        self.bearing_nav_sent_monotonic = 0.0
+        self.bearing_nav_cancel_deadline = 0.0
+        self.bearing_nav_cancel_requested = False
+        self.stuck_full_turn_direction = 1.0
+        self.stuck_full_turn_last_yaw = None
+        self.stuck_full_turn_accumulated_rad = 0.0
+        self.stuck_full_turn_speed_rad_s = 0.0
+        self.stuck_full_turn_deadline_monotonic = 0.0
+        self.yolo_preempt_body_deadline_monotonic = 0.0
+
+        # /mode used to be published directly from this node.  It is now an
+        # internal state bus owned by bodyfollow_mode_controller; voice only
+        # sends a SetBool request and retries if that controller is absent.
+        self.mode_service_name = self.get_parameter('bodyfollow_mode_service').value
+        self.mode_service_client = self.create_client(SetBool, self.mode_service_name)
+        self.motion_gate_client = self.create_client(
+            SetBool, self.motion_gate_service_name)
+        self.compute_path_client = ActionClient(
+            self, ComputePathToPose, self.compute_path_action_name)
+        self.navigate_client = ActionClient(
+            self, NavigateToPose, self.navigate_action_name)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.cmd_vel_pub = self.create_publisher(Twist, self.get_parameter('cmd_vel_topic').value, 10)
+        self.feedback_pub = self.create_publisher(String, self.get_parameter('feedback_topic').value, 10)
+        self.progress_watchdog_control_pub = self.create_publisher(
+            String, self.bearing_nav_progress_control_topic, 10)
+        self.yolo_preempt_control_pub = self.create_publisher(
+            String, self.bearing_nav_yolo_preempt_control_topic, 10)
+
+        self.voice_sub = self.create_subscription(
+            String,
+            self.get_parameter('voice_words_topic').value,
+            self._voice_words_callback,
+            10,
+        )
+        self.mapping_gate_sub = self.create_subscription(
+            Bool,
+            '/stemm_cartographer/motion_blocked',
+            self._mapping_motion_blocked_callback,
+            10,
+        )
+        self.angle_sub = self.create_subscription(
+            UInt32,
+            self.get_parameter('awake_angle_topic').value,
+            self._awake_angle_callback,
+            10,
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            self.get_parameter('odom_topic').value,
+            self._odom_callback,
+            20,
+        )
+        self.progress_watchdog_event_sub = self.create_subscription(
+            String,
+            self.bearing_nav_progress_event_topic,
+            self._progress_watchdog_event_callback,
+            10,
+        )
+        self.yolo_preempt_event_sub = self.create_subscription(
+            String,
+            self.bearing_nav_yolo_preempt_event_topic,
+            self._yolo_preempt_event_callback,
+            10,
+        )
+        self.body_sub = self.create_subscription(
+            Bodyposture,
+            self.get_parameter('body_posture_topic').value,
+            self._body_posture_callback,
+            10,
+        )
+        self.follow_control_srv = self.create_service(
+            SetBool,
+            self.get_parameter('follow_control_service').value,
+            self._follow_control_callback,
+        )
+        self.timer = self.create_timer(timer_period_s, self._timer_callback)
+
+        if self.publish_pause_on_start:
+            self._set_follow_enabled(False, 'startup_pause', monitor_completion=False)
+
+        self.get_logger().info(
+            'voice_summon_coordinator ready: summon=%s pause=%s enable_turn=%s '
+            'angle_timeout=%.1fs odom=%s max_wz=%.2f tol=%.1fdeg '
+            'mode_service=%s follow_distance=%.2fm stable=%.1fs'
+            % (
+                sorted(self.summon_commands),
+                sorted(self.pause_commands),
+                self.enable_turn_to_sound,
+                self.angle_fresh_timeout_s,
+                self.get_parameter('odom_topic').value,
+                self.turn_angular_speed_rad_s,
+                math.degrees(self.turn_tolerance_rad),
+                self.mode_service_name,
+                self.follow_distance_m,
+                self.follow_complete_stable_s,
+            )
+        )
+
+    def _awake_angle_callback(self, msg):
+        now = time.monotonic()
+        self.latest_angle_deg = int(msg.data) % 360
+        self.latest_angle_monotonic = now
+        if self._odom_is_fresh(now):
+            self.latest_angle_reference_yaw = self.latest_odom_yaw
+        else:
+            self.latest_angle_reference_yaw = None
+            self.get_logger().warn(
+                'awake_angle=%d received without fresh odometry' % self.latest_angle_deg)
+
+    def _odom_callback(self, msg):
+        self.latest_odom_x = float(msg.pose.pose.position.x)
+        self.latest_odom_y = float(msg.pose.pose.position.y)
+        orientation = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (
+            orientation.w * orientation.z + orientation.x * orientation.y)
+        cosy_cosp = 1.0 - 2.0 * (
+            orientation.y * orientation.y + orientation.z * orientation.z)
+        self.latest_odom_yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.latest_odom_angular_z = float(msg.twist.twist.angular.z)
+        self.latest_odom_monotonic = time.monotonic()
+
+    def _publish_progress_watchdog_control(self, active):
+        message = String()
+        message.data = json.dumps(
+            {
+                'active': bool(active),
+                'session': int(self.bearing_session),
+            },
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+        self.progress_watchdog_control_pub.publish(message)
+        self.get_logger().info(
+            'VOICE_BEARING_PROGRESS_WATCHDOG control active=%s session=%d'
+            % (bool(active), self.bearing_session))
+
+    def _publish_yolo_preempt_control(self, active):
+        message = String()
+        message.data = json.dumps(
+            {
+                'active': bool(active),
+                'session': int(self.bearing_session),
+            },
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+        self.yolo_preempt_control_pub.publish(message)
+        self.get_logger().info(
+            'VOICE_BEARING_YOLO_PREEMPT control active=%s session=%d'
+            % (bool(active), self.bearing_session))
+
+    def _parameter_update_callback(self, parameters):
+        """Accept a positive distance scale for future candidate queues only."""
+        proposed_scale = self.bearing_candidate_distance_scale
+        changed = False
+        for parameter in parameters:
+            if parameter.name != 'bearing_candidate_distance_scale':
+                continue
+            try:
+                proposed_scale = float(parameter.value)
+            except (TypeError, ValueError):
+                return SetParametersResult(
+                    successful=False,
+                    reason='bearing_candidate_distance_scale must be numeric',
+                )
+            if not math.isfinite(proposed_scale) or proposed_scale <= 0.0:
+                return SetParametersResult(
+                    successful=False,
+                    reason='bearing_candidate_distance_scale must be finite and > 0',
+                )
+            changed = True
+        if changed:
+            self.bearing_candidate_distance_scale = proposed_scale
+            self.get_logger().info(
+                'VOICE_BEARING_CANDIDATE_SCALE updated scale=%.3f; '
+                'applies to the next candidate queue' % proposed_scale)
+        return SetParametersResult(successful=True, reason='')
+
+    def _yolo_preempt_event_callback(self, msg):
+        try:
+            event = json.loads(msg.data)
+            event_session = int(event.get('session'))
+            event_name = str(event.get('event', ''))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn('Ignore malformed bearing YOLO-preempt event: %s' % exc)
+            return
+        if event_name != 'person_detected':
+            return
+        if event_session != self.bearing_session or self.state != 'bearing_navigating':
+            self.get_logger().info(
+                'Ignore stale bearing YOLO-preempt event session=%d current=%d state=%s'
+                % (event_session, self.bearing_session, self.state))
+            return
+        frames = event.get('consecutive_frames', '?')
+        self.get_logger().info(
+            'VOICE_BEARING_YOLO_PREEMPT detected frames=%s; cancel current bearing Nav2 goal'
+            % frames)
+        self._begin_yolo_preempt()
+
+    def _begin_yolo_preempt(self):
+        if self.state != 'bearing_navigating':
+            return
+        self._publish_progress_watchdog_control(False)
+        self._publish_yolo_preempt_control(False)
+        self._publish_turn_command(0.0)
+        # Keep RGB/depth inference in mode=2 and follower actuation gated off
+        # while Nav2 acknowledges the cancellation.  This is a Nav2-goal
+        # cancellation only; it neither shuts down Nav2 nor ends the summon.
+        self._request_motion_gate(False, 'bearing_nav_yolo_preempt')
+        self.pending_bearing_body = False
+        self._reset_follow_observation()
+        self.state = 'cancel_bearing_nav_for_yolo_preempt'
+        self.bearing_nav_cancel_deadline = time.monotonic() + self.nav_cancel_timeout_s
+        self.bearing_nav_cancel_requested = True
+        if self.bearing_nav_goal_handle is not None:
+            self.bearing_nav_goal_handle.cancel_goal_async()
+            self.get_logger().info(
+                'VOICE_BEARING_YOLO_PREEMPT cancel requested; wait for validated body')
+        else:
+            self.get_logger().warn(
+                'Bearing Nav2 handle missing on YOLO preempt; begin body wait directly')
+            self._begin_yolo_preempt_body_wait()
+
+    def _begin_yolo_preempt_body_wait(self):
+        if self.state != 'cancel_bearing_nav_for_yolo_preempt':
+            return
+        self.pending_bearing_body = False
+        self._reset_follow_observation()
+        self.state = 'waiting_yolo_preempt_body'
+        self.yolo_preempt_body_deadline_monotonic = (
+            time.monotonic() + self.yolo_preempt_body_wait_s)
+        self.get_logger().info(
+            'VOICE_BEARING_YOLO_PREEMPT_WAIT validated_body timeout_s=%.2f'
+            % self.yolo_preempt_body_wait_s)
+
+    def _progress_watchdog_event_callback(self, msg):
+        try:
+            event = json.loads(msg.data)
+            event_session = int(event.get('session'))
+            event_name = str(event.get('event', ''))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn('Ignore malformed bearing progress event: %s' % exc)
+            return
+        if event_name != 'stalled':
+            return
+        if event_session != self.bearing_session or self.state != 'bearing_navigating':
+            self.get_logger().info(
+                'Ignore stale bearing progress event session=%d current=%d state=%s'
+                % (event_session, self.bearing_session, self.state))
+            return
+        try:
+            translation_m = float(event.get('translation_m', float('nan')))
+            elapsed_s = float(event.get('elapsed_s', float('nan')))
+        except (TypeError, ValueError):
+            translation_m = float('nan')
+            elapsed_s = float('nan')
+        self.get_logger().warn(
+            'VOICE_BEARING_PROGRESS_STALLED translation_m=%.3f elapsed_s=%.2f; '
+            'cancel bearing Nav2, run recovery search, then try next candidate'
+            % (translation_m, elapsed_s))
+        self._begin_stuck_recovery()
+
+    def _begin_stuck_recovery(self):
+        if self.state != 'bearing_navigating':
+            return
+        self._publish_progress_watchdog_control(False)
+        self._publish_yolo_preempt_control(False)
+        self._publish_turn_command(0.0)
+        # The body follower already has its motion gate closed during bearing
+        # navigation.  Reassert it, but keep mode=2 active so the recovery
+        # scan continues to receive validated visual detections.
+        self._request_motion_gate(False, 'bearing_nav_progress_stall')
+        self.pending_bearing_body = False
+        self._reset_follow_observation()
+        self.state = 'cancel_bearing_nav_for_stuck_search'
+        self.bearing_nav_cancel_deadline = time.monotonic() + self.nav_cancel_timeout_s
+        self.bearing_nav_cancel_requested = True
+        if self.bearing_nav_goal_handle is not None:
+            self.bearing_nav_goal_handle.cancel_goal_async()
+            self.get_logger().info(
+                'VOICE_BEARING_PROGRESS_STALLED cancel requested; vision remains observation-only')
+        else:
+            self.get_logger().warn(
+                'Bearing Nav2 handle missing on progress stall; begin recovery search directly')
+            self._start_stuck_recovery_search(
+                completion_action='next_candidate',
+                advance_reason='progress_stalled',
+            )
+
+    @staticmethod
+    def _normalize_angle(angle_rad):
+        return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+    def _odom_is_fresh(self, now):
+        return (
+            self.latest_odom_yaw is not None
+            and self.latest_odom_monotonic is not None
+            and now - self.latest_odom_monotonic <= self.odom_fresh_timeout_s
+        )
+
+    def _reset_follow_observation(self):
+        self.latest_body_id = None
+        self.latest_body_distance_m = None
+        self.latest_body_monotonic = None
+        self.follow_stable_body_id = None
+        self.follow_stable_since = 0.0
+
+    def _body_posture_callback(self, msg):
+        if msg.lock_status != 2 or msg.centerofmass_z <= 100.0:
+            if self.state == 'following' and self.follow_monitor_enabled:
+                self._reset_follow_observation()
+            return
+
+        body_id = int(msg.bodyid)
+        body_distance_m = float(msg.centerofmass_z) * 0.001
+
+        # /body_posture_yolo_validated is already identity-validated (four
+        # confirmation frames in the current launch).  One fresh sample is
+        # therefore enough to stop the bearing scan/nav immediately and hand
+        # motion back to the visual follower.
+        if self.state in (
+                'acquiring_visual', 'searching_bearing', 'checking_bearing_path',
+                'sending_bearing_nav', 'bearing_navigating',
+                'cancel_bearing_nav_for_visual',
+                'cancel_bearing_nav_for_stuck_search',
+                'cancel_bearing_nav_for_next_candidate',
+                'cancel_bearing_nav_for_yolo_preempt',
+                'waiting_yolo_preempt_body',
+                'stuck_recovery_full_turn'):
+            self.latest_body_id = body_id
+            self.latest_body_distance_m = body_distance_m
+            self.latest_body_monotonic = time.monotonic()
+            self.pending_bearing_body = True
+            self.get_logger().info(
+                'VOICE_BEARING_BODY_VALID state=%s body_id=%d distance_m=%.2f'
+                % (self.state, body_id, body_distance_m))
+            self._handle_visual_acquired()
+            return
+
+        if self.state != 'following' or not self.follow_monitor_enabled:
+            return
+
+        if self.latest_body_id is not None and body_id != self.latest_body_id:
+            self.get_logger().warn(
+                'Reset summon completion stability because validated body changed: %d -> %d'
+                % (self.latest_body_id, body_id)
+            )
+            self.follow_stable_body_id = None
+            self.follow_stable_since = 0.0
+
+        self.latest_body_id = body_id
+        self.latest_body_distance_m = body_distance_m
+        self.latest_body_monotonic = time.monotonic()
+
+    def _follow_control_callback(self, request, response):
+        enabled = bool(request.data)
+        if enabled and self.mapping_motion_blocked:
+            self._set_follow_enabled(
+                False, 'mapping_motion_gate', monitor_completion=False)
+            response.success = False
+            response.message = 'body follow blocked during Cartographer mapping'
+            return response
+        if not enabled:
+            self._exit_bearing_summon('external_follow_disable')
+        elif self.state != 'following':
+            # Keep the legacy service behavior: an explicit external follow
+            # request remains able to release the new observation-only gate.
+            self._request_motion_gate(True, 'external_follow_enable')
+        self._set_follow_enabled(enabled, 'setbool_service', monitor_completion=False)
+        response.success = True
+        response.message = 'body follow %s request queued' % (
+            'enabled' if enabled else 'disabled')
+        return response
+
+    def _mapping_motion_blocked_callback(self, msg):
+        blocked = bool(msg.data)
+        if blocked and not self.mapping_motion_blocked:
+            self.get_logger().warn(
+                'Cartographer mapping gate active; stop voice summon/follow.')
+            self.mapping_motion_blocked = True
+            self._exit_bearing_summon('mapping_motion_gate')
+            return
+        self.mapping_motion_blocked = blocked
+
+    def _voice_words_callback(self, msg):
+        command = msg.data.strip()
+        if not command:
+            return
+
+        if command == '小车休眠':
+            self.get_logger().info(
+                'Ignore voice module sleep; keep current body follow state'
+            )
+            return
+
+        if command in self.pause_commands:
+            if self._in_cooldown(command):
+                return
+            self._exit_bearing_summon('voice_pause:%s' % command)
+            return
+
+        if command in self.summon_commands:
+            if self.mapping_motion_blocked:
+                self.get_logger().warn(
+                    'Reject voice summon while Cartographer mapping owns motion.')
+                self._publish_feedback('/stop.wav')
+                return
+            if self._in_cooldown(command) or self._summon_locked_out(command):
+                return
+            self._start_summon(command)
+            return
+
+        if self.state != 'idle':
+            self.get_logger().info('Leave voice summon flow on non-summon command: %s' % command)
+            self._exit_bearing_summon('non_summon_command:%s' % command)
+
+    def _in_cooldown(self, command):
+        now = time.monotonic()
+        last = self.last_command_at.get(command, 0.0)
+        if now - last < self.command_cooldown_s:
+            self.get_logger().info('Ignore repeated command in cooldown: %s' % command)
+            return True
+        self.last_command_at[command] = now
+        return False
+
+    def _summon_locked_out(self, command):
+        now = time.monotonic()
+        if self.state != 'idle':
+            if self.state != 'following' or now - self.last_summon_started_at < self.summon_lockout_s:
+                self.get_logger().info('Ignore summon while current summon is active: %s' % command)
+                return True
+
+        return False
+
+    def _start_summon(self, command):
+        if self.mapping_motion_blocked:
+            self.get_logger().warn(
+                'Ignore summon start because mapping motion gate is active.')
+            return
+        self.last_summon_started_at = time.monotonic()
+        self.bearing_session += 1
+        self._reset_bearing_tracking()
+        self.follow_monitor_enabled = False
+        self.follow_stable_since = 0.0
+        self.get_logger().info('Start voice summon from command: %s' % command)
+        self._set_follow_enabled(
+            False, 'pause_before_closed_loop_turn', monitor_completion=False)
+        self._publish_feedback(self.get_parameter('search_feedback_audio').value)
+
+        target = self._make_target_from_latest_angle()
+        if target is None:
+            if self.enable_follow_without_fresh_angle:
+                self.get_logger().warn(
+                    'Cannot prepare closed-loop sound turn; enable body follow without turn.')
+                self._set_follow_enabled(
+                    True, 'turn_target_unavailable', monitor_completion=True)
+            else:
+                self.get_logger().warn(
+                    'Cannot prepare closed-loop sound turn; keep body follow disabled.')
+                self._set_follow_enabled(
+                    False, 'turn_target_unavailable', monitor_completion=False)
+            return
+
+        relative_angle_rad, target_yaw = target
+        # Keep this absolute odom bearing even after the robot turns and scans.
+        # All later navigation candidates are derived from this one measurement.
+        self.locked_bearing_odom_yaw = target_yaw
+        self.locked_bearing_odom_origin_x = self.latest_odom_x
+        self.locked_bearing_odom_origin_y = self.latest_odom_y
+        relative_angle_deg = abs(math.degrees(relative_angle_rad))
+        if relative_angle_deg < self.min_turn_angle_deg:
+            self.get_logger().info(
+                'Sound target is inside deadband: relative=%.2fdeg target_yaw=%.2fdeg'
+                % (math.degrees(relative_angle_rad), math.degrees(target_yaw)))
+            self._begin_visual_acquisition('angle_deadband')
+            return
+
+        now = time.monotonic()
+        self.turn_target_yaw = target_yaw
+        self.turn_relative_angle_rad = relative_angle_rad
+        self.wait_stop_deadline_monotonic = now + self.wait_stop_timeout_s
+        self.stop_stable_since = 0.0
+        self.turn_settle_since = 0.0
+        self.last_turn_command_wz = 0.0
+        self.last_turn_control_monotonic = now
+        self.last_turn_progress_log = 0.0
+        self.state = 'waiting_stop'
+        self.get_logger().info(
+            'VOICE_TURN_WAIT_STOP awake_angle=%d relative_deg=%.2f target_yaw_deg=%.2f'
+            % (
+                self.latest_angle_deg,
+                math.degrees(relative_angle_rad),
+                math.degrees(target_yaw),
+            )
+        )
+
+    def _make_target_from_latest_angle(self):
+        if not self.enable_turn_to_sound:
+            self.get_logger().warn('Closed-loop sound turn is disabled by parameter')
+            return None
+        if self.latest_angle_deg is None or self.latest_angle_monotonic is None:
+            self.get_logger().warn('No awake_angle has been received')
+            return None
+
+        now = time.monotonic()
+        age_s = now - self.latest_angle_monotonic
+        if age_s > self.angle_fresh_timeout_s:
+            self.get_logger().warn(
+                'Ignore stale awake_angle=%d age=%.2fs'
+                % (self.latest_angle_deg, age_s)
+            )
+            return None
+        if not self._odom_is_fresh(now):
+            self.get_logger().error('Cannot turn because /odom_combined is stale')
+            return None
+        if self.latest_angle_reference_yaw is None:
+            self.get_logger().error(
+                'Cannot turn because awake_angle has no synchronized odom yaw')
+            return None
+
+        raw_angle = self.latest_angle_deg % 360
+        relative_deg = float(raw_angle if raw_angle <= 180 else raw_angle - 360)
+        relative_deg = max(
+            -self.max_turn_angle_deg, min(self.max_turn_angle_deg, relative_deg))
+        relative_angle_rad = self._normalize_angle(
+            -math.radians(relative_deg) + self.mic_yaw_offset_rad)
+        target_yaw = self._normalize_angle(
+            self.latest_angle_reference_yaw + relative_angle_rad)
+        return relative_angle_rad, target_yaw
+
+    def _wait_for_stop(self, now):
+        self._publish_turn_command(0.0)
+        if not self._odom_is_fresh(now):
+            self._abort_turn('odom_stale_while_waiting_stop')
+            return
+        if now >= self.wait_stop_deadline_monotonic:
+            self._abort_turn('wait_stop_timeout')
+            return
+
+        if abs(self.latest_odom_angular_z) <= self.stop_angular_speed_rad_s:
+            if self.stop_stable_since <= 0.0:
+                self.stop_stable_since = now
+            elif now - self.stop_stable_since >= self.stop_stable_time_s:
+                self._begin_closed_loop_turn(now)
+            return
+
+        self.stop_stable_since = 0.0
+
+    def _begin_closed_loop_turn(self, now):
+        if self.turn_target_yaw is None or not self._odom_is_fresh(now):
+            self._abort_turn('turn_start_without_fresh_target_or_odom')
+            return
+
+        self.turn_start_yaw = self.latest_odom_yaw
+        initial_error = self._normalize_angle(
+            self.turn_target_yaw - self.latest_odom_yaw)
+        estimated_timeout_s = max(
+            3.0,
+            abs(initial_error) / max(self.turn_angular_speed_rad_s, 0.01) * 2.5
+            + 2.0,
+        )
+        self.turn_started_monotonic = now
+        self.turn_deadline_monotonic = now + min(
+            self.turn_timeout_s, estimated_timeout_s)
+        self.turn_settle_since = 0.0
+        self.last_turn_control_monotonic = now
+        self.last_turn_command_wz = 0.0
+        self.last_turn_progress_log = 0.0
+        self.state = 'turning'
+        self.get_logger().info(
+            'VOICE_TURN_START start_yaw_deg=%.2f target_yaw_deg=%.2f '
+            'initial_error_deg=%.2f timeout_s=%.2f'
+            % (
+                math.degrees(self.turn_start_yaw),
+                math.degrees(self.turn_target_yaw),
+                math.degrees(initial_error),
+                self.turn_deadline_monotonic - now,
+            )
+        )
+
+    def _run_closed_loop_turn(self, now):
+        if not self._odom_is_fresh(now):
+            self._abort_turn('odom_stale_while_turning')
+            return
+        if now >= self.turn_deadline_monotonic:
+            self._abort_turn('turn_timeout')
+            return
+
+        error = self._normalize_angle(
+            self.turn_target_yaw - self.latest_odom_yaw)
+        if abs(error) <= self.turn_tolerance_rad:
+            self._publish_turn_command(0.0)
+            self.last_turn_command_wz = 0.0
+            self.last_turn_control_monotonic = now
+            if abs(self.latest_odom_angular_z) <= self.stop_angular_speed_rad_s:
+                if self.turn_settle_since <= 0.0:
+                    self.turn_settle_since = now
+                elif now - self.turn_settle_since >= self.turn_settle_time_s:
+                    self._finish_closed_loop_turn(now)
+            else:
+                self.turn_settle_since = 0.0
+            return
+
+        self.turn_settle_since = 0.0
+        desired_wz = max(
+            -self.turn_angular_speed_rad_s,
+            min(self.turn_angular_speed_rad_s, self.turn_kp * error),
+        )
+        if (
+            abs(desired_wz) < self.turn_min_angular_speed_rad_s
+            and self.turn_min_angular_speed_rad_s > 0.0
+        ):
+            desired_wz = math.copysign(
+                self.turn_min_angular_speed_rad_s, error)
+
+        dt = max(0.005, min(0.10, now - self.last_turn_control_monotonic))
+        max_delta = self.turn_max_angular_accel_rad_s2 * dt
+        command_wz = max(
+            self.last_turn_command_wz - max_delta,
+            min(self.last_turn_command_wz + max_delta, desired_wz),
+        )
+        self._publish_turn_command(command_wz)
+        self.last_turn_command_wz = command_wz
+        self.last_turn_control_monotonic = now
+
+        if now - self.last_turn_progress_log >= 0.50:
+            self.last_turn_progress_log = now
+            self.get_logger().info(
+                'VOICE_TURN_PROGRESS current_yaw_deg=%.2f error_deg=%.2f '
+                'command_wz=%.3f measured_wz=%.3f'
+                % (
+                    math.degrees(self.latest_odom_yaw),
+                    math.degrees(error),
+                    command_wz,
+                    self.latest_odom_angular_z,
+                )
+            )
+
+    def _finish_closed_loop_turn(self, now):
+        final_error = self._normalize_angle(
+            self.turn_target_yaw - self.latest_odom_yaw)
+        actual_delta = self._normalize_angle(
+            self.latest_odom_yaw - self.turn_start_yaw)
+        duration_s = now - self.turn_started_monotonic
+        self.get_logger().info(
+            'VOICE_TURN_END result=ok actual_delta_deg=%.2f '
+            'final_error_deg=%.2f duration_s=%.2f'
+            % (
+                math.degrees(actual_delta),
+                math.degrees(final_error),
+                duration_s,
+            )
+        )
+        self._publish_turn_command(0.0)
+        self._reset_turn_tracking()
+        self._begin_visual_acquisition('closed_loop_turn_complete')
+
+    def _abort_turn(self, reason):
+        error_deg = float('nan')
+        if self.turn_target_yaw is not None and self.latest_odom_yaw is not None:
+            error_deg = math.degrees(self._normalize_angle(
+                self.turn_target_yaw - self.latest_odom_yaw))
+        self.get_logger().error(
+            'VOICE_TURN_END result=aborted reason=%s final_error_deg=%.2f'
+            % (reason, error_deg)
+        )
+        self._publish_turn_command(0.0)
+        self._reset_turn_tracking()
+        self._exit_bearing_summon('closed_loop_turn_abort:%s' % reason)
+
+    def _publish_turn_command(self, angular_z):
+        twist = Twist()
+        twist.angular.z = float(angular_z)
+        self.cmd_vel_pub.publish(twist)
+
+    def _reset_turn_tracking(self):
+        self.turn_target_yaw = None
+        self.turn_start_yaw = None
+        self.turn_relative_angle_rad = 0.0
+        self.wait_stop_deadline_monotonic = 0.0
+        self.stop_stable_since = 0.0
+        self.turn_started_monotonic = 0.0
+        self.turn_deadline_monotonic = 0.0
+        self.turn_settle_since = 0.0
+        self.last_turn_control_monotonic = 0.0
+        self.last_turn_command_wz = 0.0
+        self.last_turn_progress_log = 0.0
+
+    @staticmethod
+    def _yaw_from_quaternion(quaternion):
+        return math.atan2(
+            2.0 * (quaternion.w * quaternion.z + quaternion.x * quaternion.y),
+            1.0 - 2.0 * (quaternion.y * quaternion.y + quaternion.z * quaternion.z),
+        )
+
+    @staticmethod
+    def _set_pose_yaw(pose, yaw):
+        pose.orientation.z = math.sin(yaw * 0.5)
+        pose.orientation.w = math.cos(yaw * 0.5)
+
+    def _reset_bearing_tracking(self):
+        self.locked_bearing_odom_yaw = None
+        self.locked_bearing_odom_origin_x = None
+        self.locked_bearing_odom_origin_y = None
+        self.search_targets_odom_yaw = []
+        self.search_target_index = 0
+        self.search_target_yaw = None
+        self.search_deadline_monotonic = 0.0
+        self.search_settle_since = 0.0
+        self.search_last_control_monotonic = 0.0
+        self.search_last_command_wz = 0.0
+        self.search_completion_action = 'path_check'
+        self.visual_search_completion_action = 'path_check'
+        self.candidate_advance_reason = ''
+        self.search_label = 'primary'
+        self.search_active_angular_speed_rad_s = self.search_angular_speed_rad_s
+        self.acquire_deadline_monotonic = 0.0
+        self.visual_mode_ready_deadline = 0.0
+        self.pending_bearing_body = False
+        self.bearing_candidates = []
+        self.bearing_candidate_index = 0
+        self.bearing_on_axis_rejections = []
+        self.bearing_dynamic_lateral_inserted = False
+        self.selected_bearing_candidate = None
+        self.compute_goal_handle = None
+        self.bearing_nav_goal_handle = None
+        self.bearing_nav_sent_monotonic = 0.0
+        self.bearing_nav_cancel_deadline = 0.0
+        self.bearing_nav_cancel_requested = False
+        self.stuck_full_turn_last_yaw = None
+        self.stuck_full_turn_accumulated_rad = 0.0
+        self.stuck_full_turn_speed_rad_s = 0.0
+        self.stuck_full_turn_deadline_monotonic = 0.0
+
+    def _request_motion_gate(self, enabled, reason, next_step=None):
+        """Gate follower actuation while keeping mode=2 vision alive."""
+        if self.motion_gate_inflight:
+            self.get_logger().warn(
+                'Motion gate request already pending; ignore desired=%s reason=%s'
+                % (enabled, reason))
+            return False
+        if not self.motion_gate_client.service_is_ready():
+            self.get_logger().error(
+                'Motion gate service unavailable: %s reason=%s'
+                % (self.motion_gate_service_name, reason))
+            if next_step is not None:
+                self._exit_bearing_summon('motion_gate_unavailable:%s' % reason)
+            return False
+
+        self.motion_gate_desired = bool(enabled)
+        self.motion_gate_next = next_step
+        self.motion_gate_inflight = True
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        future = self.motion_gate_client.call_async(request)
+        session = self.bearing_session
+        future.add_done_callback(
+            lambda completed, expected=bool(enabled), why=str(reason), next_name=next_step,
+            token=session: self._motion_gate_response(
+                completed, expected, why, next_name, token))
+        return True
+
+    def _motion_gate_response(self, future, enabled, reason, next_step, session):
+        self.motion_gate_inflight = False
+        if session != self.bearing_session and next_step is not None:
+            return
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().error('Motion gate call failed reason=%s: %s' % (reason, exc))
+            if next_step is not None:
+                self._exit_bearing_summon('motion_gate_transport:%s' % reason)
+            return
+        if not response.success:
+            self.get_logger().error(
+                'Motion gate rejected desired=%s reason=%s: %s'
+                % (enabled, reason, response.message))
+            if next_step is not None:
+                self._exit_bearing_summon('motion_gate_rejected:%s' % reason)
+            return
+
+        self.get_logger().info(
+            'Motion gate applied enabled=%s reason=%s: %s'
+            % (enabled, reason, response.message))
+        if next_step == 'begin_visual_acquisition':
+            self._enter_visual_acquisition_after_gate()
+        elif next_step == 'handoff_visual_follow':
+            self._enter_visual_follow()
+
+    def _begin_visual_acquisition(self, reason, scan_completion_action='path_check'):
+        """Enable perception after sound turn, with follower actuation paused."""
+        if not self.enable_bearing_nav_fallback:
+            self._set_follow_enabled(True, reason, monitor_completion=True)
+            return
+        if self.locked_bearing_odom_yaw is None:
+            self._exit_bearing_summon('missing_locked_bearing:%s' % reason)
+            return
+        if scan_completion_action not in ('path_check', 'next_candidate'):
+            self._exit_bearing_summon(
+                'invalid_visual_scan_completion:%s' % scan_completion_action)
+            return
+        self._publish_turn_command(0.0)
+        self._reset_follow_observation()
+        self.pending_bearing_body = False
+        self.visual_search_completion_action = scan_completion_action
+        self.state = 'preparing_visual_gate'
+        self._request_motion_gate(False, reason, 'begin_visual_acquisition')
+
+    def _enter_visual_acquisition_after_gate(self):
+        # mode=2 enables the current TensorRT/identity pipeline.  The new
+        # motion gate remains false, so body_nav2_follower cannot submit a
+        # competing NavigateToPose goal during search or bearing navigation.
+        self._set_follow_enabled(True, 'bearing_visual_observe', monitor_completion=False)
+        # Do not start the visual grace timer or physical scan merely because
+        # an asynchronous SetBool call was queued.  During a service restart an
+        # old in-flight request can otherwise leave mode=1 forever.
+        self.state = 'waiting_visual_mode'
+        self.visual_mode_ready_deadline = (
+            time.monotonic() + self.mode_service_call_timeout_s + 0.5)
+        self.get_logger().info(
+            'VOICE_BEARING_VISUAL_WAIT mode=2 timeout_s=%.2f'
+            % (self.mode_service_call_timeout_s + 0.5))
+
+    def _enter_visual_acquisition_after_mode_ready(self):
+        if self.state != 'waiting_visual_mode':
+            return
+        self.state = 'acquiring_visual'
+        self.acquire_deadline_monotonic = time.monotonic() + self.visual_acquire_grace_s
+        self.visual_mode_ready_deadline = 0.0
+        self.get_logger().info(
+            'VOICE_BEARING_VISUAL_READY mode=2 grace_s=%.2f'
+            % self.visual_acquire_grace_s)
+
+    def _handle_visual_acquired(self):
+        if not self.pending_bearing_body:
+            return
+        self._publish_turn_command(0.0)
+        if self.state == 'cancel_bearing_nav_for_yolo_preempt':
+            # The cancellation is already in flight.  A validated body wins
+            # over the RGB-only wait path as soon as Nav2 acknowledges it.
+            self.state = 'cancel_bearing_nav_for_visual'
+            self.get_logger().info(
+                'Validated body preempts pending YOLO-only body wait')
+            return
+        if self.state == 'cancel_bearing_nav_for_stuck_search':
+            # The action is already being cancelled.  A freshly observed
+            # person takes priority over the recovery rotation once Nav2
+            # acknowledges that cancellation.
+            self.state = 'cancel_bearing_nav_for_visual'
+            self.get_logger().info(
+                'Visual target preempts pending stuck-recovery search')
+            return
+        if self.state == 'cancel_bearing_nav_for_next_candidate':
+            # The timed-out goal is already being cancelled.  A fresh body
+            # must always win over moving on to a lower-rank endpoint.
+            self.state = 'cancel_bearing_nav_for_visual'
+            self.get_logger().info(
+                'Visual target preempts pending next-candidate transition')
+            return
+        if self.state in ('sending_bearing_nav', 'bearing_navigating'):
+            self._publish_progress_watchdog_control(False)
+            self._publish_yolo_preempt_control(False)
+            self.state = 'cancel_bearing_nav_for_visual'
+            self.bearing_nav_cancel_deadline = time.monotonic() + self.nav_cancel_timeout_s
+            self.bearing_nav_cancel_requested = True
+            if self.bearing_nav_goal_handle is not None:
+                self.bearing_nav_goal_handle.cancel_goal_async()
+                self.get_logger().info('Cancel bearing navigation for visual handoff')
+            else:
+                self.get_logger().info('Visual body arrived while bearing goal was pending')
+            return
+        if self.state in (
+                'cancel_bearing_nav_for_visual',
+                'cancel_bearing_nav_for_stuck_search',
+                'cancel_bearing_nav_for_next_candidate',
+                'cancel_bearing_nav_for_yolo_preempt'):
+            return
+        # Freeze the local state machine before the asynchronous service call;
+        # otherwise a late ComputePath result could send a bearing goal after a
+        # valid visual target has already been observed.
+        self.state = 'handoff_visual_pending'
+        self._request_motion_gate(True, 'visual_target_acquired', 'handoff_visual_follow')
+
+    def _enter_visual_follow(self):
+        if not self.pending_bearing_body:
+            self._exit_bearing_summon('visual_handoff_without_fresh_body')
+            return
+        self.follow_enabled = True
+        self.follow_monitor_enabled = True
+        self.follow_stable_body_id = None
+        self.follow_stable_since = 0.0
+        self.state = 'following'
+        self.pending_bearing_body = False
+        self._reset_bearing_tracking()
+        self.get_logger().info('VOICE_BEARING_HANDOFF visual follow released')
+
+    def _start_stuck_recovery_search(self, completion_action='exit', advance_reason=''):
+        """Search once after only this bearing-nav goal makes no translation.
+
+        The sign of the lateral odom offset says which side of the frozen
+        acoustic ray the robot reached.  The search sector is the half-plane
+        back towards that ray.  A robot essentially still on the ray instead
+        performs one faster full rotation, because neither perpendicular is
+        preferred in that geometry.
+        """
+        now = time.monotonic()
+        if (
+                self.locked_bearing_odom_yaw is None
+                or not self._odom_is_fresh(now)
+                or self.latest_odom_x is None
+                or self.latest_odom_y is None):
+            self._exit_bearing_summon('stuck_recovery_without_fresh_odom_or_bearing')
+            return
+
+        self._publish_turn_command(0.0)
+        self._reset_follow_observation()
+        self.pending_bearing_body = False
+        if completion_action not in ('exit', 'next_candidate'):
+            self._exit_bearing_summon(
+                'invalid_stuck_recovery_completion:%s' % completion_action)
+            return
+        self.search_completion_action = completion_action
+        self.candidate_advance_reason = str(advance_reason)
+
+        if (
+                self.locked_bearing_odom_origin_x is None
+                or self.locked_bearing_odom_origin_y is None):
+            lateral_m = 0.0
+        else:
+            delta_x = self.latest_odom_x - self.locked_bearing_odom_origin_x
+            delta_y = self.latest_odom_y - self.locked_bearing_odom_origin_y
+            # Positive is left of the directed acoustic ray.
+            lateral_m = (
+                -math.sin(self.locked_bearing_odom_yaw) * delta_x
+                + math.cos(self.locked_bearing_odom_yaw) * delta_y)
+
+        if abs(lateral_m) < self.stuck_search_lateral_epsilon_m:
+            self._start_stuck_recovery_full_turn(now, lateral_m)
+            return
+
+        if lateral_m > 0.0:
+            center_yaw = self._normalize_angle(
+                self.locked_bearing_odom_yaw - math.pi * 0.5)
+            side_label = 'left_of_ray_to_right_normal'
+        else:
+            center_yaw = self._normalize_angle(
+                self.locked_bearing_odom_yaw + math.pi * 0.5)
+            side_label = 'right_of_ray_to_left_normal'
+
+        self.search_targets_odom_yaw = [
+            self._normalize_angle(center_yaw + self.stuck_search_half_span_rad),
+            center_yaw,
+            self._normalize_angle(center_yaw - self.stuck_search_half_span_rad),
+        ]
+        self.search_target_index = 0
+        self.search_deadline_monotonic = now + self.stuck_search_timeout_s
+        self.search_label = 'stuck_recovery_side_sweep'
+        self.search_active_angular_speed_rad_s = self.search_angular_speed_rad_s
+        self.get_logger().warn(
+            'VOICE_BEARING_STUCK_RECOVERY side_sweep lateral_m=%.3f side=%s '
+            'center_yaw_deg=%.2f range=left90_to_right90 speed=%.3f completion=%s'
+            % (
+                lateral_m,
+                side_label,
+                math.degrees(center_yaw),
+                self.search_active_angular_speed_rad_s,
+                self.search_completion_action,
+            ))
+        self._start_next_search_segment()
+
+    def _start_stuck_recovery_full_turn(self, now, lateral_m):
+        self.state = 'stuck_recovery_full_turn'
+        # Either direction is valid for the zero-lateral case.  Keep it fixed
+        # for reproducible logs and use 1.5x the side-sweep speed, bounded by
+        # the pre-existing chassis turn-speed limit.
+        self.stuck_full_turn_direction = 1.0
+        self.stuck_full_turn_last_yaw = self.latest_odom_yaw
+        self.stuck_full_turn_accumulated_rad = 0.0
+        self.stuck_full_turn_speed_rad_s = min(
+            self.turn_angular_speed_rad_s,
+            self.search_angular_speed_rad_s * self.stuck_full_turn_speed_multiplier)
+        self.stuck_full_turn_deadline_monotonic = now + self.stuck_full_turn_timeout_s
+        self.get_logger().warn(
+            'VOICE_BEARING_STUCK_RECOVERY full_turn lateral_m=%.3f epsilon_m=%.3f '
+            'speed=%.3f multiplier=%.2f direction=ccw'
+            % (
+                lateral_m,
+                self.stuck_search_lateral_epsilon_m,
+                self.stuck_full_turn_speed_rad_s,
+                self.stuck_full_turn_speed_multiplier,
+            ))
+
+    def _run_stuck_recovery_full_turn(self, now):
+        if not self._odom_is_fresh(now) or self.stuck_full_turn_last_yaw is None:
+            self._exit_bearing_summon('stuck_recovery_full_turn_odom_stale')
+            return
+        if now >= self.stuck_full_turn_deadline_monotonic:
+            self._exit_bearing_summon('stuck_recovery_full_turn_timeout')
+            return
+
+        yaw_delta = self._normalize_angle(
+            self.latest_odom_yaw - self.stuck_full_turn_last_yaw)
+        self.stuck_full_turn_last_yaw = self.latest_odom_yaw
+        directed_progress = self.stuck_full_turn_direction * yaw_delta
+        if directed_progress > 0.0:
+            self.stuck_full_turn_accumulated_rad += directed_progress
+
+        if self.stuck_full_turn_accumulated_rad >= (2.0 * math.pi - self.turn_tolerance_rad):
+            self._publish_turn_command(0.0)
+            if self.search_completion_action == 'next_candidate':
+                self.get_logger().info(
+                    'VOICE_BEARING_STUCK_RECOVERY full_turn_complete accumulated_deg=%.2f; '
+                    'try next candidate'
+                    % math.degrees(self.stuck_full_turn_accumulated_rad))
+                self._advance_bearing_candidate(
+                    self.candidate_advance_reason or 'stuck_recovery_full_turn_complete')
+            else:
+                self.get_logger().info(
+                    'VOICE_BEARING_STUCK_RECOVERY full_turn_complete accumulated_deg=%.2f; '
+                    'exit summon'
+                    % math.degrees(self.stuck_full_turn_accumulated_rad))
+                self._exit_bearing_summon('stuck_recovery_full_turn_complete')
+            return
+
+        self._publish_turn_command(
+            self.stuck_full_turn_direction * self.stuck_full_turn_speed_rad_s)
+
+    def _start_bearing_search(self):
+        if self.locked_bearing_odom_yaw is None or not self._odom_is_fresh(time.monotonic()):
+            self._exit_bearing_summon('search_without_fresh_locked_bearing_or_odom')
+            return
+        targets = []
+        for _ in range(self.search_sweep_cycles):
+            targets.extend((
+                self._normalize_angle(self.locked_bearing_odom_yaw + self.search_sweep_rad),
+                self._normalize_angle(self.locked_bearing_odom_yaw - self.search_sweep_rad),
+                self.locked_bearing_odom_yaw,
+            ))
+        self.search_targets_odom_yaw = targets
+        self.search_target_index = 0
+        self.search_deadline_monotonic = time.monotonic() + self.search_timeout_s
+        self.search_completion_action = self.visual_search_completion_action
+        self.search_label = (
+            'candidate_visual_search'
+            if self.search_completion_action == 'next_candidate' else 'primary')
+        self.search_active_angular_speed_rad_s = self.search_angular_speed_rad_s
+        self.get_logger().info(
+            'VOICE_BEARING_SCAN start label=%s cycles=%d sweep_deg=%.1f targets=%d completion=%s'
+            % (
+                self.search_label,
+                self.search_sweep_cycles,
+                math.degrees(self.search_sweep_rad),
+                len(targets),
+                self.search_completion_action,
+            ))
+        self._start_next_search_segment()
+
+    def _start_next_search_segment(self):
+        now = time.monotonic()
+        if self.search_target_index >= len(self.search_targets_odom_yaw):
+            if self.search_completion_action == 'path_check':
+                self.get_logger().info(
+                    'VOICE_BEARING_SCAN_COMPLETE; begin fixed-rank Nav2 feasibility checks')
+                self._start_bearing_path_check()
+            elif self.search_completion_action == 'next_candidate':
+                self.get_logger().info(
+                    'VOICE_BEARING_SCAN_COMPLETE; no target at candidate index=%d, '
+                    'try next fixed-rank candidate'
+                    % (self.bearing_candidate_index + 1))
+                self._advance_bearing_candidate(
+                    self.candidate_advance_reason or 'candidate_visual_scan_no_target')
+            else:
+                self.get_logger().info(
+                    'VOICE_BEARING_STUCK_RECOVERY side_sweep_complete; exit summon')
+                self._exit_bearing_summon('stuck_recovery_side_sweep_complete')
+            return
+        if now >= self.search_deadline_monotonic or not self._odom_is_fresh(now):
+            self._exit_bearing_summon('search_timeout_or_stale_odom')
+            return
+        self.search_target_yaw = self.search_targets_odom_yaw[self.search_target_index]
+        self.search_settle_since = 0.0
+        self.search_last_control_monotonic = now
+        self.search_last_command_wz = 0.0
+        self.state = 'searching_bearing'
+        self.get_logger().info(
+            'VOICE_BEARING_SCAN_SEGMENT index=%d/%d target_yaw_deg=%.2f'
+            % (self.search_target_index + 1, len(self.search_targets_odom_yaw),
+               math.degrees(self.search_target_yaw)))
+
+    def _run_bearing_search(self, now):
+        if self.search_target_yaw is None or not self._odom_is_fresh(now):
+            self._exit_bearing_summon('search_target_or_odom_invalid')
+            return
+        if now >= self.search_deadline_monotonic:
+            reason = (
+                'stuck_recovery_side_sweep_timeout'
+                if self.search_completion_action == 'exit' else 'search_timeout')
+            self._exit_bearing_summon(reason)
+            return
+        error = self._normalize_angle(self.search_target_yaw - self.latest_odom_yaw)
+        if abs(error) <= self.turn_tolerance_rad:
+            self._publish_turn_command(0.0)
+            if abs(self.latest_odom_angular_z) <= self.stop_angular_speed_rad_s:
+                if self.search_settle_since <= 0.0:
+                    self.search_settle_since = now
+                elif now - self.search_settle_since >= self.turn_settle_time_s:
+                    self.search_target_index += 1
+                    self._start_next_search_segment()
+            else:
+                self.search_settle_since = 0.0
+            return
+
+        self.search_settle_since = 0.0
+        desired_wz = max(
+            -self.search_active_angular_speed_rad_s,
+            min(self.search_active_angular_speed_rad_s, self.turn_kp * error),
+        )
+        if abs(desired_wz) < self.turn_min_angular_speed_rad_s:
+            desired_wz = math.copysign(self.turn_min_angular_speed_rad_s, error)
+        dt = max(0.005, min(0.10, now - self.search_last_control_monotonic))
+        max_delta = self.turn_max_angular_accel_rad_s2 * dt
+        command_wz = max(
+            self.search_last_command_wz - max_delta,
+            min(self.search_last_command_wz + max_delta, desired_wz),
+        )
+        self._publish_turn_command(command_wz)
+        self.search_last_command_wz = command_wz
+        self.search_last_control_monotonic = now
+
+    def _make_bearing_candidate(
+            self, origin_x, origin_y, bearing_map, base_distance_m,
+            offset_deg, score, dynamic_lateral=False):
+        """Create one endpoint from the frozen single acoustic bearing."""
+        distance_m = base_distance_m * self.bearing_candidate_distance_scale
+        heading = self._normalize_angle(bearing_map + math.radians(offset_deg))
+        center_x = origin_x + distance_m * math.cos(bearing_map)
+        center_y = origin_y + distance_m * math.sin(bearing_map)
+        pose = PoseStamped()
+        pose.header.frame_id = self.map_frame
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = origin_x + distance_m * math.cos(heading)
+        pose.pose.position.y = origin_y + distance_m * math.sin(heading)
+        pose.pose.position.z = 0.0
+        # Preserve the validated V9 construction.  On-axis candidates face the
+        # locked bearing; lateral alternatives face back toward that ray.
+        goal_yaw = bearing_map if abs(offset_deg) < 1.0e-9 else math.atan2(
+            center_y - pose.pose.position.y, center_x - pose.pose.position.x)
+        self._set_pose_yaw(pose.pose, goal_yaw)
+        return {
+            'pose': pose,
+            'base_range_m': base_distance_m,
+            'range_m': distance_m,
+            'offset_deg': offset_deg,
+            'score': score,
+            'bearing_map_rad': bearing_map,
+            'origin_x': origin_x,
+            'origin_y': origin_y,
+            'dynamic_lateral': bool(dynamic_lateral),
+        }
+
+    def _build_bearing_candidates(self):
+        if self.locked_bearing_odom_yaw is None or not self._odom_is_fresh(time.monotonic()):
+            return None
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, Time())
+        except TransformException as error:
+            self.get_logger().error(
+                'No fresh %s->%s transform for bearing navigation: %s'
+                % (self.map_frame, self.base_frame, type(error).__name__))
+            return None
+
+        translation = transform.transform.translation
+        robot_map_yaw = self._yaw_from_quaternion(transform.transform.rotation)
+        bearing_map = self._normalize_angle(
+            robot_map_yaw + self._normalize_angle(
+                self.locked_bearing_odom_yaw - self.latest_odom_yaw))
+        return [
+            self._make_bearing_candidate(
+                translation.x, translation.y, bearing_map,
+                base_distance_m, offset_deg, score)
+            for base_distance_m, offset_deg, score in V9_FIRST_STAGE
+        ]
+
+    def _insert_dynamic_lateral_candidates(self, after_index):
+        """Insert fixed bearing-constrained detours after repeated path rejects."""
+        if (not self.bearing_dynamic_lateral_enabled
+                or self.bearing_dynamic_lateral_inserted
+                or len(self.bearing_on_axis_rejections)
+                < self.bearing_dynamic_lateral_reject_threshold):
+            return
+        anchors = self.bearing_on_axis_rejections[
+            -self.bearing_dynamic_lateral_reject_threshold:]
+        alternatives = []
+        for anchor in anchors:
+            for offset_deg in self.bearing_dynamic_lateral_offsets_deg:
+                alternatives.append(self._make_bearing_candidate(
+                    anchor['origin_x'],
+                    anchor['origin_y'],
+                    anchor['bearing_map_rad'],
+                    anchor['base_range_m'],
+                    offset_deg,
+                    anchor['score'],
+                    dynamic_lateral=True,
+                ))
+        if not alternatives:
+            return
+        self.bearing_candidates[after_index + 1:after_index + 1] = alternatives
+        self.bearing_dynamic_lateral_inserted = True
+        self.get_logger().warn(
+            'VOICE_BEARING_DYNAMIC_LATERAL_INSERT after=%d anchors=%s '
+            'offsets_deg=%s inserted=%d queue_total=%d'
+            % (
+                after_index + 1,
+                ','.join('%.1f' % anchor['range_m'] for anchor in anchors),
+                ','.join('%.1f' % offset for offset in
+                         self.bearing_dynamic_lateral_offsets_deg),
+                len(alternatives),
+                len(self.bearing_candidates),
+            ))
+
+    def _reject_bearing_candidate(self, index, reason):
+        """Audit a binary Nav2 rejection and prepare the next fixed endpoint."""
+        if index < 0 or index >= len(self.bearing_candidates):
+            self._exit_bearing_summon('candidate_rejection_index_invalid:%s' % reason)
+            return
+        candidate = self.bearing_candidates[index]
+        self.get_logger().warn(
+            'VOICE_BEARING_CANDIDATE_REJECTED index=%d/%d x=%.3f y=%.3f '
+            'range=%.1f offset=%.1f dynamic_lateral=%s reason=%s'
+            % (
+                index + 1,
+                len(self.bearing_candidates),
+                candidate['pose'].pose.position.x,
+                candidate['pose'].pose.position.y,
+                candidate['range_m'],
+                candidate['offset_deg'],
+                candidate.get('dynamic_lateral', False),
+                reason,
+            ))
+        if abs(candidate['offset_deg']) < 1.0e-9:
+            self.bearing_on_axis_rejections.append(candidate)
+            self._insert_dynamic_lateral_candidates(index)
+        self.bearing_candidate_index = index + 1
+        self._check_next_bearing_candidate()
+
+    def _start_bearing_path_check(self):
+        self._publish_turn_command(0.0)
+        candidates = self._build_bearing_candidates()
+        if not candidates:
+            self._exit_bearing_summon('bearing_map_tf_unavailable')
+            return
+        if not self.compute_path_client.server_is_ready():
+            self.get_logger().error(
+                'ComputePathToPose action unavailable: %s' % self.compute_path_action_name)
+            self._exit_bearing_summon('compute_path_unavailable')
+            return
+        self.bearing_candidates = candidates
+        self.bearing_candidate_index = 0
+        self.candidate_advance_reason = ''
+        self.get_logger().info(
+            'VOICE_BEARING_CANDIDATE_SCALE scale=%.3f candidates=%d'
+            % (self.bearing_candidate_distance_scale, len(candidates)))
+        self.state = 'checking_bearing_path'
+        self._check_next_bearing_candidate()
+
+    def _check_next_bearing_candidate(self):
+        if self.state != 'checking_bearing_path':
+            return
+        if self.bearing_candidate_index >= len(self.bearing_candidates):
+            self._exit_bearing_summon('no_nav2_reachable_bearing_candidate')
+            return
+        candidate = self.bearing_candidates[self.bearing_candidate_index]
+        candidate['pose'].header.stamp = self.get_clock().now().to_msg()
+        goal = ComputePathToPose.Goal()
+        goal.goal = candidate['pose']
+        goal.use_start = False
+        goal.planner_id = ''
+        session = self.bearing_session
+        index = self.bearing_candidate_index
+        future = self.compute_path_client.send_goal_async(goal)
+        future.add_done_callback(
+            lambda completed, token=session, candidate_index=index:
+            self._compute_path_goal_response(completed, token, candidate_index))
+        self.get_logger().info(
+            'VOICE_BEARING_FEASIBILITY index=%d/%d range=%.1f offset=%.1f score=%.6f'
+            % (index + 1, len(self.bearing_candidates), candidate['range_m'],
+               candidate['offset_deg'], candidate['score']))
+
+    def _compute_path_goal_response(self, future, session, index):
+        if session != self.bearing_session or self.state != 'checking_bearing_path':
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().warn('ComputePath request failed: %s' % exc)
+            self._reject_bearing_candidate(
+                index, 'compute_path_goal_exception:%s' % type(exc).__name__)
+            return
+        if not goal_handle.accepted:
+            self.get_logger().warn('ComputePath rejected candidate index=%d' % (index + 1))
+            self._reject_bearing_candidate(index, 'compute_path_goal_rejected')
+            return
+        self.compute_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda completed, token=session, candidate_index=index:
+            self._compute_path_result(completed, token, candidate_index))
+
+    def _compute_path_result(self, future, session, index):
+        if session != self.bearing_session or self.state != 'checking_bearing_path':
+            return
+        self.compute_goal_handle = None
+        try:
+            wrapped = future.result()
+            path_ok = (
+                wrapped.status == GoalStatus.STATUS_SUCCEEDED
+                and wrapped.result is not None
+                and len(wrapped.result.path.poses) > 0)
+            failure_reason = 'compute_path_status:%s' % wrapped.status
+        except Exception as exc:
+            self.get_logger().warn('ComputePath result failed: %s' % exc)
+            path_ok = False
+            failure_reason = 'compute_path_result_exception:%s' % type(exc).__name__
+        if not path_ok:
+            self._reject_bearing_candidate(index, failure_reason)
+            return
+        # A reachability success breaks the consecutive on-axis rejection run.
+        self.bearing_on_axis_rejections = []
+        self.selected_bearing_candidate = self.bearing_candidates[index]
+        self._send_bearing_navigation(session)
+
+    def _advance_bearing_candidate(self, reason):
+        """Keep the one frozen bearing-derived queue and try its next rank."""
+        if not self.bearing_candidates:
+            self._exit_bearing_summon('candidate_advance_without_queue:%s' % reason)
+            return
+        previous_index = self.bearing_candidate_index
+        next_index = previous_index + 1
+        self._publish_turn_command(0.0)
+        self._publish_progress_watchdog_control(False)
+        self._publish_yolo_preempt_control(False)
+        self.pending_bearing_body = False
+        self._reset_follow_observation()
+        self.selected_bearing_candidate = None
+        self.compute_goal_handle = None
+        self.bearing_nav_cancel_requested = False
+        self.bearing_nav_cancel_deadline = 0.0
+        self.bearing_candidate_index = next_index
+        if next_index >= len(self.bearing_candidates):
+            self.get_logger().warn(
+                'VOICE_BEARING_CANDIDATE_EXHAUSTED attempted=%d/%d reason=%s'
+                % (previous_index + 1, len(self.bearing_candidates), reason))
+            self._exit_bearing_summon('bearing_candidate_queue_exhausted:%s' % reason)
+            return
+        self.state = 'checking_bearing_path'
+        self.get_logger().info(
+            'VOICE_BEARING_CANDIDATE_ADVANCE from=%d/%d to=%d/%d reason=%s'
+            % (
+                previous_index + 1,
+                len(self.bearing_candidates),
+                next_index + 1,
+                len(self.bearing_candidates),
+                reason,
+            ))
+        self._check_next_bearing_candidate()
+
+    def _cancel_bearing_nav_for_next_candidate(self, reason):
+        """Cancel only the current Nav2 goal before advancing the queue."""
+        if self.state != 'bearing_navigating':
+            return
+        self._publish_progress_watchdog_control(False)
+        self._publish_yolo_preempt_control(False)
+        self._publish_turn_command(0.0)
+        self._request_motion_gate(False, 'bearing_nav_next_candidate')
+        self.pending_bearing_body = False
+        self._reset_follow_observation()
+        self.candidate_advance_reason = str(reason)
+        self.state = 'cancel_bearing_nav_for_next_candidate'
+        self.bearing_nav_cancel_deadline = time.monotonic() + self.nav_cancel_timeout_s
+        self.bearing_nav_cancel_requested = True
+        if self.bearing_nav_goal_handle is not None:
+            self.bearing_nav_goal_handle.cancel_goal_async()
+            self.get_logger().warn(
+                'VOICE_BEARING_CANDIDATE_CANCEL current=%d/%d reason=%s'
+                % (
+                    self.bearing_candidate_index + 1,
+                    len(self.bearing_candidates),
+                    reason,
+                ))
+            return
+        self.get_logger().warn(
+            'Bearing Nav2 handle missing while advancing candidate queue; advance directly')
+        self._advance_bearing_candidate(reason)
+
+    def _send_bearing_navigation(self, session):
+        if session != self.bearing_session or self.selected_bearing_candidate is None:
+            return
+        if not self.navigate_client.server_is_ready():
+            self._exit_bearing_summon('navigate_to_pose_unavailable')
+            return
+        candidate = self.selected_bearing_candidate
+        candidate['pose'].header.stamp = self.get_clock().now().to_msg()
+        goal = NavigateToPose.Goal()
+        goal.pose = candidate['pose']
+        goal.behavior_tree = ''
+        self.state = 'sending_bearing_nav'
+        future = self.navigate_client.send_goal_async(goal)
+        future.add_done_callback(
+            lambda completed, token=session: self._bearing_nav_goal_response(completed, token))
+        self.get_logger().info(
+            'VOICE_BEARING_NAV_SEND index=%d/%d x=%.3f y=%.3f range=%.1f offset=%.1f score=%.6f'
+            % (self.bearing_candidate_index + 1, len(self.bearing_candidates),
+               candidate['pose'].pose.position.x, candidate['pose'].pose.position.y,
+               candidate['range_m'], candidate['offset_deg'], candidate['score']))
+
+    def _bearing_nav_goal_response(self, future, session):
+        if session != self.bearing_session:
+            try:
+                late_handle = future.result()
+                if late_handle and late_handle.accepted:
+                    late_handle.cancel_goal_async()
+            except Exception:
+                pass
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error('NavigateToPose request failed: %s' % exc)
+            if self.state == 'sending_bearing_nav':
+                self._advance_bearing_candidate('bearing_nav_send_failed')
+            else:
+                self._exit_bearing_summon('bearing_nav_send_failed')
+            return
+        if not goal_handle.accepted:
+            if self.state == 'cancel_bearing_nav_for_stuck_search':
+                self._start_stuck_recovery_search(
+                    completion_action='next_candidate',
+                    advance_reason='progress_stalled',
+                )
+            elif self.state == 'cancel_bearing_nav_for_next_candidate':
+                self._advance_bearing_candidate(self.candidate_advance_reason)
+            elif self.state == 'cancel_bearing_nav_for_yolo_preempt':
+                self._begin_yolo_preempt_body_wait()
+            elif self.state == 'cancel_bearing_nav_for_visual' or self.pending_bearing_body:
+                self._request_motion_gate(
+                    True, 'visual_after_bearing_nav_rejected', 'handoff_visual_follow')
+            else:
+                self.get_logger().warn('NavigateToPose rejected selected bearing candidate')
+                self._advance_bearing_candidate('bearing_nav_rejected')
+            return
+        self.bearing_nav_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda completed, token=session: self._bearing_nav_result(completed, token))
+        if self.state in (
+                'cancel_bearing_nav_for_visual',
+                'cancel_bearing_nav_for_stuck_search',
+                'cancel_bearing_nav_for_next_candidate',
+                'cancel_bearing_nav_for_yolo_preempt'):
+            goal_handle.cancel_goal_async()
+            return
+        self.state = 'bearing_navigating'
+        self.bearing_nav_sent_monotonic = time.monotonic()
+        self.candidate_advance_reason = ''
+        self.get_logger().info('VOICE_BEARING_NAV_ACCEPTED')
+        self._publish_progress_watchdog_control(True)
+        self._publish_yolo_preempt_control(True)
+
+    def _bearing_nav_result(self, future, session):
+        if session != self.bearing_session:
+            return
+        self.bearing_nav_goal_handle = None
+        try:
+            wrapped = future.result()
+            status = wrapped.status
+        except Exception as exc:
+            self.get_logger().error('NavigateToPose result failed: %s' % exc)
+            if self.state == 'bearing_navigating':
+                self._advance_bearing_candidate('bearing_nav_result_failed')
+            else:
+                self._exit_bearing_summon('bearing_nav_result_failed')
+            return
+        if self.state == 'cancel_bearing_nav_for_visual':
+            self._request_motion_gate(True, 'visual_cancelled_bearing_nav', 'handoff_visual_follow')
+            return
+        if self.state == 'cancel_bearing_nav_for_stuck_search':
+            self._start_stuck_recovery_search(
+                completion_action='next_candidate',
+                advance_reason='progress_stalled',
+            )
+            return
+        if self.state == 'cancel_bearing_nav_for_next_candidate':
+            self._advance_bearing_candidate(self.candidate_advance_reason)
+            return
+        if self.state == 'cancel_bearing_nav_for_yolo_preempt':
+            self._begin_yolo_preempt_body_wait()
+            return
+        if self.state != 'bearing_navigating':
+            return
+        self._publish_progress_watchdog_control(False)
+        self._publish_yolo_preempt_control(False)
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info(
+                'VOICE_BEARING_NAV_RESULT succeeded index=%d/%d; begin candidate visual scan'
+                % (self.bearing_candidate_index + 1, len(self.bearing_candidates)))
+            self._begin_visual_acquisition(
+                'bearing_nav_arrived', scan_completion_action='next_candidate')
+            return
+        self.get_logger().warn('VOICE_BEARING_NAV_RESULT non_success status=%s' % status)
+        self._advance_bearing_candidate('bearing_nav_non_success:%s' % status)
+
+    def _exit_bearing_summon(self, reason):
+        """Stop only this summon flow; do not alter Nav2 or other controllers."""
+        self._publish_turn_command(0.0)
+        self._publish_progress_watchdog_control(False)
+        self._publish_yolo_preempt_control(False)
+        if self.compute_goal_handle is not None:
+            self.compute_goal_handle.cancel_goal_async()
+        if self.bearing_nav_goal_handle is not None:
+            self.bearing_nav_goal_handle.cancel_goal_async()
+        self.bearing_session += 1
+        self._reset_bearing_tracking()
+        self._set_follow_enabled(False, reason, monitor_completion=False)
+        self.get_logger().info('VOICE_BEARING_EXIT reason=%s' % reason)
+
+    def _timer_callback(self):
+        self._try_send_mode_request()
+        if self.mapping_motion_blocked:
+            return
+        now = time.monotonic()
+        if self.state == 'waiting_stop':
+            self._wait_for_stop(now)
+            return
+
+        if self.state == 'turning':
+            self._run_closed_loop_turn(now)
+            return
+
+        if self.state == 'waiting_visual_mode':
+            if now >= self.visual_mode_ready_deadline:
+                self._exit_bearing_summon('visual_mode_enable_timeout')
+            return
+
+        if self.state == 'acquiring_visual':
+            if now >= self.acquire_deadline_monotonic:
+                self._start_bearing_search()
+            return
+
+        if self.state == 'searching_bearing':
+            self._run_bearing_search(now)
+            return
+
+        if self.state == 'stuck_recovery_full_turn':
+            self._run_stuck_recovery_full_turn(now)
+            return
+
+        if self.state == 'waiting_yolo_preempt_body':
+            if now >= self.yolo_preempt_body_deadline_monotonic:
+                self.get_logger().info(
+                    'VOICE_BEARING_YOLO_PREEMPT_WAIT timeout; begin recovery search '
+                    'before the next candidate')
+                self._start_stuck_recovery_search(
+                    completion_action='next_candidate',
+                    advance_reason='yolo_preempt_without_valid_body',
+                )
+            return
+
+        if self.state == 'bearing_navigating':
+            if now - self.bearing_nav_sent_monotonic >= self.nav_timeout_s:
+                self._cancel_bearing_nav_for_next_candidate('bearing_nav_timeout')
+            return
+
+        if self.state in (
+                'cancel_bearing_nav_for_visual',
+                'cancel_bearing_nav_for_stuck_search',
+                'cancel_bearing_nav_for_next_candidate',
+                'cancel_bearing_nav_for_yolo_preempt'):
+            if now >= self.bearing_nav_cancel_deadline:
+                # Never release visual actuation until the bearing action has
+                # acknowledged cancellation; a timeout is a safe summon exit.
+                reason = (
+                    'bearing_nav_stuck_cancel_timeout'
+                    if self.state == 'cancel_bearing_nav_for_stuck_search'
+                    else (
+                        'bearing_nav_next_candidate_cancel_timeout'
+                        if self.state == 'cancel_bearing_nav_for_next_candidate'
+                        else (
+                            'bearing_nav_yolo_preempt_cancel_timeout'
+                            if self.state == 'cancel_bearing_nav_for_yolo_preempt'
+                            else 'bearing_nav_cancel_timeout')))
+                self._exit_bearing_summon(reason)
+            return
+
+        if self.state == 'following' and self.follow_monitor_enabled:
+            self._check_follow_complete(now)
+            return
+
+    def _check_follow_complete(self, now):
+        if (
+            self.latest_body_id is None
+            or self.latest_body_distance_m is None
+            or self.latest_body_monotonic is None
+        ):
+            self.follow_stable_body_id = None
+            self.follow_stable_since = 0.0
+            return
+
+        if now - self.latest_body_monotonic > self.body_fresh_timeout_s:
+            self.follow_stable_body_id = None
+            self.follow_stable_since = 0.0
+            return
+
+        error_m = abs(self.latest_body_distance_m - self.follow_distance_m)
+        if error_m <= self.follow_complete_tolerance_m:
+            if (
+                self.follow_stable_body_id != self.latest_body_id
+                or self.follow_stable_since <= 0.0
+            ):
+                self.follow_stable_body_id = self.latest_body_id
+                self.follow_stable_since = now
+                return
+            stable_s = now - self.follow_stable_since
+            if stable_s >= self.follow_complete_stable_s:
+                self.get_logger().info(
+                    'Summon follow complete: body_id=%d distance=%.2fm target=%.2fm stable=%.2fs'
+                    % (
+                        self.latest_body_id,
+                        self.latest_body_distance_m,
+                        self.follow_distance_m,
+                        stable_s,
+                    )
+                )
+                self._set_follow_enabled(False, 'summon_follow_complete', monitor_completion=False)
+            return
+
+        self.follow_stable_body_id = None
+        self.follow_stable_since = 0.0
+
+    def _set_follow_enabled(self, enabled, reason, monitor_completion=False):
+        self.follow_enabled = bool(enabled)
+        self.follow_monitor_enabled = bool(enabled and monitor_completion)
+        self._reset_follow_observation()
+
+        if enabled:
+            self.state = 'following' if monitor_completion else 'idle'
+            self._publish_stop_cmd()
+            self._request_follow_service(True, reason)
+            self.get_logger().info(
+                'Body follow enable requested: %s monitor=%s' % (reason, monitor_completion))
+            return
+
+        self.state = 'idle'
+        self._reset_turn_tracking()
+        self._publish_stop_cmd()
+        self._request_follow_service(False, reason)
+        self.get_logger().info('Body follow disable requested: %s' % reason)
+
+    def _request_follow_service(self, enabled, reason):
+        self.desired_follow_enabled = bool(enabled)
+        self.desired_follow_reason = str(reason)
+        self._try_send_mode_request()
+
+    def _try_send_mode_request(self):
+        now = time.monotonic()
+        if self.mode_request_inflight and now >= self.mode_request_deadline:
+            # A service restart can leave a future unresolved forever.  Expire
+            # it by sequence number; any late callback is ignored below.
+            self.get_logger().error(
+                'Body follow mode request timed out; retry desired=%s reason=%s'
+                % (self.desired_follow_enabled, self.desired_follow_reason))
+            self.mode_request_inflight = False
+            self.mode_request_deadline = 0.0
+            self.mode_request_sequence += 1
+
+        if self.desired_follow_enabled is None or self.mode_request_inflight:
+            return
+
+        if now - self.last_mode_request_at < self.mode_service_retry_s:
+            return
+        self.last_mode_request_at = now
+
+        if not self.mode_service_client.service_is_ready():
+            if now - self.last_mode_service_warning_at >= 5.0:
+                self.last_mode_service_warning_at = now
+                self.get_logger().error(
+                    'Body follow mode service unavailable: %s; will retry desired=%s reason=%s'
+                    % (
+                        self.mode_service_name,
+                        self.desired_follow_enabled,
+                        self.desired_follow_reason,
+                    )
+                )
+            return
+
+        request = SetBool.Request()
+        request.data = self.desired_follow_enabled
+        requested_enabled = self.desired_follow_enabled
+        requested_reason = self.desired_follow_reason
+        self.mode_request_inflight = True
+        self.mode_request_sequence += 1
+        request_sequence = self.mode_request_sequence
+        self.mode_request_deadline = now + self.mode_service_call_timeout_s
+        future = self.mode_service_client.call_async(request)
+        future.add_done_callback(
+            lambda completed, enabled=requested_enabled, reason=requested_reason,
+            sequence=request_sequence:
+            self._mode_service_response(completed, enabled, reason, sequence))
+
+    def _mode_service_response(
+            self, future, requested_enabled, requested_reason, request_sequence):
+        if request_sequence != self.mode_request_sequence:
+            self.get_logger().warn(
+                'Ignore late body follow mode response sequence=%d current=%d'
+                % (request_sequence, self.mode_request_sequence))
+            return
+        self.mode_request_inflight = False
+        self.mode_request_deadline = 0.0
+        try:
+            response = future.result()
+        except Exception as exc:  # Service transport failure: retry through timer.
+            self.get_logger().error(
+                'Body follow mode service call failed desired=%s reason=%s: %s'
+                % (requested_enabled, requested_reason, exc))
+            return
+
+        if not response.success:
+            self.get_logger().error(
+                'Body follow mode service rejected desired=%s reason=%s: %s'
+                % (requested_enabled, requested_reason, response.message))
+            return
+
+        self.get_logger().info(
+            'Body follow mode service applied enabled=%s reason=%s: %s'
+            % (requested_enabled, requested_reason, response.message))
+        if self.desired_follow_enabled == requested_enabled:
+            # This is the newest desired state, so a single acknowledged
+            # service call is enough.  Keep retrying only on failure or when
+            # another request replaced it while the call was in flight.
+            self.desired_follow_enabled = None
+            self.desired_follow_reason = ''
+            if (
+                    requested_enabled
+                    and requested_reason == 'bearing_visual_observe'
+                    and self.state == 'waiting_visual_mode'):
+                self._enter_visual_acquisition_after_mode_ready()
+            return
+        # A newer request arrived while this one was in flight.
+        self._try_send_mode_request()
+
+    def _publish_stop_cmd(self):
+        self.cmd_vel_pub.publish(Twist())
+
+    def _publish_feedback(self, audio_file):
+        if not audio_file:
+            return
+
+        now = time.monotonic()
+        last = self.last_feedback_at.get(audio_file, 0.0)
+        if now - last < self.feedback_cooldown_s:
+            self.get_logger().info('Ignore repeated feedback audio: %s' % audio_file)
+            return
+
+        self.last_feedback_at[audio_file] = now
+        msg = String()
+        msg.data = audio_file
+        self.feedback_pub.publish(msg)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = VoiceSummonCoordinator()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if rclpy.ok():
+            node._publish_stop_cmd()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

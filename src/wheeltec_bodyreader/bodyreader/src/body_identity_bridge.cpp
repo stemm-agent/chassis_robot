@@ -28,7 +28,7 @@ constexpr double kHeightRatioScale = 2.5;
 constexpr double kTrackingBboxMarginRatio = 0.08;
 constexpr double kAstraNoBodyGraceS = 3.0;
 constexpr double kAstraRestartCooldownS = 8.0;
-constexpr int kAstraMaxRestartsPerFollowSession = 2;
+constexpr int kAstraMaxRestartsPerFollowSession = 5;
 }
 
 class BodyIdentityBridge : public rclcpp::Node
@@ -61,8 +61,12 @@ public:
     appearance_accept_score_ = declare_parameter<double>("appearance_accept_score", 1.35);
     bound_appearance_accept_score_ =
       declare_parameter<double>("bound_appearance_accept_score", 1.15);
+    identity_validation_grace_s_ =
+      std::max(0.0, declare_parameter<double>("identity_validation_grace_s", 0.5));
     reacquire_candidate_margin_ =
       declare_parameter<double>("reacquire_candidate_margin", 0.18);
+    max_rebind_position_jump_m_ =
+      declare_parameter<double>("max_rebind_position_jump_m", 2.0);
     reacquire_confirm_frames_ = static_cast<int>(
       declare_parameter<int>("reacquire_confirm_frames", 4));
     reacquire_confirm_frames_ = std::max(1, reacquire_confirm_frames_);
@@ -75,6 +79,9 @@ public:
     bodylist_sub_ = create_subscription<bodyreader_msg::msg::Bodylist>(
       bodylist_topic_, 5,
       std::bind(&BodyIdentityBridge::bodylist_callback, this, std::placeholders::_1));
+    raw_body_count_sub_ = create_subscription<std_msgs::msg::Int8>(
+      "/body_main/raw_body_count", rclcpp::QoS(1).best_effort(),
+      std::bind(&BodyIdentityBridge::raw_body_count_callback, this, std::placeholders::_1));
     bodyposture_sub_ = create_subscription<bodyreader_msg::msg::Bodyposture>(
       bodyposture_topic_, 5,
       std::bind(&BodyIdentityBridge::bodyposture_callback, this, std::placeholders::_1));
@@ -102,6 +109,8 @@ public:
     last_features_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_recovery_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_lock_command_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    last_validated_body_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    last_raw_body_count_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     yolo_without_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_astra_restart_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
 
@@ -123,6 +132,8 @@ private:
     double angle{0.0};
     double depth_m{0.0};
     bool valid_depth{false};
+    double center_x{0.0};
+    double center_z{0.0};
     double image_center_x{0.0};
     double image_center_y{0.0};
     bool valid_image_center{false};
@@ -300,6 +311,12 @@ private:
     return diff;
   }
 
+  void raw_body_count_callback(const std_msgs::msg::Int8::SharedPtr msg)
+  {
+    raw_body_count_ = static_cast<int>(msg->data);
+    last_raw_body_count_time_ = now();
+  }
+
   void bodylist_callback(const bodyreader_msg::msg::Bodylist::SharedPtr msg)
   {
     const int count = std::max(0, static_cast<int>(msg->count));
@@ -317,6 +334,8 @@ private:
       candidate.angle = std::atan2(
         static_cast<double>(body.centerofmass.x),
         static_cast<double>(body.centerofmass.z));
+      candidate.center_x = static_cast<double>(body.centerofmass.x) * 0.001;
+      candidate.center_z = static_cast<double>(body.centerofmass.z) * 0.001;
       double min_x = std::numeric_limits<double>::infinity();
       double min_y = std::numeric_limits<double>::infinity();
       double max_x = -std::numeric_limits<double>::infinity();
@@ -357,6 +376,25 @@ private:
       yolo_validated =
         match.valid && match.score <= match_accept_score_ && is_bound_yolo_track(match.yolo) &&
         tracking_appearance_matches(match.yolo);
+    }
+
+    if (yolo_validated) {
+      last_validated_body_time_ = t;
+    } else {
+      const bool same_locked_body =
+        has_identity_ && msg->lock_status == 2 && msg->bodyid == target_body_id_ &&
+        msg->centerofmass_z > 100.0f;
+      const bool within_validation_grace =
+        last_validated_body_time_.nanoseconds() != 0 &&
+        (t - last_validated_body_time_).seconds() <= identity_validation_grace_s_;
+      if (same_locked_body && within_validation_grace) {
+        yolo_validated = true;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Identity validation grace active for body=%d (age=%.3fs limit=%.3fs)",
+          msg->bodyid, (t - last_validated_body_time_).seconds(),
+          identity_validation_grace_s_);
+      }
     }
 
     auto validated = *msg;
@@ -417,6 +455,13 @@ private:
   bool yolo_recent(const rclcpp::Time & t) const
   {
     return !yolo_targets_.empty() && (t - last_features_time_).seconds() <= yolo_max_age_s_;
+  }
+
+  bool raw_body_empty_recent(const rclcpp::Time & t) const
+  {
+    return raw_body_count_ == 0 &&
+           last_raw_body_count_time_.nanoseconds() != 0 &&
+           (t - last_raw_body_count_time_).seconds() <= body_max_age_s_;
   }
 
   double yolo_angle(const YoloTarget & target) const
@@ -593,6 +638,21 @@ private:
     if (!has_signature_) {
       return choice;
     }
+
+    // When the original locked track is still present, keep it authoritative.
+    // Duplicate detections of the same person must not make the identity ambiguous,
+    // and the bound-track threshold should remain consistent during body-ID rebinding.
+    for (const auto & target : yolo_targets_) {
+      if (!is_bound_yolo_track(target)) {
+        continue;
+      }
+      choice.best_score = appearance_score(target);
+      if (choice.best_score <= bound_appearance_accept_score_) {
+        choice.target = &target;
+      }
+      return choice;
+    }
+
     for (const auto & target : yolo_targets_) {
       const double score = appearance_score(target);
       if (score < choice.best_score) {
@@ -689,12 +749,33 @@ private:
       return false;
     }
 
+    if (has_last_locked_position_) {
+      const double dx = match.body.center_x - last_locked_body_x_;
+      const double dz = match.body.center_z - last_locked_body_z_;
+      const double jump_dist = std::sqrt(dx * dx + dz * dz);
+      if (jump_dist > max_rebind_position_jump_m_) {
+        RCLCPP_WARN(
+          get_logger(),
+          "identity_rebind_position_jump_rejected: old_track=%d new_track=%d body=%d "
+          "jump=%.2f m (max %.2f m) last_locked=(%.2f, %.2f) candidate=(%.2f, %.2f)",
+          locked_identity_track_id_, match.yolo.track_id, match.body.id,
+          jump_dist, max_rebind_position_jump_m_,
+          last_locked_body_x_, last_locked_body_z_,
+          match.body.center_x, match.body.center_z);
+        reset_rebind_confirmation();
+        return false;
+      }
+    }
+
     RCLCPP_INFO(
       get_logger(),
       "identity_rebind_confirmed: old_track=%d new_track=%d body=%d frames=%d",
       locked_identity_track_id_, match.yolo.track_id, match.body.id, pending_confirm_count_);
     target_body_id_ = match.body.id;
     bind_yolo_track(match.yolo.track_id);
+    last_locked_body_x_ = match.body.center_x;
+    last_locked_body_z_ = match.body.center_z;
+    has_last_locked_position_ = true;
     reset_rebind_confirmation();
     return true;
   }
@@ -788,11 +869,17 @@ private:
     pending_track_id_ = -1;
     pending_body_id_ = 0;
     pending_confirm_count_ = 0;
+    last_locked_body_x_ = 0.0;
+    last_locked_body_z_ = 0.0;
+    has_last_locked_position_ = false;
     start_time_ = now();
     last_bodylist_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_features_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_recovery_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_lock_command_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    last_validated_body_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    raw_body_count_ = -1;
+    last_raw_body_count_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     yolo_without_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     last_astra_restart_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     astra_restart_count_ = 0;
@@ -819,7 +906,7 @@ private:
       return;
     }
 
-    if (body_recent(t) || !yolo_recent(t)) {
+    if (!yolo_recent(t) || !raw_body_empty_recent(t)) {
       yolo_without_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       return;
     }
@@ -852,7 +939,7 @@ private:
     yolo_without_body_since_ = t;
     RCLCPP_WARN(
       get_logger(),
-      "Astra watchdog requested body stream restart: YOLO person present, no valid body "
+      "Astra watchdog requested body stream restart: YOLO person present, raw Astra body list empty "
       "for %.1f s (attempt %d/%d)",
       kAstraNoBodyGraceS, astra_restart_count_, kAstraMaxRestartsPerFollowSession);
   }
@@ -941,7 +1028,7 @@ private:
 
     const Match match = match_yolo_to_body(*choice.target);
     if (match.valid && match.score <= reacquire_accept_score_ &&
-        appearance_matches(match.yolo)) {
+        tracking_appearance_matches(match.yolo)) {
       if (confirm_rebind(match)) {
         publish_recovery_id(target_body_id_, "identity_reacquired");
       }
@@ -971,6 +1058,11 @@ private:
           is_bound_yolo_track(match.yolo) &&
           tracking_appearance_matches(match.yolo)) {
         reset_rebind_confirmation();
+        if (current_target->valid_depth) {
+          last_locked_body_x_ = current_target->center_x;
+          last_locked_body_z_ = current_target->center_z;
+          has_last_locked_position_ = true;
+        }
         if (current_lock_status_ != 2 || current_body_id_ != target_body_id_) {
           publish_recovery_id(target_body_id_, "identity_restore_body_lock");
         }
@@ -1024,6 +1116,7 @@ private:
   double reacquire_accept_score_{1.65};
   double appearance_accept_score_{1.35};
   double bound_appearance_accept_score_{1.15};
+  double identity_validation_grace_s_{0.5};
   double reacquire_candidate_margin_{0.18};
   bool require_yolo_for_initial_lock_{true};
   int initial_confirm_frames_{4};
@@ -1039,6 +1132,7 @@ private:
   bool locked_yolo_visible_{false};
   int current_mode_{-1};
   int target_body_id_{0};
+  int raw_body_count_{-1};
   int current_body_id_{0};
   int current_lock_status_{0};
   int locked_track_id_{-1};
@@ -1050,16 +1144,23 @@ private:
   int pending_confirm_count_{0};
   size_t feature_generation_{0};
   size_t pending_feature_generation_{0};
+  double last_locked_body_x_{0.0};
+  double last_locked_body_z_{0.0};
+  bool has_last_locked_position_{false};
+  double max_rebind_position_jump_m_{2.0};
 
   rclcpp::Time start_time_;
   rclcpp::Time last_bodylist_time_;
   rclcpp::Time last_features_time_;
   rclcpp::Time last_recovery_time_;
   rclcpp::Time last_lock_command_time_;
+  rclcpp::Time last_validated_body_time_;
+  rclcpp::Time last_raw_body_count_time_;
   rclcpp::Time yolo_without_body_since_;
   rclcpp::Time last_astra_restart_time_;
 
   rclcpp::Subscription<bodyreader_msg::msg::Bodylist>::SharedPtr bodylist_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr raw_body_count_sub_;
   rclcpp::Subscription<bodyreader_msg::msg::Bodyposture>::SharedPtr bodyposture_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr features_sub_;
   rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr mode_sub_;
