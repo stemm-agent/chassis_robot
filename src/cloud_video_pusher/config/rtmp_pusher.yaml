@@ -13,8 +13,8 @@ rtmp_image_pusher:
     upload_interval_ms: 15000
     width: 640
     height: 480
-    fps: 15.0
-    bitrate: 800k
+    fps: 8.0
+    bitrate: 400k
     gop: 30
     ffmpeg_path: ffmpeg
     auto_start: true

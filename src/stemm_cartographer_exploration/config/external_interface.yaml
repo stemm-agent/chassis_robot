@@ -6,6 +6,7 @@ services:
   start_mapping: /stemm_cartographer/start_mapping
   save_map: /stemm_cartographer/save_map
   stop_navigation: /stemm_cartographer/stop_navigation
+  cancel_mapping: /stemm_cartographer/cancel_mapping
   set_mapping_done: /stemm_cartographer/set_mapping_done
   save_state: /stemm_cartographer/save_state
 mqtt:

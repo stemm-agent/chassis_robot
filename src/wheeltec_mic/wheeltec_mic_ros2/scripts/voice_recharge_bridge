@@ -1,15 +1,135 @@
 #!/usr/bin/env python3
+import json
 import os
 import signal
 import shutil
+import stat
 import subprocess
 import time
 from datetime import datetime
 
 import rclpy
+from nav2_msgs.srv import ManageLifecycleNodes
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float32, String, UInt8
 from std_srvs.srv import SetBool, Trigger
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - production target is Linux
+    fcntl = None
+
+
+NAVIGATION_LAUNCH_LOCK_PATH = '/tmp/wheeltec_nav2_launch.lock'
+DEFAULT_NAVIGATION_START_TIMEOUT_SEC = 120.0
+
+
+def navigation_start_timeout_reached(elapsed_sec, timeout_sec):
+    return elapsed_sec >= timeout_sec
+
+
+def build_navigation_start_event(
+    event, generation, detail, bridge_pid, published_at_epoch_ms,
+    started_at_epoch_ms, published_at_monotonic_ms,
+    started_at_monotonic_ms,
+):
+    return json.dumps({
+        'schemaVersion': 2,
+        'event': str(event),
+        'generation': int(generation),
+        'detail': str(detail),
+        'bridgePid': int(bridge_pid),
+        'publishedAtEpochMs': int(published_at_epoch_ms),
+        'startedAtEpochMs': int(started_at_epoch_ms),
+        'publishedAtMonotonicMs': int(published_at_monotonic_ms),
+        'startedAtMonotonicMs': int(started_at_monotonic_ms),
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def navigation_lock_stat_is_secure(lock_stat, effective_uid):
+    return (
+        stat.S_ISREG(lock_stat.st_mode)
+        and lock_stat.st_uid == effective_uid
+        and stat.S_IMODE(lock_stat.st_mode) == 0o600
+        and lock_stat.st_nlink == 1
+    )
+
+
+def _open_navigation_launch_lock():
+    if not hasattr(os, 'O_NOFOLLOW'):
+        return None, 'Secure O_NOFOLLOW file locking is unavailable.'
+    flags = (
+        os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    fd = None
+    try:
+        fd = os.open(NAVIGATION_LAUNCH_LOCK_PATH, flags, 0o600)
+        effective_uid = os.geteuid()
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise OSError('navigation lock is not a regular file')
+        if opened_stat.st_uid != effective_uid:
+            raise OSError(
+                'navigation lock is owned by uid %s, expected uid %s'
+                % (opened_stat.st_uid, effective_uid)
+            )
+        if opened_stat.st_nlink != 1:
+            raise OSError('navigation lock has unexpected hard links')
+        os.fchmod(fd, 0o600)
+        opened_stat = os.fstat(fd)
+        path_stat = os.stat(NAVIGATION_LAUNCH_LOCK_PATH, follow_symlinks=False)
+        if not navigation_lock_stat_is_secure(opened_stat, effective_uid):
+            raise OSError('navigation lock permissions are not 0600')
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or path_stat.st_uid != effective_uid
+            or path_stat.st_nlink != 1
+            or path_stat.st_dev != opened_stat.st_dev
+            or path_stat.st_ino != opened_stat.st_ino
+        ):
+            raise OSError('navigation lock path changed while it was opened')
+        return os.fdopen(fd, 'r+', encoding='utf-8', closefd=True), ''
+    except OSError as exc:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None, 'Cannot securely open navigation launch lock: %s' % exc
+
+
+def acquire_navigation_launch_lock(owner):
+    if fcntl is None:
+        return None, 'POSIX file locking is unavailable.'
+    handle, open_error = _open_navigation_launch_lock()
+    if handle is None:
+        return None, open_error
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked_stat = os.fstat(handle.fileno())
+        path_stat = os.stat(NAVIGATION_LAUNCH_LOCK_PATH, follow_symlinks=False)
+        if (
+            not navigation_lock_stat_is_secure(locked_stat, os.geteuid())
+            or path_stat.st_dev != locked_stat.st_dev
+            or path_stat.st_ino != locked_stat.st_ino
+        ):
+            raise OSError('navigation lock changed before metadata update')
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({
+            'owner': owner,
+            'pid': os.getpid(),
+            'acquiredAt': datetime.now().isoformat(timespec='seconds'),
+        }) + '\n')
+        handle.flush()
+        return handle, ''
+    except BlockingIOError:
+        handle.close()
+        return None, 'Navigation startup is already owned by another launcher.'
+    except OSError as exc:
+        handle.close()
+        return None, 'Cannot acquire navigation launch lock: %s' % exc
 
 
 class VoiceRechargeBridge(Node):
@@ -30,12 +150,37 @@ class VoiceRechargeBridge(Node):
         self.declare_parameter('cancel_executable', 'cancel_charge')
         self.declare_parameter('navigation_launch_package', 'wheeltec_nav2')
         self.declare_parameter('navigation_launch_file', 'wheeltec_nav2.launch.py')
+        self.declare_parameter(
+            'navigation_launch_lock_path', NAVIGATION_LAUNCH_LOCK_PATH)
+        self.declare_parameter(
+            'navigation_start_event_topic', '/voice_navigation_start_event')
+        self.declare_parameter(
+            'navigation_start_result_topic', '/voice_navigation_start_result')
+        self.declare_parameter(
+            'navigation_start_timeout_sec',
+            DEFAULT_NAVIGATION_START_TIMEOUT_SEC,
+        )
         self.declare_parameter('follow_launch_package', 'bodyreader')
         self.declare_parameter('follow_launch_file', 'bodyfollow_no_avoider.launch.py')
         self.declare_parameter('cancel_recharge_timeout_sec', 25.0)
         self.declare_parameter('dock_evidence_hold_sec', 15.0)
         self.declare_parameter('recharge_start_service', '/auto_recharge/start')
         self.declare_parameter('recharge_stop_service', '/auto_recharge/stop')
+        self.declare_parameter(
+            'bodyfollow_mode_service', '/voice_summon/set_body_follow_enabled')
+        self.declare_parameter(
+            'bodyfollow_status_service', '/voice_summon/get_body_follow_status')
+        self.declare_parameter('follow_feedback_poll_sec', 0.25)
+        self.declare_parameter('follow_feedback_timeout_sec', 15.0)
+        self.declare_parameter(
+            'navigation_lifecycle_manager_services', [
+                '/lifecycle_manager_navigation/manage_nodes',
+                '/lifecycle_manager_localization/manage_nodes',
+            ]
+        )
+        self.declare_parameter('navigation_lifecycle_shutdown_timeout_sec', 6.0)
+        self.declare_parameter('navigation_sigint_timeout_sec', 8.0)
+        self.declare_parameter('navigation_sigterm_timeout_sec', 3.0)
 
         self.start_commands = set(self.get_parameter('start_commands').value)
         self.cancel_commands = set(self.get_parameter('cancel_commands').value)
@@ -51,6 +196,27 @@ class VoiceRechargeBridge(Node):
         self.cancel_executable = self.get_parameter('cancel_executable').value
         self.navigation_launch_package = self.get_parameter('navigation_launch_package').value
         self.navigation_launch_file = self.get_parameter('navigation_launch_file').value
+        configured_lock_path = str(
+            self.get_parameter('navigation_launch_lock_path').value).strip()
+        self.navigation_launch_lock_path = NAVIGATION_LAUNCH_LOCK_PATH
+        self.navigation_launch_lock_configuration_error = (
+            '' if configured_lock_path == NAVIGATION_LAUNCH_LOCK_PATH else (
+                'navigation_launch_lock_path must be the shared fixed path %s; '
+                'got %s'
+                % (NAVIGATION_LAUNCH_LOCK_PATH, configured_lock_path)
+            )
+        )
+        self.navigation_start_event_topic = str(
+            self.get_parameter('navigation_start_event_topic').value)
+        self.navigation_start_result_topic = str(
+            self.get_parameter('navigation_start_result_topic').value)
+        self.navigation_start_timeout_sec = min(
+            DEFAULT_NAVIGATION_START_TIMEOUT_SEC,
+            max(
+                1.0,
+                float(self.get_parameter('navigation_start_timeout_sec').value),
+            ),
+        )
         self.follow_launch_package = self.get_parameter('follow_launch_package').value
         self.follow_launch_file = self.get_parameter('follow_launch_file').value
         self.cancel_recharge_timeout_sec = float(
@@ -65,6 +231,39 @@ class VoiceRechargeBridge(Node):
         self.recharge_stop_service = str(
             self.get_parameter('recharge_stop_service').value
         )
+        self.bodyfollow_mode_service = str(
+            self.get_parameter('bodyfollow_mode_service').value
+        )
+        self.bodyfollow_status_service = str(
+            self.get_parameter('bodyfollow_status_service').value
+        )
+        self.follow_feedback_poll_sec = max(
+            0.10,
+            float(self.get_parameter('follow_feedback_poll_sec').value),
+        )
+        self.follow_feedback_timeout_sec = max(
+            1.0,
+            float(self.get_parameter('follow_feedback_timeout_sec').value),
+        )
+        self.navigation_lifecycle_manager_services = tuple(dict.fromkeys(
+            str(name).strip()
+            for name in self.get_parameter(
+                'navigation_lifecycle_manager_services').value
+            if str(name).strip()
+        ))
+        self.navigation_lifecycle_shutdown_timeout_sec = max(
+            0.0,
+            float(self.get_parameter(
+                'navigation_lifecycle_shutdown_timeout_sec').value),
+        )
+        self.navigation_sigint_timeout_sec = max(
+            0.5,
+            float(self.get_parameter('navigation_sigint_timeout_sec').value),
+        )
+        self.navigation_sigterm_timeout_sec = max(
+            0.5,
+            float(self.get_parameter('navigation_sigterm_timeout_sec').value),
+        )
         self.ros2_command = shutil.which('ros2') or '/opt/ros/humble/bin/ros2'
 
         self._navigate_process = None
@@ -77,6 +276,18 @@ class VoiceRechargeBridge(Node):
         self._recharge_start_future = None
         self._recharge_stop_future = None
         self._mapping_motion_blocked = False
+        self._navigation_shutdown = None
+        self._navigation_launch_lock_file = None
+        self._navigation_start_generation = 0
+        self._active_navigation_start_generation = None
+        self._active_navigation_start_started_at_epoch_ms = 0
+        self._active_navigation_start_started_at_monotonic = 0.0
+        self._follow_voice_request_token = 0
+        self._follow_feedback_completed_token = 0
+        self._follow_feedback_pending = None
+        self._follow_status_future = None
+        self._follow_status_future_token = 0
+        self._follow_status_next_poll = 0.0
 
         self.recharge_start_client = self.create_client(
             Trigger, self.recharge_start_service
@@ -85,11 +296,32 @@ class VoiceRechargeBridge(Node):
             Trigger, self.recharge_stop_service
         )
         self.follow_control_client = self.create_client(
-            SetBool, '/voice_summon/set_body_follow_enabled'
+            SetBool, self.bodyfollow_mode_service
+        )
+        self.follow_status_client = self.create_client(
+            Trigger, self.bodyfollow_status_service
+        )
+        self.navigation_lifecycle_clients = {
+            service_name: self.create_client(
+                ManageLifecycleNodes, service_name)
+            for service_name in self.navigation_lifecycle_manager_services
+        }
+        navigation_event_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.feedback_pub = self.create_publisher(String, 'feedback_audio', 10)
+        self.navigation_start_event_pub = self.create_publisher(
+            String, self.navigation_start_event_topic, navigation_event_qos)
         self.voice_sub = self.create_subscription(
             String, 'voice_words', self._voice_words_callback, 10
+        )
+        self.navigation_start_result_sub = self.create_subscription(
+            String,
+            self.navigation_start_result_topic,
+            self._navigation_start_result_callback,
+            10,
         )
         self.create_subscription(
             Bool,
@@ -108,6 +340,9 @@ class VoiceRechargeBridge(Node):
         )
         self.create_subscription(UInt8, 'robot_red_flag', self._red_state_callback, 10)
         self.create_timer(1.0, self._reap_finished_processes)
+        self.create_timer(0.5, self._check_navigation_start_timeout)
+        self.create_timer(
+            self.follow_feedback_poll_sec, self._check_follow_feedback)
 
         self.get_logger().info(
             'voice_recharge_bridge ready: start=%s cancel=%s navigation=%s follow=%s cancel_navigation=%s cancel_follow=%s dry_run=%s'
@@ -311,11 +546,185 @@ class VoiceRechargeBridge(Node):
         )
         self._request_manager_stop_fallback()
 
-    def _start_navigation(self):
-        if self._reject_mapping_motion('normal navigation start'):
+    def _next_navigation_start_generation(self):
+        self._navigation_start_generation += 1
+        return self._navigation_start_generation
+
+    def _publish_navigation_start_event(self, event, generation, detail=''):
+        published_at_epoch_ms = int(time.time() * 1000)
+        published_at_monotonic_ms = int(time.monotonic() * 1000)
+        started_at_epoch_ms = published_at_epoch_ms
+        started_at_monotonic_ms = published_at_monotonic_ms
+        if (
+            generation == self._active_navigation_start_generation
+            and self._active_navigation_start_started_at_epoch_ms > 0
+            and self._active_navigation_start_started_at_monotonic > 0.0
+        ):
+            started_at_epoch_ms = (
+                self._active_navigation_start_started_at_epoch_ms
+            )
+            started_at_monotonic_ms = int(
+                self._active_navigation_start_started_at_monotonic * 1000)
+        msg = String()
+        msg.data = build_navigation_start_event(
+            event,
+            generation,
+            detail,
+            os.getpid(),
+            published_at_epoch_ms,
+            started_at_epoch_ms,
+            published_at_monotonic_ms,
+            started_at_monotonic_ms,
+        )
+        self.navigation_start_event_pub.publish(msg)
+
+    def _publish_navigation_start_rejection(self, generation, detail):
+        self._publish_navigation_start_event('rejected', generation, detail)
+        if self._active_navigation_start_generation is not None:
+            # Keep the accepted in-flight generation as the latched state after
+            # reporting this separate rejected command.
+            self._publish_navigation_start_event(
+                'accepted',
+                self._active_navigation_start_generation,
+                'previously accepted navigation startup remains active',
+            )
+
+    def _clear_active_navigation_start(self):
+        self._active_navigation_start_generation = None
+        self._active_navigation_start_started_at_epoch_ms = 0
+        self._active_navigation_start_started_at_monotonic = 0.0
+
+    def _fail_active_navigation_start(self, detail, publish_feedback=False):
+        generation = self._active_navigation_start_generation
+        if generation is None:
+            return False
+        self._publish_navigation_start_event(
+            'health_failed', generation, detail)
+        self._clear_active_navigation_start()
+        if publish_feedback:
+            # The normal monitor path publishes this feedback before returning
+            # its failed result. This fallback is for a missing/stalled monitor.
+            self._publish_feedback('/stop.wav')
+        self.get_logger().error(
+            'Navigation startup generation %d failed health checks; '
+            'clean up its exact launch root: %s' % (generation, detail))
+        self._reap_finished_processes()
+        if self._is_tracked_process_running('navigation_launch'):
+            self._begin_navigation_shutdown()
+        return True
+
+    def _check_navigation_start_timeout(self):
+        generation = self._active_navigation_start_generation
+        started_at = self._active_navigation_start_started_at_monotonic
+        if generation is None or started_at <= 0.0:
             return
-        self._publish_feedback('/OK.wav')
-        self._launch_named_process(
+        elapsed_sec = max(0.0, time.monotonic() - started_at)
+        if not navigation_start_timeout_reached(
+            elapsed_sec, self.navigation_start_timeout_sec
+        ):
+            return
+        self._fail_active_navigation_start(
+            'navigation startup health confirmation timed out after %.1fs'
+            % self.navigation_start_timeout_sec,
+            publish_feedback=True,
+        )
+
+    def _navigation_start_result_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+            if not isinstance(payload, dict):
+                raise ValueError('navigation startup result must be an object')
+            generation = int(payload.get('generation'))
+            bridge_pid = int(payload.get('bridgePid'))
+            result = str(payload.get('result') or '')
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn(
+                'Ignore malformed navigation startup result: %s' % exc)
+            return
+        if (
+            bridge_pid != os.getpid()
+            or generation != self._active_navigation_start_generation
+        ):
+            return
+        elapsed_sec = max(
+            0.0,
+            time.monotonic()
+            - self._active_navigation_start_started_at_monotonic,
+        )
+        if navigation_start_timeout_reached(
+            elapsed_sec, self.navigation_start_timeout_sec
+        ):
+            self._fail_active_navigation_start(
+                'navigation startup health confirmation timed out after %.1fs'
+                % self.navigation_start_timeout_sec,
+                publish_feedback=True,
+            )
+            return
+        if result == 'ready':
+            self._publish_navigation_start_event(
+                'completed', generation, 'navigation startup is health-confirmed')
+            self._clear_active_navigation_start()
+            self.get_logger().info(
+                'Navigation startup generation %d is health-confirmed.'
+                % generation)
+            return
+        if result != 'failed':
+            return
+        self._fail_active_navigation_start(
+            str(payload.get('detail') or 'navigation startup health failed'))
+
+    def _acquire_navigation_launch_lock(self):
+        if self.navigation_launch_lock_configuration_error:
+            self.get_logger().error(
+                self.navigation_launch_lock_configuration_error)
+            return None
+        lock_file, lock_error = acquire_navigation_launch_lock(
+            'voice:%s' % os.getpid())
+        if lock_file is None:
+            self.get_logger().warn(lock_error)
+        return lock_file
+
+    def _release_navigation_launch_lock(self):
+        lock_file = self._navigation_launch_lock_file
+        self._navigation_launch_lock_file = None
+        if lock_file is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except (AttributeError, OSError):
+            pass
+        self._close_log(lock_file)
+
+    def _start_navigation(self):
+        generation = self._next_navigation_start_generation()
+        if self._reject_mapping_motion('normal navigation start'):
+            self._publish_navigation_start_rejection(
+                generation, 'Cartographer mapping owns motion')
+            return
+        self._reap_finished_processes()
+        if self._navigation_shutdown is not None:
+            self.get_logger().warn(
+                'Navigation shutdown is still in progress; ignore start command.')
+            self._publish_navigation_start_rejection(
+                generation, 'navigation shutdown is in progress')
+            return
+        existing_roots = self._navigation_launch_roots()
+        if existing_roots:
+            self.get_logger().warn(
+                'Exact navigation launch root(s) %s already exist; ignore '
+                'duplicate voice command.' % existing_roots)
+            self._publish_navigation_start_rejection(
+                generation,
+                'an exact navigation launch root already exists')
+            return
+        lock_file = self._acquire_navigation_launch_lock()
+        if lock_file is None:
+            self._publish_navigation_start_rejection(
+                generation,
+                'shared navigation launch lock was not acquired')
+            return
+        launched = self._launch_named_process(
             'navigation_launch',
             [self.ros2_command, 'launch', self.navigation_launch_package, self.navigation_launch_file],
             ['bt_navigator', 'planner_server', 'controller_server', 'waypoint_cycle'],
@@ -324,81 +733,329 @@ class VoiceRechargeBridge(Node):
                 'wheeltec_nav2.launch.py',
                 'nav2_container',
             ],
+            pass_fds=(lock_file.fileno(),),
         )
+        if launched is None:
+            self._close_log(lock_file)
+            self._publish_navigation_start_rejection(
+                generation, 'navigation launch process was not created')
+            return
+        self._navigation_launch_lock_file = lock_file
+        self._active_navigation_start_generation = generation
+        self._active_navigation_start_started_at_epoch_ms = int(
+            time.time() * 1000)
+        self._active_navigation_start_started_at_monotonic = time.monotonic()
+        self._publish_feedback('/OK.wav')
+        self._publish_navigation_start_event(
+            'accepted', generation, 'navigation launch process created')
 
     def _start_follow(self):
-        if self._reject_mapping_motion('body follow start'):
-            return
-        self._publish_feedback('/OK.wav')
         self._set_body_follow_enabled(True)
 
     def _cancel_navigation(self):
         self._publish_feedback('/OK.wav')
-        self._terminate_navigate_process('cancel_navigation')
-        self._kill_named_process_tree(
-            'navigation_launch',
-            [
-                'ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py',
-                'wheeltec_nav2.launch.py',
-                'nav2_container',
-            ],
-        )
+        if self._active_navigation_start_generation is not None:
+            self._publish_navigation_start_event(
+                'cancelled',
+                self._active_navigation_start_generation,
+                'navigation cancellation requested',
+            )
+            self._clear_active_navigation_start()
+        if self.dry_run:
+            self.get_logger().info(
+                'Dry run: would request Nav2 lifecycle shutdown, then stop the '
+                'exact %s/%s launch tree.'
+                % (self.navigation_launch_package, self.navigation_launch_file)
+            )
+            return
+        self._begin_navigation_shutdown()
 
     def _cancel_follow(self):
-        self._publish_feedback('/OK.wav')
         self._set_body_follow_enabled(False)
 
     def _set_body_follow_enabled(self, enabled):
+        self._follow_voice_request_token += 1
+        request_token = self._follow_voice_request_token
+        self._follow_feedback_pending = (
+            {
+                'token': request_token,
+                'generation': None,
+                'deadline': time.monotonic()
+                + self.follow_feedback_timeout_sec,
+            }
+            if enabled else None)
+        self._follow_status_future = None
+        self._follow_status_future_token = 0
+        self._follow_status_next_poll = 0.0
         if enabled and self._reject_mapping_motion('body follow enable'):
+            # _reject_mapping_motion already publishes the single failure tone.
+            self._follow_feedback_completed_token = request_token
+            self._follow_feedback_pending = None
             return
         if self.dry_run:
             self.get_logger().info(
-                'Dry run: would call /voice_summon/set_body_follow_enabled data=%s'
-                % bool(enabled)
+                'Dry run: would call %s data=%s'
+                % (self.bodyfollow_mode_service, bool(enabled))
             )
+            self._follow_feedback_completed_token = request_token
+            self._follow_feedback_pending = None
             return
 
         if not self.follow_control_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error(
-                '/voice_summon/set_body_follow_enabled service is unavailable'
+                'Body follow mode service is unavailable: %s'
+                % self.bodyfollow_mode_service
             )
+            if enabled:
+                self._finish_follow_feedback(
+                    request_token, False, 'control_service_unavailable')
             return
 
         request = SetBool.Request()
         request.data = bool(enabled)
-        future = self.follow_control_client.call_async(request)
+        try:
+            future = self.follow_control_client.call_async(request)
+        except Exception as exc:
+            self.get_logger().error(
+                'Failed to send body follow service request data=%s: %s'
+                % (enabled, exc)
+            )
+            if enabled:
+                self._finish_follow_feedback(
+                    request_token, False, 'control_request_failed')
+            return
         future.add_done_callback(
-            lambda completed, requested=bool(enabled): self._follow_control_response(
-                completed, requested
+            lambda completed, requested=bool(enabled), token=request_token:
+            self._follow_control_response(
+                completed, requested, token
             )
         )
 
-    def _follow_control_response(self, future, enabled):
+    def _follow_control_response(self, future, enabled, request_token):
+        if (
+                request_token != self._follow_voice_request_token
+                or request_token == self._follow_feedback_completed_token):
+            return
         try:
             response = future.result()
         except Exception as exc:
             self.get_logger().error(
                 'Body follow service call failed for data=%s: %s' % (enabled, exc)
             )
+            if enabled:
+                self._finish_follow_feedback(
+                    request_token, False, 'control_response_failed')
             return
 
         if response.success:
             self.get_logger().info(
-                'Body follow service call succeeded: data=%s message=%s'
+                'Body follow service request accepted: data=%s message=%s'
                 % (enabled, response.message)
             )
+            if enabled:
+                try:
+                    payload = json.loads(response.message)
+                    if not isinstance(payload, dict):
+                        raise ValueError('acceptance payload is not an object')
+                    accepted = payload.get('accepted') is True
+                    desired = payload.get('desired') is True
+                    generation = payload.get(
+                        'requestGeneration', payload.get('generation'))
+                    if (
+                            not accepted
+                            or not desired
+                            or isinstance(generation, bool)
+                            or not isinstance(generation, int)
+                            or generation <= 0):
+                        raise ValueError('invalid accepted follow response')
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    self.get_logger().error(
+                        'Invalid body follow acceptance response: %s' % exc)
+                    self._finish_follow_feedback(
+                        request_token, False, 'invalid_control_response')
+                    return
+                pending = self._follow_feedback_pending
+                if pending is None or pending['token'] != request_token:
+                    return
+                pending['generation'] = generation
+                self._follow_status_next_poll = 0.0
         else:
+            if enabled:
+                self._finish_follow_feedback(
+                    request_token, False, 'control_request_rejected')
+            else:
+                self._publish_feedback('/stop.wav')
             self.get_logger().error(
                 'Body follow service rejected data=%s: %s'
                 % (enabled, response.message)
             )
 
-    def _launch_named_process(self, label, cmd, active_node_names, active_process_patterns=None):
+    @staticmethod
+    def _classify_follow_feedback_status(payload, expected_generation):
+        current_generation = payload.get('generation')
+        request_generation = payload.get('requestGeneration')
+        result_generation = payload.get('lastResultGeneration')
+        result = payload.get('lastResult')
+
+        for value in (
+                current_generation, request_generation, result_generation):
+            if isinstance(value, bool) or not isinstance(value, int):
+                return 'protocol_error'
+
+        if result_generation == expected_generation and result == 'failed':
+            return 'failed'
+
+        if (
+                request_generation != expected_generation
+                and current_generation > expected_generation):
+            return 'superseded'
+
+        if (
+                request_generation == expected_generation
+                and current_generation == expected_generation
+                and payload.get('enabled') is True
+                and payload.get('phase') == 'waiting_body'
+                and payload.get('pending') is True
+                and payload.get('controllerApplied') is False
+                and payload.get('pipelineReady') is False
+                and payload.get('modeEnabled') is True
+                and payload.get('motionEnabled') is False
+                and not payload.get('lastError')):
+            return 'waiting_body'
+
+        if (
+                request_generation == expected_generation
+                and result_generation == expected_generation
+                and result == 'following'
+                and payload.get('enabled') is True
+                and payload.get('phase') == 'following'
+                and payload.get('pending') is False
+                and payload.get('controllerApplied') is True
+                and payload.get('pipelineReady') is True
+                and payload.get('modeEnabled') is True
+                and payload.get('motionEnabled') is True
+                and not payload.get('lastError')):
+            return 'following'
+
+        return 'pending'
+
+    def _check_follow_feedback(self):
+        pending = self._follow_feedback_pending
+        if pending is None:
+            return
+        token = pending['token']
+        if token != self._follow_voice_request_token:
+            self._follow_feedback_pending = None
+            return
+
+        now = time.monotonic()
+        if now >= pending['deadline']:
+            self._finish_follow_feedback(token, False, 'status_timeout')
+            return
+        if pending['generation'] is None:
+            # A current request generation can only come from this SetBool
+            # response.  Do not claim an unrelated app/older following state.
+            return
+        if self._follow_status_future is not None:
+            return
+        if now < self._follow_status_next_poll:
+            return
+        self._follow_status_next_poll = now + self.follow_feedback_poll_sec
+        if not self.follow_status_client.service_is_ready():
+            return
+
+        try:
+            future = self.follow_status_client.call_async(Trigger.Request())
+        except Exception as exc:
+            self.get_logger().warn(
+                'Failed to request body follow completion status: %s' % exc)
+            return
+        self._follow_status_future = future
+        self._follow_status_future_token = token
+        future.add_done_callback(
+            lambda completed, request_token=token:
+            self._follow_status_response(completed, request_token)
+        )
+
+    def _follow_status_response(self, future, request_token):
+        if (
+                self._follow_status_future is future
+                and self._follow_status_future_token == request_token):
+            self._follow_status_future = None
+            self._follow_status_future_token = 0
+        pending = self._follow_feedback_pending
+        if (
+                pending is None
+                or request_token != self._follow_voice_request_token
+                or pending['token'] != request_token):
+            return
+        if time.monotonic() >= pending['deadline']:
+            self._finish_follow_feedback(
+                request_token, False, 'status_timeout')
+            return
+
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().warn(
+                'Body follow completion status call failed: %s' % exc)
+            return
+        if not response.success:
+            self.get_logger().warn(
+                'Body follow completion status rejected: %s' % response.message)
+            return
+        try:
+            payload = json.loads(response.message)
+            if not isinstance(payload, dict):
+                raise ValueError('status payload is not an object')
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().error(
+                'Invalid body follow completion status: %s' % exc)
+            self._finish_follow_feedback(
+                request_token, False, 'invalid_status_response')
+            return
+
+        outcome = self._classify_follow_feedback_status(
+            payload, pending['generation'])
+        if outcome == 'following':
+            self._finish_follow_feedback(request_token, True, 'following')
+        elif outcome == 'waiting_body':
+            self._finish_follow_feedback(
+                request_token, True, 'waiting_body')
+        elif outcome in ('failed', 'protocol_error'):
+            reason = payload.get('lastResultError') or outcome
+            self._finish_follow_feedback(request_token, False, reason)
+        elif outcome == 'superseded':
+            self.get_logger().info(
+                'Voice body follow feedback canceled because generation %d '
+                'was superseded.' % pending['generation'])
+            self._follow_feedback_pending = None
+
+    def _finish_follow_feedback(self, request_token, succeeded, reason):
+        if (
+                request_token != self._follow_voice_request_token
+                or request_token == self._follow_feedback_completed_token):
+            return
+        self._follow_feedback_completed_token = request_token
+        self._follow_feedback_pending = None
+        self._publish_feedback('/OK.wav' if succeeded else '/stop.wav')
+        self.get_logger().info(
+            'Voice body follow feedback completed token=%d success=%s reason=%s'
+            % (request_token, bool(succeeded), reason))
+
+    def _launch_named_process(
+        self,
+        label,
+        cmd,
+        active_node_names,
+        active_process_patterns=None,
+        pass_fds=(),
+    ):
         self._reap_finished_processes()
 
         if self._is_tracked_process_running(label):
             self.get_logger().warn('%s process is already running; ignore duplicate command.' % label)
-            return
+            return None
 
         active_nodes = [node_name for node_name in active_node_names if self._is_node_active(node_name)]
         if active_nodes:
@@ -411,15 +1068,253 @@ class VoiceRechargeBridge(Node):
                     '%s appears active because node(s) %s and process(es) %s exist; ignore duplicate command.'
                     % (label, active_nodes, active_pids)
                 )
-                return
+                return None
             self.get_logger().warn(
                 '%s has stale ROS node(s) %s but no matching launch process; starting a new process.'
                 % (label, active_nodes)
             )
 
-        launched = self._launch_process(cmd, label)
+        launched = self._launch_process(cmd, label, pass_fds=pass_fds)
         if launched is not None:
             self._child_processes.append((label,) + launched)
+        return launched
+
+    def _begin_navigation_shutdown(self):
+        self._reap_finished_processes()
+        if self._navigation_shutdown is not None:
+            self.get_logger().warn(
+                'Navigation shutdown is already in progress; ignore duplicate '
+                'cancel command.')
+            return
+
+        roots = self._navigation_launch_roots()
+        if not roots:
+            self.get_logger().warn(
+                'No exact %s/%s navigation launch process found; no process was '
+                'signalled. Cartographer and unrelated nav2_container processes '
+                'are intentionally outside the fallback scope.'
+                % (self.navigation_launch_package, self.navigation_launch_file)
+            )
+            return
+
+        known_pids = set()
+        for root_pid in roots:
+            known_pids.update(self._process_tree_pids(root_pid))
+
+        lifecycle_futures = {}
+        for service_name, client in self.navigation_lifecycle_clients.items():
+            if not (
+                client.service_is_ready()
+                or client.wait_for_service(timeout_sec=0.2)
+            ):
+                self.get_logger().warn(
+                    'Nav2 lifecycle shutdown service is unavailable: %s'
+                    % service_name)
+                continue
+            request = ManageLifecycleNodes.Request()
+            request.command = ManageLifecycleNodes.Request.SHUTDOWN
+            try:
+                lifecycle_futures[service_name] = client.call_async(request)
+            except Exception as exc:
+                self.get_logger().warn(
+                    'Failed to request Nav2 lifecycle shutdown through %s: %s'
+                    % (service_name, exc))
+
+        now = time.monotonic()
+        self._navigation_shutdown = {
+            'roots': roots,
+            'known_pids': known_pids,
+            'lifecycle_futures': lifecycle_futures,
+            'phase': 'lifecycle',
+            'deadline': now + self.navigation_lifecycle_shutdown_timeout_sec,
+        }
+        if lifecycle_futures and self.navigation_lifecycle_shutdown_timeout_sec > 0.0:
+            self.get_logger().info(
+                'Requested graceful Nav2 lifecycle shutdown through %s; wait up '
+                'to %.1fs before signalling the exact launch root(s) %s.'
+                % (
+                    sorted(lifecycle_futures),
+                    self.navigation_lifecycle_shutdown_timeout_sec,
+                    roots,
+                )
+            )
+            return
+
+        self.get_logger().warn(
+            'No lifecycle shutdown request can be awaited; proceeding with '
+            'SIGINT for exact navigation launch root(s) %s.' % roots)
+        self._start_navigation_signal_phase(
+            'sigint', signal.SIGINT, self.navigation_sigint_timeout_sec,
+            roots_only=True)
+
+    def _navigation_launch_roots(self):
+        roots = set()
+        candidates = set(self._tracked_process_pids('navigation_launch'))
+        candidates.update(self._pgrep(self.navigation_launch_file))
+        candidates.update(self._pgrep(
+            'ros2 launch %s %s'
+            % (self.navigation_launch_package, self.navigation_launch_file)))
+        for pid in candidates:
+            if self._is_exact_navigation_launch_process(pid):
+                roots.add(pid)
+            else:
+                self.get_logger().debug(
+                    'Ignore pid=%s while locating navigation launch: command '
+                    'line is not the exact configured ros2 launch.' % pid)
+        return sorted(
+            pid for pid in roots if pid > 1 and pid != os.getpid()
+            and self._pid_exists(pid)
+        )
+
+    def _is_exact_navigation_launch_process(self, pid):
+        tokens = self._process_cmdline_tokens(pid)
+        if not tokens:
+            return False
+        ros2_positions = [
+            index for index, token in enumerate(tokens)
+            if os.path.basename(token) == 'ros2'
+        ]
+        if not ros2_positions:
+            return False
+        for index in range(len(tokens) - 2):
+            if (
+                tokens[index] == 'launch'
+                and tokens[index + 1] == self.navigation_launch_package
+                and os.path.basename(tokens[index + 2])
+                == self.navigation_launch_file
+                and any(ros2_index < index for ros2_index in ros2_positions)
+            ):
+                return True
+        return False
+
+    def _process_cmdline_tokens(self, pid):
+        try:
+            with open('/proc/%d/cmdline' % int(pid), 'rb') as cmdline_file:
+                raw = cmdline_file.read()
+        except (FileNotFoundError, ProcessLookupError):
+            return []
+        except Exception as exc:
+            self.get_logger().warn(
+                'Failed to inspect command line for pid=%s: %s' % (pid, exc))
+            return []
+        return [
+            token.decode('utf-8', errors='replace')
+            for token in raw.split(b'\0') if token
+        ]
+
+    def _advance_navigation_shutdown(self):
+        shutdown = self._navigation_shutdown
+        if shutdown is None:
+            return
+
+        now = time.monotonic()
+        alive = self._navigation_shutdown_alive_pids()
+        if not alive:
+            phase = shutdown['phase']
+            self._navigation_shutdown = None
+            self.get_logger().info(
+                'Navigation process tree exited during %s phase.' % phase)
+            return
+
+        phase = shutdown['phase']
+        if phase == 'lifecycle':
+            futures = shutdown['lifecycle_futures']
+            complete = all(future.done() for future in futures.values())
+            if not complete and now < shutdown['deadline']:
+                return
+            self._report_lifecycle_shutdown_results(futures, complete)
+            self._start_navigation_signal_phase(
+                'sigint', signal.SIGINT, self.navigation_sigint_timeout_sec,
+                roots_only=True)
+            return
+
+        if now < shutdown['deadline']:
+            return
+        if phase == 'sigint':
+            self.get_logger().warn(
+                'Navigation launch did not exit within %.1fs after SIGINT; '
+                'escalating to SIGTERM for remaining exact-tree pid(s) %s.'
+                % (self.navigation_sigint_timeout_sec, alive))
+            self._start_navigation_signal_phase(
+                'sigterm', signal.SIGTERM,
+                self.navigation_sigterm_timeout_sec, roots_only=False)
+            return
+        if phase == 'sigterm':
+            self.get_logger().error(
+                'Navigation launch did not exit within %.1fs after SIGTERM; '
+                'force killing remaining exact-tree pid(s) %s.'
+                % (self.navigation_sigterm_timeout_sec, alive))
+            self._start_navigation_signal_phase(
+                'sigkill', signal.SIGKILL, 1.0, roots_only=False)
+            return
+
+        self.get_logger().error(
+            'Navigation pid(s) still appear alive one second after SIGKILL: %s'
+            % alive)
+        self._navigation_shutdown = None
+
+    def _report_lifecycle_shutdown_results(self, futures, all_complete):
+        if not all_complete:
+            pending = sorted(
+                name for name, future in futures.items() if not future.done())
+            self.get_logger().warn(
+                'Nav2 lifecycle shutdown timed out after %.1fs; pending=%s.'
+                % (self.navigation_lifecycle_shutdown_timeout_sec, pending))
+        for service_name, future in futures.items():
+            if not future.done():
+                continue
+            try:
+                response = future.result()
+            except Exception as exc:
+                self.get_logger().warn(
+                    'Nav2 lifecycle shutdown call failed through %s: %s'
+                    % (service_name, exc))
+                continue
+            if response is not None and response.success:
+                self.get_logger().info(
+                    'Nav2 lifecycle shutdown confirmed by %s.' % service_name)
+            else:
+                self.get_logger().warn(
+                    'Nav2 lifecycle shutdown was rejected by %s.' % service_name)
+
+    def _start_navigation_signal_phase(
+        self, phase, sig, timeout_sec, roots_only
+    ):
+        shutdown = self._navigation_shutdown
+        if shutdown is None:
+            return
+        self._refresh_navigation_known_pids()
+        if roots_only:
+            targets = [
+                pid for pid in shutdown['roots'] if self._pid_exists(pid)
+            ]
+        else:
+            targets = self._navigation_shutdown_alive_pids()
+        targets = sorted(set(targets), reverse=not roots_only)
+        self.get_logger().warn(
+            'Sending %s to navigation %s: %s'
+            % (signal.Signals(sig).name, 'launch root(s)' if roots_only
+               else 'exact process tree', targets))
+        self._signal_pids(targets, sig)
+        shutdown['phase'] = phase
+        shutdown['deadline'] = time.monotonic() + max(0.0, timeout_sec)
+
+    def _refresh_navigation_known_pids(self):
+        shutdown = self._navigation_shutdown
+        if shutdown is None:
+            return
+        for root_pid in shutdown['roots']:
+            if self._pid_exists(root_pid):
+                shutdown['known_pids'].update(
+                    self._process_tree_pids(root_pid))
+
+    def _navigation_shutdown_alive_pids(self):
+        shutdown = self._navigation_shutdown
+        if shutdown is None:
+            return []
+        return sorted(
+            pid for pid in shutdown['known_pids'] if self._pid_exists(pid)
+        )
 
     def _kill_named_process_tree(self, label, root_patterns):
         self._reap_finished_processes()
@@ -547,7 +1442,7 @@ class VoiceRechargeBridge(Node):
             cmd.extend(ros_args)
         return self._launch_process(cmd, label)
 
-    def _launch_process(self, cmd, label):
+    def _launch_process(self, cmd, label, pass_fds=()):
         log_path = self._make_log_path(label)
 
         if self.dry_run:
@@ -567,6 +1462,7 @@ class VoiceRechargeBridge(Node):
                 cwd='/home/wheeltec/wheeltec_ros2',
                 env=process_env,
                 start_new_session=True,
+                pass_fds=tuple(pass_fds),
             )
         except Exception as exc:
             self.get_logger().error('Failed to launch %s: %s' % (label, exc))
@@ -604,6 +1500,8 @@ class VoiceRechargeBridge(Node):
         return False
 
     def _reap_finished_processes(self):
+        self._advance_navigation_shutdown()
+
         if self._navigate_process is not None and self._navigate_process.poll() is not None:
             self.get_logger().info(
                 'navigate_to_charger exited with code=%s, log=%s'
@@ -622,6 +1520,16 @@ class VoiceRechargeBridge(Node):
             else:
                 self.get_logger().info('%s exited with code=%s, log=%s' % (label, process.returncode, log_path))
                 self._close_log(log_file)
+                if label == 'navigation_launch':
+                    if self._active_navigation_start_generation is not None:
+                        self._publish_navigation_start_event(
+                            'launch_exited',
+                            self._active_navigation_start_generation,
+                            'navigation launch exited before health confirmation '
+                            'with code=%s' % process.returncode,
+                        )
+                        self._clear_active_navigation_start()
+                    self._release_navigation_launch_lock()
                 if label == 'cancel_charge':
                     cancel_finished = True
         self._child_processes = alive

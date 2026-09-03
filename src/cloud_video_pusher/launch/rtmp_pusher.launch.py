@@ -1,9 +1,5 @@
-import os
-
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.actions import Node
@@ -24,23 +20,6 @@ def generate_launch_description():
     fps = LaunchConfiguration('fps')
     bitrate = LaunchConfiguration('bitrate')
     auto_start = LaunchConfiguration('auto_start')
-
-    camera_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory('turn_on_wheeltec_robot'),
-                'launch',
-                'wheeltec_camera.launch.py',
-            )
-        )
-    )
-
-    web_video_server = Node(
-        package='web_video_server',
-        executable='web_video_server',
-        name='web_video_server',
-        output='screen',
-    )
 
     rtmp_pusher = Node(
         package='cloud_video_pusher',
@@ -66,7 +45,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument('image_topic', default_value='/camera/color/image_raw'),
+        DeclareLaunchArgument('image_topic', default_value='/image_raw'),
         DeclareLaunchArgument('rtmp_url', default_value=''),
         DeclareLaunchArgument('media_host', default_value=''),
         DeclareLaunchArgument('rtmp_base_url', default_value='rtmp://8.148.249.36/live'),
@@ -77,10 +56,8 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_device_id', default_value='robot-camera-1'),
         DeclareLaunchArgument('width', default_value='640'),
         DeclareLaunchArgument('height', default_value='480'),
-        DeclareLaunchArgument('fps', default_value='15.0'),
-        DeclareLaunchArgument('bitrate', default_value='800k'),
+        DeclareLaunchArgument('fps', default_value='8.0'),
+        DeclareLaunchArgument('bitrate', default_value='400k'),
         DeclareLaunchArgument('auto_start', default_value='true'),
-        camera_launch,
-        TimerAction(period=2.0, actions=[web_video_server]),
-        TimerAction(period=4.0, actions=[rtmp_pusher]),
+        rtmp_pusher,
     ])

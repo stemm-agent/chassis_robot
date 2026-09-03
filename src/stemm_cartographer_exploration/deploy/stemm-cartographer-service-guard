@@ -60,12 +60,23 @@ unit_is_stopped() {
      "${UNIT_MAIN_PID}" == 0 ]]
 }
 
-wait_for_stopped() {
-  local unit=$1
-  local attempts=$2
-  local index
+# Updates WAITING_UNITS as a set of services still alive after one shared
+# bounded wait. All stop requests are issued first, so a hung feature cannot
+# serialize the grace period of every other feature.
+wait_for_units_stopped() {
+  local attempts=$1
+  shift
+  local index unit
+  WAITING_UNITS=("$@")
   for ((index = 0; index < attempts; index += 1)); do
-    if unit_is_stopped "${unit}"; then
+    local -a remaining=()
+    for unit in "${WAITING_UNITS[@]}"; do
+      if ! unit_is_stopped "${unit}"; then
+        remaining+=("${unit}")
+      fi
+    done
+    WAITING_UNITS=("${remaining[@]}")
+    if (( ${#WAITING_UNITS[@]} == 0 )); then
       return 0
     fi
     sleep "${STOP_POLL_SEC}"
@@ -73,34 +84,62 @@ wait_for_stopped() {
   return 1
 }
 
-stop_unit() {
-  local unit=$1
-  echo "stopping feature service: ${unit}"
-  if unit_is_stopped "${unit}"; then
-    echo "feature service already stopped: ${unit}"
-    return 0
-  fi
+stop_units() {
+  local unit
+  local stop_status=0
+  local -a requested_units=()
 
-  if [[ "${unit}" == "${RECHARGE_UNIT}" ]]; then
-    request_recharge_stop
-  fi
-
-  systemctl stop --no-block "${unit}"
-  if ! wait_for_stopped "${unit}" "${STOP_GRACE_ATTEMPTS}"; then
-    read_unit_state "${unit}"
-    echo "graceful stop timed out; force-killing allowlisted feature service: ${unit} state=${UNIT_ACTIVE_STATE} pid=${UNIT_MAIN_PID}" >&2
-    if ! systemctl kill --kill-who=all --signal=KILL "${unit}"; then
-      echo "force-kill command reported failure; verifying final unit state: ${unit}" >&2
+  # The recharge helper sends the application-level stop before we interrupt
+  # its service. It is deliberately kept synchronous; all systemd stops below
+  # are then dispatched together.
+  if ! unit_is_stopped "${RECHARGE_UNIT}"; then
+    if ! request_recharge_stop; then
+      echo "recharge stop helper failed; continuing with bounded service stop" >&2
+      stop_status=1
     fi
-    systemctl stop --no-block "${unit}" || true
-    if ! wait_for_stopped "${unit}" "${STOP_KILL_ATTEMPTS}"; then
+  fi
+
+  for unit in "${STOP_ORDER[@]}"; do
+    echo "stopping feature service: ${unit}"
+    if unit_is_stopped "${unit}"; then
+      echo "feature service already stopped: ${unit}"
+      continue
+    fi
+    if ! systemctl stop --no-block "${unit}"; then
+      echo "systemctl stop failed for feature service: ${unit}" >&2
+      stop_status=1
+    fi
+    requested_units+=("${unit}")
+  done
+
+  if (( ${#requested_units[@]} == 0 )); then
+    return "${stop_status}"
+  fi
+
+  if ! wait_for_units_stopped "${STOP_GRACE_ATTEMPTS}" "${requested_units[@]}"; then
+    for unit in "${WAITING_UNITS[@]}"; do
       read_unit_state "${unit}"
-      echo "feature service did not stop after bounded force-kill: ${unit} state=${UNIT_ACTIVE_STATE} pid=${UNIT_MAIN_PID}" >&2
+      echo "graceful stop timed out; force-killing allowlisted feature service: ${unit} state=${UNIT_ACTIVE_STATE} pid=${UNIT_MAIN_PID}" >&2
+      if ! systemctl kill --kill-who=all --signal=KILL "${unit}"; then
+        echo "force-kill command reported failure; verifying final unit state: ${unit}" >&2
+        stop_status=1
+      fi
+      systemctl stop --no-block "${unit}" || true
+    done
+    local -a force_killed_units=("${WAITING_UNITS[@]}")
+    if ! wait_for_units_stopped "${STOP_KILL_ATTEMPTS}" "${force_killed_units[@]}"; then
+      for unit in "${WAITING_UNITS[@]}"; do
+        read_unit_state "${unit}"
+        echo "feature service did not stop after bounded force-kill: ${unit} state=${UNIT_ACTIVE_STATE} pid=${UNIT_MAIN_PID}" >&2
+      done
       return 1
     fi
   fi
 
-  echo "stopped feature service: ${unit}"
+  for unit in "${requested_units[@]}"; do
+    echo "stopped feature service: ${unit}"
+  done
+  return "${stop_status}"
 }
 
 restart_unit() {
@@ -120,9 +159,7 @@ restart_unit() {
 
 case "${1:-}" in
   stop)
-    for unit in "${STOP_ORDER[@]}"; do
-      stop_unit "${unit}"
-    done
+    stop_units
     ;;
   restart)
     restart_status=0

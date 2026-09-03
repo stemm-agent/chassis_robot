@@ -13,9 +13,10 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.time import Time
-from std_msgs.msg import Bool, String, UInt32
-from std_srvs.srv import SetBool
+from std_msgs.msg import Bool, Empty, Int8, String, UInt32
+from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
@@ -55,6 +56,18 @@ class VoiceSummonCoordinator(Node):
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('feedback_topic', 'feedback_audio')
         self.declare_parameter('follow_control_service', '/voice_summon/set_body_follow_enabled')
+        self.declare_parameter('follow_status_service', '/voice_summon/get_body_follow_status')
+        self.declare_parameter('external_body_confirm_frames', 2)
+        self.declare_parameter('external_body_confirm_max_gap_s', 0.50)
+        self.declare_parameter('external_body_wait_timeout_s', 6.0)
+        self.declare_parameter(
+            'astra_restart_topic', '/body_main/restart_body_stream')
+        self.declare_parameter('external_body_recovery_grace_s', 6.0)
+        self.declare_parameter('external_transaction_timeout_s', 2.0)
+        self.declare_parameter('external_gate_reassert_s', 0.5)
+        self.declare_parameter('external_gate_ack_max_age_s', 1.0)
+        self.declare_parameter('external_gate_close_retry_limit', 5)
+        self.declare_parameter('external_gate_close_retry_s', 0.5)
         self.declare_parameter('search_feedback_audio', '/search_voice.wav')
         self.declare_parameter('enable_turn_to_sound', True)
         self.declare_parameter('enable_follow_without_fresh_angle', False)
@@ -145,6 +158,11 @@ class VoiceSummonCoordinator(Node):
             'bearing_nav_yolo_preempt_event_topic',
             '/voice_summon/bearing_nav_yolo_preempt/event')
         self.declare_parameter('yolo_preempt_body_wait_s', 2.0)
+        # The TF guard publishes a transient, fail-safe indication whenever an
+        # AMCL update is rejected and the last trusted map->odom transform is
+        # being held.  Bearing navigation must not continue on an uncertain
+        # global pose even though the held TF remains syntactically available.
+        self.declare_parameter('localization_guard_anomaly_topic', '/amcl_tf_guard/anomaly')
 
         self.summon_commands = set(self.get_parameter('summon_commands').value)
         self.pause_commands = set(self.get_parameter('pause_commands').value)
@@ -259,6 +277,35 @@ class VoiceSummonCoordinator(Node):
             self.get_parameter('bearing_nav_yolo_preempt_event_topic').value)
         self.yolo_preempt_body_wait_s = max(
             0.1, float(self.get_parameter('yolo_preempt_body_wait_s').value))
+        self.localization_guard_anomaly_topic = str(
+            self.get_parameter('localization_guard_anomaly_topic').value)
+        self.external_body_confirm_frames = max(
+            1, int(self.get_parameter('external_body_confirm_frames').value))
+        self.external_body_confirm_max_gap_s = max(
+            0.1, float(
+                self.get_parameter('external_body_confirm_max_gap_s').value))
+        self.external_body_wait_timeout_s = max(
+            1.0, float(self.get_parameter('external_body_wait_timeout_s').value))
+        self.astra_restart_topic = str(
+            self.get_parameter('astra_restart_topic').value)
+        self.external_body_recovery_grace_s = min(
+            10.0,
+            max(
+                1.0,
+                float(self.get_parameter('external_body_recovery_grace_s').value),
+            ),
+        )
+        self.external_transaction_timeout_s = max(
+            0.5, float(self.get_parameter('external_transaction_timeout_s').value))
+        self.external_gate_reassert_s = max(
+            0.5, float(self.get_parameter('external_gate_reassert_s').value))
+        self.external_gate_ack_max_age_s = max(
+            self.external_gate_reassert_s + 0.2,
+            float(self.get_parameter('external_gate_ack_max_age_s').value))
+        self.external_gate_close_retry_limit = max(
+            0, int(self.get_parameter('external_gate_close_retry_limit').value))
+        self.external_gate_close_retry_s = max(
+            0.2, float(self.get_parameter('external_gate_close_retry_s').value))
         self.add_on_set_parameters_callback(self._parameter_update_callback)
 
         self.latest_angle_deg = None
@@ -292,14 +339,42 @@ class VoiceSummonCoordinator(Node):
         self.last_feedback_at = {}
         self.last_summon_started_at = 0.0
         self.mapping_motion_blocked = False
+        self.mapping_gate_seen = False
+        self.localization_guard_anomaly = False
         self.desired_follow_enabled = None
         self.desired_follow_reason = ''
         self.mode_request_inflight = False
         self.mode_request_sequence = 0
+        self.mode_desired_generation = 0
         self.mode_request_deadline = 0.0
         self.last_mode_request_at = 0.0
         self.last_mode_service_warning_at = 0.0
+        self.mode_applied_enabled = False
+        self.mode_topic = str(self.get_parameter('mode_topic').value)
+        self.mode_follow = int(self.get_parameter('mode_follow').value)
         self.visual_mode_ready_deadline = 0.0
+
+        # Public enable/disable is a small asynchronous transaction.  The epoch
+        # is the linearization token: callbacks from an older transaction may
+        # log, but can never release motion in a newer session.
+        self.external_follow_epoch = 0
+        self.external_follow_request_generation = 0
+        self.external_follow_desired = False
+        self.external_follow_phase = 'disabled'
+        self.external_follow_deadline = 0.0
+        self.external_follow_last_error = ''
+        self.external_follow_failure_latched = False
+        self.external_follow_last_result_generation = 0
+        self.external_follow_last_result = ''
+        self.external_follow_last_result_error = ''
+        self.external_body_id = None
+        self.external_body_confirm_count = 0
+        self.external_body_last_monotonic = 0.0
+        self.external_body_recovery_extended_generation = 0
+        self.external_last_gate_reassert = 0.0
+        self.external_gate_close_retry_count = 0
+        self.external_gate_close_retry_at = 0.0
+        self.external_gate_close_retry_epoch = 0
 
         # The locked bearing is expressed in odom_combined and captured only
         # once, at wake reception.  Later map-frame candidates are derived by
@@ -328,6 +403,14 @@ class VoiceSummonCoordinator(Node):
         self.motion_gate_desired = None
         self.motion_gate_inflight = False
         self.motion_gate_next = None
+        self.motion_gate_applied = False
+        self.motion_gate_ack_epoch = -1
+        self.motion_gate_ack_enabled = False
+        self.motion_gate_last_ack_monotonic = 0.0
+        self.motion_gate_sequence = 0
+        self.motion_gate_deadline = 0.0
+        self.motion_gate_current = None
+        self.motion_gate_pending = None
         self.bearing_candidates = []
         self.bearing_candidate_index = 0
         self.bearing_on_axis_rejections = []
@@ -375,7 +458,13 @@ class VoiceSummonCoordinator(Node):
             Bool,
             '/stemm_cartographer/motion_blocked',
             self._mapping_motion_blocked_callback,
-            10,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self.localization_guard_sub = self.create_subscription(
+            Bool,
+            self.localization_guard_anomaly_topic,
+            self._localization_guard_anomaly_callback,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
         self.angle_sub = self.create_subscription(
             UInt32,
@@ -405,17 +494,35 @@ class VoiceSummonCoordinator(Node):
             Bodyposture,
             self.get_parameter('body_posture_topic').value,
             self._body_posture_callback,
-            10,
+            1,
+        )
+        self.astra_restart_sub = self.create_subscription(
+            Empty,
+            self.astra_restart_topic,
+            self._astra_restart_callback,
+            1,
+        )
+        mode_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.mode_state_sub = self.create_subscription(
+            Int8,
+            self.mode_topic,
+            self._mode_state_callback,
+            mode_qos,
         )
         self.follow_control_srv = self.create_service(
             SetBool,
             self.get_parameter('follow_control_service').value,
             self._follow_control_callback,
         )
+        self.follow_status_srv = self.create_service(
+            Trigger,
+            self.get_parameter('follow_status_service').value,
+            self._follow_status_callback,
+        )
         self.timer = self.create_timer(timer_period_s, self._timer_callback)
 
         if self.publish_pause_on_start:
-            self._set_follow_enabled(False, 'startup_pause', monitor_completion=False)
+            self._stop_external_follow('startup_pause', preserve_desired=False)
 
         self.get_logger().info(
             'voice_summon_coordinator ready: summon=%s pause=%s enable_turn=%s '
@@ -644,14 +751,150 @@ class VoiceSummonCoordinator(Node):
         self.follow_stable_body_id = None
         self.follow_stable_since = 0.0
 
+    def _reset_external_body_confirmation(self):
+        self.external_body_id = None
+        self.external_body_confirm_count = 0
+        self.external_body_last_monotonic = 0.0
+
+    def _external_body_confirmation_fresh(self, now=None):
+        if now is None:
+            now = time.monotonic()
+        return (
+            self.external_body_id is not None
+            and self.external_body_confirm_count >= self.external_body_confirm_frames
+            and self.external_body_last_monotonic > 0.0
+            and now - self.external_body_last_monotonic
+            <= self.external_body_confirm_max_gap_s
+        )
+
+    def _astra_restart_callback(self, _msg):
+        if (
+                not self.external_follow_desired
+                or self.external_follow_phase not in (
+                    'enabling_mode', 'waiting_body', 'opening_gate')
+                or self.mapping_motion_blocked
+                or self.localization_guard_anomaly):
+            return
+
+        now = time.monotonic()
+        if self.external_follow_phase == 'opening_gate':
+            self.get_logger().warn(
+                'Astra recovery started before the external follow motion '
+                'gate was acknowledged; return to safe observation')
+            self._start_external_follow(
+                'astra_recovery_before_gate_ack', force=True)
+            return
+
+        if self.external_follow_phase == 'waiting_body':
+            # Waiting for a body has no deadline. Every Astra recovery still
+            # invalidates any partial identity confirmation while the existing
+            # gate-maintenance path keeps motion disabled.
+            self._reset_external_body_confirmation()
+            self.external_follow_deadline = 0.0
+            self.get_logger().warn(
+                'Astra recovery started while waiting for a body; keep motion '
+                'gate closed and clear partial body confirmation')
+            return
+
+        if (
+                self.external_follow_deadline <= 0.0
+                or now >= self.external_follow_deadline):
+            self.get_logger().warn(
+                'Ignore Astra recovery grace request after external follow '
+                'deadline expired')
+            return
+
+        request_generation = self.external_follow_request_generation
+        if request_generation <= 0:
+            return
+        epoch = self.external_follow_epoch
+        if (
+                self.external_body_recovery_extended_generation
+                == request_generation):
+            self.get_logger().warn(
+                'Ignore repeated Astra recovery grace request for external '
+                'follow requestGeneration=%d epoch=%d'
+                % (request_generation, epoch))
+            return
+
+        old_remaining_s = max(0.0, self.external_follow_deadline - now)
+        self.external_body_recovery_extended_generation = request_generation
+        self._reset_external_body_confirmation()
+        self.external_follow_deadline = max(
+            self.external_follow_deadline,
+            now + self.external_body_recovery_grace_s,
+        )
+        self.get_logger().warn(
+            'Astra recovery started during external follow requestGeneration=%d '
+            'epoch=%d phase=%s; '
+            'keep motion gate closed, clear body confirmation, and extend '
+            'deadline once from %.2fs to %.2fs remaining'
+            % (
+                request_generation,
+                epoch,
+                self.external_follow_phase,
+                old_remaining_s,
+                max(0.0, self.external_follow_deadline - now),
+            ))
+
     def _body_posture_callback(self, msg):
         if msg.lock_status != 2 or msg.centerofmass_z <= 100.0:
+            if self.external_follow_desired:
+                if self.external_follow_phase == 'waiting_body':
+                    self._reset_external_body_confirmation()
+                elif self.external_follow_phase == 'opening_gate':
+                    self._start_external_follow(
+                        'validated_body_lost_before_gate_ack', force=True)
             if self.state == 'following' and self.follow_monitor_enabled:
                 self._reset_follow_observation()
             return
 
+        now = time.monotonic()
         body_id = int(msg.bodyid)
         body_distance_m = float(msg.centerofmass_z) * 0.001
+
+        if (
+                self.external_follow_desired
+                and self.external_follow_phase in ('waiting_body', 'opening_gate')
+                and not self.mapping_motion_blocked
+                and not self.localization_guard_anomaly):
+            consecutive = (
+                body_id == self.external_body_id
+                and self.external_body_last_monotonic > 0.0
+                and now - self.external_body_last_monotonic
+                <= self.external_body_confirm_max_gap_s)
+            if self.external_follow_phase == 'opening_gate' and not consecutive:
+                self._start_external_follow(
+                    'validated_body_changed_before_gate_ack', force=True)
+                return
+            elif consecutive:
+                self.external_body_confirm_count += 1
+            else:
+                self.external_body_id = body_id
+                self.external_body_confirm_count = 1
+            self.external_body_last_monotonic = now
+            self.get_logger().info(
+                'External follow body confirmation epoch=%d body=%d frames=%d/%d'
+                % (
+                    self.external_follow_epoch,
+                    body_id,
+                    self.external_body_confirm_count,
+                    self.external_body_confirm_frames,
+                ))
+            if (
+                    self.external_follow_phase == 'waiting_body'
+                    and self.external_body_confirm_count
+                    >= self.external_body_confirm_frames):
+                epoch = self.external_follow_epoch
+                self.external_follow_phase = 'opening_gate'
+                self.external_follow_deadline = (
+                    now + self.external_transaction_timeout_s)
+                if not self._request_motion_gate(
+                        True,
+                        'external_validated_body',
+                        next_step='external_follow_commit',
+                        external_epoch=epoch):
+                    self._fail_external_follow(epoch, 'motion_gate_unavailable')
 
         # /body_posture_yolo_validated is already identity-validated (four
         # confirmation frames in the current launch).  One fresh sample is
@@ -691,35 +934,395 @@ class VoiceSummonCoordinator(Node):
         self.latest_body_distance_m = body_distance_m
         self.latest_body_monotonic = time.monotonic()
 
+    def _mode_state_callback(self, msg):
+        actual_enabled = int(msg.data) == self.mode_follow
+        previous_enabled = self.mode_applied_enabled
+        self.mode_applied_enabled = actual_enabled
+        if actual_enabled == previous_enabled:
+            return
+
+        self.get_logger().info(
+            'Observed body follow mode enabled=%s phase=%s epoch=%d'
+            % (
+                actual_enabled,
+                self.external_follow_phase,
+                self.external_follow_epoch,
+            ))
+        if (
+                not actual_enabled
+                and self.external_follow_desired
+                and self.external_follow_phase in (
+                    'waiting_body', 'opening_gate', 'following')
+                and not self.mapping_motion_blocked
+                and not self.localization_guard_anomaly):
+            self.get_logger().warn(
+                'Body follow mode dropped during an active external session; '
+                'return to safe observation before motion is re-enabled.')
+            self._start_external_follow('observed_mode_drop', force=True)
+            return
+
+        if (
+                actual_enabled
+                and not self.external_follow_desired
+                and not self.follow_enabled
+                and self.external_follow_phase in ('disabled', 'disabling')):
+            self.get_logger().warn(
+                'Observed unexpected mode=2 while public follow is disabled; correct it.')
+            self._request_follow_service(False, 'correct_unexpected_mode')
+
     def _follow_control_callback(self, request, response):
         enabled = bool(request.data)
-        if enabled and self.mapping_motion_blocked:
-            self._set_follow_enabled(
-                False, 'mapping_motion_gate', monitor_completion=False)
-            response.success = False
-            response.message = 'body follow blocked during Cartographer mapping'
+        if enabled:
+            if not self.mapping_gate_seen:
+                response.success = False
+                response.message = 'body follow safety state is not ready'
+                return response
+            if self.mapping_motion_blocked:
+                self._stop_external_follow('mapping_motion_gate', preserve_desired=False)
+                response.success = False
+                response.message = 'body follow blocked during Cartographer mapping'
+                return response
+            if self.localization_guard_anomaly:
+                self._stop_external_follow(
+                    'localization_tf_guard_anomaly', preserve_desired=False)
+                response.success = False
+                response.message = 'body follow blocked by localization safety guard'
+                return response
+            if not self.mode_service_client.service_is_ready():
+                response.success = False
+                response.message = 'body follow mode service is unavailable'
+                return response
+            if not self.motion_gate_client.service_is_ready():
+                response.success = False
+                response.message = 'body follower motion gate service is unavailable'
+                return response
+            accepted = self._start_external_follow('setbool_service')
+            response.success = accepted
+            response.message = json.dumps(
+                {
+                    'accepted': bool(accepted),
+                    'pending': bool(accepted),
+                    'desired': True,
+                    'generation': int(self.external_follow_epoch),
+                    'requestGeneration': int(
+                        self.external_follow_request_generation),
+                },
+                separators=(',', ':'),
+            )
             return response
-        if not enabled:
+
+        if self.state != 'idle':
             self._exit_bearing_summon('external_follow_disable')
-        elif self.state != 'following':
-            # Keep the legacy service behavior: an explicit external follow
-            # request remains able to release the new observation-only gate.
-            self._request_motion_gate(True, 'external_follow_enable')
-        self._set_follow_enabled(enabled, 'setbool_service', monitor_completion=False)
+        if (
+                not self.external_follow_desired
+                and self.external_follow_phase == 'disabling'):
+            response.success = True
+            response.message = json.dumps(
+                {
+                    'accepted': True,
+                    'pending': True,
+                    'desired': False,
+                    'generation': int(self.external_follow_epoch),
+                },
+                separators=(',', ':'),
+            )
+            return response
+        self._stop_external_follow('external_follow_disable', preserve_desired=False)
         response.success = True
-        response.message = 'body follow %s request queued' % (
-            'enabled' if enabled else 'disabled')
+        response.message = json.dumps(
+            {
+                'accepted': True,
+                'pending': True,
+                'desired': False,
+                'generation': int(self.external_follow_epoch),
+            },
+            separators=(',', ':'),
+        )
         return response
 
+    def _external_gate_ack_is_current(self, expected_enabled, require_fresh=True):
+        if (
+                self.motion_gate_ack_epoch != self.external_follow_epoch
+                or self.motion_gate_ack_enabled != bool(expected_enabled)
+                or self.motion_gate_last_ack_monotonic <= 0.0):
+            return False
+        if not require_fresh:
+            return True
+        return (
+            time.monotonic() - self.motion_gate_last_ack_monotonic
+            <= self.external_gate_ack_max_age_s)
+
+    def _follow_status_callback(self, _request, response):
+        pending_phases = {
+            'closing_gate', 'enabling_mode', 'waiting_body', 'opening_gate', 'disabling',
+            'blocked_localization',
+        }
+        external_owned = (
+            self.external_follow_desired
+            or self.external_follow_phase not in ('disabled', 'idle'))
+        enabled = (
+            self.external_follow_desired if external_owned else bool(self.follow_enabled))
+        pending = self.external_follow_phase in pending_phases
+        mode_subscriber_count = max(0, int(self.count_subscribers(self.mode_topic)) - 1)
+        motion_gate_service_ready = self.motion_gate_client.service_is_ready()
+        if enabled:
+            controller_applied = (
+                self.mode_applied_enabled
+                and mode_subscriber_count > 0
+                and motion_gate_service_ready
+                and self.external_follow_phase == 'following'
+                and self._external_gate_ack_is_current(True))
+        else:
+            controller_applied = (
+                not self.mode_applied_enabled
+                and self._external_gate_ack_is_current(False, require_fresh=False)
+                and not pending)
+        payload = {
+            'enabled': bool(enabled),
+            'state': 'enabled' if enabled else 'disabled',
+            'controllerApplied': bool(controller_applied),
+            'pending': bool(pending),
+            # Subtract this coordinator's health subscription so the legacy
+            # field still represents real downstream /mode consumers.
+            'modeSubscriberCount': mode_subscriber_count,
+            'lastError': self.external_follow_last_error,
+            'phase': self.external_follow_phase,
+            'modeEnabled': bool(self.mode_applied_enabled),
+            'motionEnabled': bool(self.motion_gate_applied),
+            'pipelineReady': bool(
+                self.external_follow_phase == 'following'
+                and self.mode_applied_enabled
+                and self._external_gate_ack_is_current(True)
+                and motion_gate_service_ready),
+            'generation': int(self.external_follow_epoch),
+            'requestGeneration': int(
+                self.external_follow_request_generation),
+            'lastResultGeneration': int(
+                self.external_follow_last_result_generation),
+            'lastResult': self.external_follow_last_result,
+            'lastResultError': self.external_follow_last_result_error,
+        }
+        response.success = True
+        response.message = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        return response
+
+    def _start_external_follow(self, reason, force=False):
+        if (
+                not force
+                and self.external_follow_desired
+                and self.external_follow_phase in (
+                    'closing_gate', 'enabling_mode', 'waiting_body',
+                    'opening_gate', 'following')):
+            return True
+        if self.state != 'idle':
+            self._exit_bearing_summon('external_follow_override')
+        self.external_follow_epoch += 1
+        epoch = self.external_follow_epoch
+        if not force or self.external_follow_request_generation <= 0:
+            self.external_follow_request_generation = epoch
+            self.external_body_recovery_extended_generation = 0
+        self.external_follow_desired = True
+        self.external_follow_phase = 'closing_gate'
+        self.external_follow_deadline = (
+            time.monotonic() + self.external_transaction_timeout_s)
+        self.external_follow_last_error = ''
+        self.external_follow_failure_latched = False
+        self._reset_external_body_confirmation()
+        self.external_last_gate_reassert = 0.0
+        self.motion_gate_ack_epoch = -1
+        self._publish_stop_cmd()
+        accepted = self._request_motion_gate(
+            False,
+            'external_enable_prepare:%s' % reason,
+            next_step='external_enable_mode',
+            external_epoch=epoch,
+        )
+        if not accepted:
+            self._fail_external_follow(epoch, 'motion_gate_unavailable')
+        return accepted
+
+    def _enter_external_observation(self, epoch):
+        if (
+                epoch != self.external_follow_epoch
+                or not self.external_follow_desired
+                or self.mapping_motion_blocked
+                or self.localization_guard_anomaly):
+            return
+        self.external_follow_phase = 'enabling_mode'
+        self.external_follow_deadline = (
+            time.monotonic() + self.external_transaction_timeout_s)
+        self._reset_external_body_confirmation()
+        self._set_follow_enabled(
+            True, 'external_observe:%d' % epoch, monitor_completion=False)
+
+    def _commit_external_follow(self, epoch):
+        if epoch != self.external_follow_epoch:
+            return
+        if (
+                not self.external_follow_desired
+                or self.mapping_motion_blocked
+                or self.localization_guard_anomaly
+                or not self._external_body_confirmation_fresh()
+                or not self._external_gate_ack_is_current(True)):
+            self._start_external_follow(
+                'body_or_gate_stale_before_commit', force=True)
+            return
+        self.external_follow_phase = 'following'
+        self.external_follow_deadline = 0.0
+        self.external_follow_last_error = ''
+        result_generation = (
+            self.external_follow_request_generation or epoch)
+        self.external_follow_last_result_generation = result_generation
+        self.external_follow_last_result = 'following'
+        self.external_follow_last_result_error = ''
+        self.get_logger().info(
+            'External body follow active epoch=%d body=%s confirmations=%d'
+            % (
+                epoch,
+                self.external_body_id,
+                self.external_body_confirm_count,
+            ))
+
+    def _stop_external_follow(
+            self, reason, preserve_desired=False, failure_reason=''):
+        stopped_request_generation = self.external_follow_request_generation
+        if failure_reason and stopped_request_generation > 0:
+            self.external_follow_last_result_generation = (
+                stopped_request_generation)
+            self.external_follow_last_result = 'failed'
+            self.external_follow_last_result_error = str(failure_reason)
+        self.external_follow_epoch += 1
+        epoch = self.external_follow_epoch
+        self.external_follow_request_generation = 0
+        self.external_follow_desired = bool(preserve_desired)
+        self.external_follow_phase = (
+            'blocked_localization' if preserve_desired else 'disabling')
+        self.external_follow_deadline = (
+            0.0 if preserve_desired else
+            time.monotonic() + self.external_transaction_timeout_s)
+        self.external_follow_last_error = (
+            str(failure_reason or reason) if preserve_desired or failure_reason else '')
+        self.external_follow_failure_latched = bool(preserve_desired or failure_reason)
+        self._reset_external_body_confirmation()
+        self.external_last_gate_reassert = 0.0
+        self.motion_gate_ack_epoch = -1
+        self._publish_stop_cmd()
+        self._set_follow_enabled(
+            False, 'external_stop:%d:%s' % (epoch, reason), monitor_completion=False)
+        self.external_gate_close_retry_count = 0
+        self.external_gate_close_retry_at = 0.0
+        self.external_gate_close_retry_epoch = epoch
+        if not self._request_motion_gate(
+                False,
+                reason,
+                next_step='external_stop_complete',
+                external_epoch=epoch):
+            self._schedule_external_gate_close_retry(
+                epoch, 'motion_gate_unavailable:%s' % reason)
+        return epoch
+
+    def _complete_external_stop(self, epoch):
+        if epoch != self.external_follow_epoch:
+            return
+        if (
+                self.mode_applied_enabled
+                or not self._external_gate_ack_is_current(
+                    False, require_fresh=False)):
+            self.external_follow_phase = (
+                'blocked_localization'
+                if self.external_follow_desired else 'disabling')
+            return
+        self.external_follow_deadline = 0.0
+        self.external_follow_phase = (
+            'blocked_localization'
+            if self.external_follow_desired else 'disabled')
+        if not self.external_follow_failure_latched:
+            self.external_follow_last_error = ''
+
+    def _fail_external_follow(self, epoch, reason):
+        if epoch != self.external_follow_epoch:
+            return
+        result_generation = (
+            self.external_follow_request_generation or epoch)
+        self.external_follow_last_result_generation = result_generation
+        self.external_follow_last_result = 'failed'
+        self.external_follow_last_result_error = str(reason)
+        self.get_logger().error(
+            'External body follow transaction failed epoch=%d phase=%s reason=%s'
+            % (epoch, self.external_follow_phase, reason))
+        self._stop_external_follow(
+            reason, preserve_desired=False, failure_reason=reason)
+
+    def _schedule_external_gate_close_retry(self, epoch, reason):
+        if epoch != self.external_follow_epoch:
+            return
+        self._publish_stop_cmd()
+        if not self.external_follow_last_error:
+            self.external_follow_last_error = str(reason)
+        if self.external_gate_close_retry_count >= self.external_gate_close_retry_limit:
+            self.external_gate_close_retry_at = 0.0
+            self.external_follow_deadline = 0.0
+            self.external_follow_phase = (
+                'blocked_localization'
+                if self.external_follow_desired else 'disabled_error')
+            self.get_logger().error(
+                'Motion gate close retries exhausted epoch=%d reason=%s'
+                % (epoch, reason))
+            return
+        self.external_gate_close_retry_count += 1
+        delay = self.external_gate_close_retry_s * (
+            2 ** (self.external_gate_close_retry_count - 1))
+        self.external_gate_close_retry_epoch = epoch
+        self.external_gate_close_retry_at = time.monotonic() + delay
+        self.get_logger().warn(
+            'Schedule bounded motion gate close retry epoch=%d attempt=%d/%d '
+            'delay=%.2fs reason=%s'
+            % (
+                epoch,
+                self.external_gate_close_retry_count,
+                self.external_gate_close_retry_limit,
+                delay,
+                reason,
+            ))
+
     def _mapping_motion_blocked_callback(self, msg):
+        self.mapping_gate_seen = True
         blocked = bool(msg.data)
         if blocked and not self.mapping_motion_blocked:
             self.get_logger().warn(
                 'Cartographer mapping gate active; stop voice summon/follow.')
             self.mapping_motion_blocked = True
+            if self.external_follow_desired:
+                self._stop_external_follow(
+                    'mapping_motion_gate',
+                    preserve_desired=False,
+                    failure_reason='mapping_motion_gate')
             self._exit_bearing_summon('mapping_motion_gate')
             return
         self.mapping_motion_blocked = blocked
+
+    def _localization_guard_anomaly_callback(self, msg):
+        anomaly = bool(msg.data)
+        if anomaly == self.localization_guard_anomaly:
+            return
+        self.localization_guard_anomaly = anomaly
+        if not anomaly:
+            self.get_logger().info(
+                'VOICE_BEARING_LOCALIZATION_GUARD recovered; a new explicit '
+                'follow command is required.')
+            return
+
+        self.get_logger().error(
+            'VOICE_BEARING_LOCALIZATION_GUARD anomaly; close motion gate and cancel '
+            'the active summon navigation immediately.')
+        if self.external_follow_desired:
+            self._stop_external_follow(
+                'localization_tf_guard_anomaly',
+                preserve_desired=False,
+                failure_reason='localization_tf_guard_anomaly')
+        if self.state != 'idle':
+            self._request_motion_gate(False, 'localization_tf_guard_anomaly')
+            self._exit_bearing_summon('localization_tf_guard_anomaly')
 
     def _voice_words_callback(self, msg):
         command = msg.data.strip()
@@ -735,6 +1338,9 @@ class VoiceSummonCoordinator(Node):
         if command in self.pause_commands:
             if self._in_cooldown(command):
                 return
+            if self.external_follow_desired:
+                self._stop_external_follow(
+                    'voice_pause:%s' % command, preserve_desired=False)
             self._exit_bearing_summon('voice_pause:%s' % command)
             return
 
@@ -742,6 +1348,11 @@ class VoiceSummonCoordinator(Node):
             if self.mapping_motion_blocked:
                 self.get_logger().warn(
                     'Reject voice summon while Cartographer mapping owns motion.')
+                self._publish_feedback('/stop.wav')
+                return
+            if self.localization_guard_anomaly:
+                self.get_logger().error(
+                    'Reject voice summon while localization TF guard is holding an anomaly.')
                 self._publish_feedback('/stop.wav')
                 return
             if self._in_cooldown(command) or self._summon_locked_out(command):
@@ -776,6 +1387,9 @@ class VoiceSummonCoordinator(Node):
             self.get_logger().warn(
                 'Ignore summon start because mapping motion gate is active.')
             return
+        if self.external_follow_desired:
+            self._stop_external_follow(
+                'voice_summon_override', preserve_desired=False)
         self.last_summon_started_at = time.monotonic()
         self.bearing_session += 1
         self._reset_bearing_tracking()
@@ -1071,65 +1685,224 @@ class VoiceSummonCoordinator(Node):
         self.stuck_full_turn_speed_rad_s = 0.0
         self.stuck_full_turn_deadline_monotonic = 0.0
 
-    def _request_motion_gate(self, enabled, reason, next_step=None):
-        """Gate follower actuation while keeping mode=2 vision alive."""
-        if self.motion_gate_inflight:
+    def _gate_request_is_current(self, request_spec):
+        enabled, _reason, next_step, session, external_epoch = request_spec
+        if external_epoch is not None:
+            if external_epoch != self.external_follow_epoch:
+                return False
+            if not enabled:
+                return True
+            return (
+                self.external_follow_desired
+                and not self.mapping_motion_blocked
+                and not self.localization_guard_anomaly
+                and (
+                    self.external_follow_phase == 'following'
+                    or (
+                        self.external_follow_phase == 'opening_gate'
+                        and self._external_body_confirmation_fresh()))
+            )
+        if next_step is not None and session != self.bearing_session:
+            return False
+        if enabled and next_step == 'handoff_visual_follow':
+            return self.state == 'handoff_visual_pending' and self.pending_bearing_body
+        if enabled and next_step == 'direct_visual_follow_ready':
+            return self.state == 'following' and self.follow_enabled
+        return True
+
+    def _request_motion_gate(
+            self, enabled, reason, next_step=None, external_epoch=None):
+        """Apply the latest gate intent without dropping a concurrent disable."""
+        request_spec = (
+            bool(enabled), str(reason), next_step, self.bearing_session, external_epoch)
+        if not self._gate_request_is_current(request_spec):
             self.get_logger().warn(
-                'Motion gate request already pending; ignore desired=%s reason=%s'
+                'Drop stale motion gate request desired=%s reason=%s epoch=%s'
+                % (enabled, reason, external_epoch))
+            return False
+        self.motion_gate_desired = bool(enabled)
+        if self.motion_gate_inflight:
+            # A single-slot latest-wins queue is enough for SetBool semantics.
+            # In particular, disable can no longer be lost behind an enable.
+            self.motion_gate_pending = request_spec
+            self.get_logger().warn(
+                'Motion gate request queued behind inflight call desired=%s reason=%s'
                 % (enabled, reason))
+            return True
+        sent = self._send_motion_gate_request(request_spec)
+        if not sent and external_epoch is None and next_step is not None:
+            self._exit_bearing_summon('motion_gate_unavailable:%s' % reason)
+        return sent
+
+    def _send_motion_gate_request(self, request_spec):
+        enabled, reason, next_step, session, external_epoch = request_spec
+        if not self._gate_request_is_current(request_spec):
+            self.get_logger().warn(
+                'Drop superseded queued motion gate request desired=%s reason=%s epoch=%s'
+                % (enabled, reason, external_epoch))
             return False
         if not self.motion_gate_client.service_is_ready():
             self.get_logger().error(
                 'Motion gate service unavailable: %s reason=%s'
                 % (self.motion_gate_service_name, reason))
-            if next_step is not None:
-                self._exit_bearing_summon('motion_gate_unavailable:%s' % reason)
             return False
 
-        self.motion_gate_desired = bool(enabled)
-        self.motion_gate_next = next_step
         self.motion_gate_inflight = True
+        self.motion_gate_next = next_step
+        self.motion_gate_current = request_spec
+        self.motion_gate_sequence += 1
+        sequence = self.motion_gate_sequence
+        self.motion_gate_deadline = (
+            time.monotonic() + self.external_transaction_timeout_s)
         request = SetBool.Request()
-        request.data = bool(enabled)
+        request.data = enabled
         future = self.motion_gate_client.call_async(request)
-        session = self.bearing_session
         future.add_done_callback(
-            lambda completed, expected=bool(enabled), why=str(reason), next_name=next_step,
-            token=session: self._motion_gate_response(
-                completed, expected, why, next_name, token))
+            lambda completed, expected=enabled, why=reason, next_name=next_step,
+            token=session, transaction=external_epoch, request_sequence=sequence:
+            self._motion_gate_response(
+                completed, expected, why, next_name, token, transaction,
+                request_sequence))
         return True
 
-    def _motion_gate_response(self, future, enabled, reason, next_step, session):
-        self.motion_gate_inflight = False
-        if session != self.bearing_session and next_step is not None:
+    def _dispatch_pending_motion_gate(self):
+        if self.motion_gate_inflight or self.motion_gate_pending is None:
             return
+        request_spec = self.motion_gate_pending
+        self.motion_gate_pending = None
+        if not self._send_motion_gate_request(request_spec):
+            enabled, reason, next_step, session, external_epoch = request_spec
+            self._handle_motion_gate_failure(
+                enabled,
+                'motion_gate_unavailable:%s' % reason,
+                next_step,
+                session,
+                external_epoch,
+            )
+
+    def _handle_motion_gate_failure(
+            self, enabled, failure, next_step, session, external_epoch):
+        if external_epoch == self.external_follow_epoch:
+            is_stop_request = (
+                not enabled
+                and (
+                    next_step == 'external_stop_complete'
+                    or self.external_follow_phase in (
+                        'disabling', 'blocked_localization')))
+            if is_stop_request:
+                self._schedule_external_gate_close_retry(external_epoch, failure)
+            else:
+                self._fail_external_follow(external_epoch, failure)
+            return
+        if external_epoch is not None:
+            # A newer public transaction owns the gate now.  Its latest-wins
+            # request (or periodic reassertion) will establish the right state.
+            return
+        if next_step is not None and session == self.bearing_session:
+            self._exit_bearing_summon(failure)
+
+    def _motion_gate_response(
+            self, future, enabled, reason, next_step, session, external_epoch,
+            request_sequence):
+        if request_sequence != self.motion_gate_sequence:
+            self.get_logger().warn(
+                'Ignore late motion gate response sequence=%d current=%d reason=%s'
+                % (request_sequence, self.motion_gate_sequence, reason))
+            if enabled and self.motion_gate_desired is False:
+                self._request_motion_gate(False, 'correct_stale_gate_enable')
+            return
+
+        self.motion_gate_inflight = False
+        self.motion_gate_deadline = 0.0
+        self.motion_gate_current = None
+        context_current = (
+            (next_step not in (
+                'begin_visual_acquisition', 'handoff_visual_follow',
+                'direct_visual_follow_ready')
+             or session == self.bearing_session)
+            and (external_epoch is None or external_epoch == self.external_follow_epoch)
+            and enabled == self.motion_gate_desired)
         try:
             response = future.result()
         except Exception as exc:
-            self.get_logger().error('Motion gate call failed reason=%s: %s' % (reason, exc))
-            if next_step is not None:
-                self._exit_bearing_summon('motion_gate_transport:%s' % reason)
+            self.get_logger().error(
+                'Motion gate call failed reason=%s: %s' % (reason, exc))
+            self._handle_motion_gate_failure(
+                enabled,
+                'motion_gate_transport:%s' % reason,
+                next_step,
+                session,
+                external_epoch,
+            )
+            self._dispatch_pending_motion_gate()
             return
         if not response.success:
             self.get_logger().error(
                 'Motion gate rejected desired=%s reason=%s: %s'
                 % (enabled, reason, response.message))
-            if next_step is not None:
-                self._exit_bearing_summon('motion_gate_rejected:%s' % reason)
+            self._handle_motion_gate_failure(
+                enabled,
+                'motion_gate_rejected:%s' % reason,
+                next_step,
+                session,
+                external_epoch,
+            )
+            self._dispatch_pending_motion_gate()
             return
 
+        self.motion_gate_applied = enabled
+        if external_epoch is not None:
+            self.motion_gate_ack_epoch = external_epoch
+            self.motion_gate_ack_enabled = enabled
+            self.motion_gate_last_ack_monotonic = time.monotonic()
         self.get_logger().info(
             'Motion gate applied enabled=%s reason=%s: %s'
             % (enabled, reason, response.message))
-        if next_step == 'begin_visual_acquisition':
-            self._enter_visual_acquisition_after_gate()
-        elif next_step == 'handoff_visual_follow':
-            self._enter_visual_follow()
+        if context_current:
+            if next_step == 'begin_visual_acquisition':
+                self._enter_visual_acquisition_after_gate()
+            elif next_step == 'handoff_visual_follow':
+                self._enter_visual_follow()
+            elif next_step == 'direct_visual_follow_ready':
+                self.get_logger().info(
+                    'VOICE_DIRECT_VISUAL_FOLLOW motion gate released')
+            elif next_step == 'external_enable_mode':
+                self._enter_external_observation(external_epoch)
+            elif next_step == 'external_follow_commit':
+                self._commit_external_follow(external_epoch)
+            elif next_step == 'external_stop_complete':
+                self._complete_external_stop(external_epoch)
+        elif enabled and self.motion_gate_desired is False:
+            self._request_motion_gate(False, 'correct_superseded_gate_enable')
+        self._dispatch_pending_motion_gate()
+
+    def _check_motion_gate_timeout(self, now):
+        if not self.motion_gate_inflight or now < self.motion_gate_deadline:
+            return
+        request_spec = self.motion_gate_current
+        self.motion_gate_inflight = False
+        self.motion_gate_deadline = 0.0
+        self.motion_gate_current = None
+        self.motion_gate_sequence += 1
+        if request_spec is None:
+            return
+        enabled, reason, next_step, session, external_epoch = request_spec
+        self.get_logger().error(
+            'Motion gate request timed out desired=%s reason=%s' % (enabled, reason))
+        self._handle_motion_gate_failure(
+            enabled,
+            'motion_gate_timeout:%s' % reason,
+            next_step,
+            session,
+            external_epoch,
+        )
+        self._dispatch_pending_motion_gate()
 
     def _begin_visual_acquisition(self, reason, scan_completion_action='path_check'):
         """Enable perception after sound turn, with follower actuation paused."""
         if not self.enable_bearing_nav_fallback:
-            self._set_follow_enabled(True, reason, monitor_completion=True)
+            self._set_follow_enabled(
+                True, 'direct_visual_follow:%s' % reason, monitor_completion=True)
             return
         if self.locked_bearing_odom_yaw is None:
             self._exit_bearing_summon('missing_locked_bearing:%s' % reason)
@@ -1864,10 +2637,13 @@ class VoiceSummonCoordinator(Node):
         self.get_logger().info('VOICE_BEARING_EXIT reason=%s' % reason)
 
     def _timer_callback(self):
+        now = time.monotonic()
+        self._check_motion_gate_timeout(now)
+        self._check_external_gate_maintenance(now)
+        self._check_external_follow_timeout(now)
         self._try_send_mode_request()
         if self.mapping_motion_blocked:
             return
-        now = time.monotonic()
         if self.state == 'waiting_stop':
             self._wait_for_stop(now)
             return
@@ -1935,6 +2711,61 @@ class VoiceSummonCoordinator(Node):
             self._check_follow_complete(now)
             return
 
+    def _check_external_follow_timeout(self, now):
+        if (
+                self.external_follow_deadline <= 0.0
+                or now < self.external_follow_deadline):
+            return
+        if self.external_follow_phase in (
+                'closing_gate', 'enabling_mode', 'opening_gate'):
+            epoch = self.external_follow_epoch
+            self._fail_external_follow(
+                epoch, 'transaction_timeout:%s' % self.external_follow_phase)
+
+    def _check_external_gate_maintenance(self, now):
+        if self.external_gate_close_retry_at > 0.0:
+            if self.external_gate_close_retry_epoch != self.external_follow_epoch:
+                self.external_gate_close_retry_at = 0.0
+            elif now >= self.external_gate_close_retry_at:
+                if self.motion_gate_inflight:
+                    self.external_gate_close_retry_at = (
+                        now + self.external_gate_close_retry_s)
+                else:
+                    epoch = self.external_gate_close_retry_epoch
+                    self.external_gate_close_retry_at = 0.0
+                    if not self._request_motion_gate(
+                            False,
+                            'external_gate_close_retry',
+                            next_step='external_stop_complete',
+                            external_epoch=epoch):
+                        self._schedule_external_gate_close_retry(
+                            epoch, 'motion_gate_unavailable:close_retry')
+
+        if self.motion_gate_inflight:
+            return
+        if now - self.external_last_gate_reassert < self.external_gate_reassert_s:
+            return
+        if self.external_follow_phase == 'following':
+            desired_gate = True
+        elif self.external_follow_phase in ('waiting_body', 'blocked_localization'):
+            desired_gate = False
+        else:
+            return
+
+        epoch = self.external_follow_epoch
+        self.external_last_gate_reassert = now
+        if self._request_motion_gate(
+                desired_gate,
+                'external_gate_health_reassert',
+                external_epoch=epoch):
+            return
+        if self.external_follow_phase == 'blocked_localization':
+            self._schedule_external_gate_close_retry(
+                epoch, 'motion_gate_unavailable:health_reassert')
+        else:
+            self._fail_external_follow(
+                epoch, 'motion_gate_unavailable:health_reassert')
+
     def _check_follow_complete(self, now):
         if (
             self.latest_body_id is None
@@ -1996,6 +2827,7 @@ class VoiceSummonCoordinator(Node):
         self.get_logger().info('Body follow disable requested: %s' % reason)
 
     def _request_follow_service(self, enabled, reason):
+        self.mode_desired_generation += 1
         self.desired_follow_enabled = bool(enabled)
         self.desired_follow_reason = str(reason)
         self._try_send_mode_request()
@@ -2036,6 +2868,7 @@ class VoiceSummonCoordinator(Node):
         request.data = self.desired_follow_enabled
         requested_enabled = self.desired_follow_enabled
         requested_reason = self.desired_follow_reason
+        requested_generation = self.mode_desired_generation
         self.mode_request_inflight = True
         self.mode_request_sequence += 1
         request_sequence = self.mode_request_sequence
@@ -2043,11 +2876,13 @@ class VoiceSummonCoordinator(Node):
         future = self.mode_service_client.call_async(request)
         future.add_done_callback(
             lambda completed, enabled=requested_enabled, reason=requested_reason,
-            sequence=request_sequence:
-            self._mode_service_response(completed, enabled, reason, sequence))
+            sequence=request_sequence, generation=requested_generation:
+            self._mode_service_response(
+                completed, enabled, reason, sequence, generation))
 
     def _mode_service_response(
-            self, future, requested_enabled, requested_reason, request_sequence):
+            self, future, requested_enabled, requested_reason, request_sequence,
+            requested_generation):
         if request_sequence != self.mode_request_sequence:
             self.get_logger().warn(
                 'Ignore late body follow mode response sequence=%d current=%d'
@@ -2069,10 +2904,13 @@ class VoiceSummonCoordinator(Node):
                 % (requested_enabled, requested_reason, response.message))
             return
 
+        self.mode_applied_enabled = bool(requested_enabled)
         self.get_logger().info(
             'Body follow mode service applied enabled=%s reason=%s: %s'
             % (requested_enabled, requested_reason, response.message))
-        if self.desired_follow_enabled == requested_enabled:
+        if (
+                self.desired_follow_enabled == requested_enabled
+                and self.mode_desired_generation == requested_generation):
             # This is the newest desired state, so a single acknowledged
             # service call is enough.  Keep retrying only on failure or when
             # another request replaced it while the call was in flight.
@@ -2083,6 +2921,39 @@ class VoiceSummonCoordinator(Node):
                     and requested_reason == 'bearing_visual_observe'
                     and self.state == 'waiting_visual_mode'):
                 self._enter_visual_acquisition_after_mode_ready()
+            elif (
+                    requested_enabled
+                    and requested_reason.startswith('direct_visual_follow:')
+                    and self.state == 'following'):
+                self._request_motion_gate(
+                    True,
+                    'direct_visual_mode_ready',
+                    next_step='direct_visual_follow_ready')
+            elif (
+                    requested_enabled
+                    and requested_reason.startswith('external_observe:')):
+                try:
+                    external_epoch = int(requested_reason.rsplit(':', 1)[1])
+                except (TypeError, ValueError):
+                    external_epoch = -1
+                if (
+                        external_epoch == self.external_follow_epoch
+                        and self.external_follow_desired
+                        and self.external_follow_phase == 'enabling_mode'
+                        and not self.mapping_motion_blocked
+                        and not self.localization_guard_anomaly):
+                    self.external_follow_phase = 'waiting_body'
+                    self.external_follow_deadline = 0.0
+                    self._reset_external_body_confirmation()
+                    self.get_logger().info(
+                        'External body follow observing epoch=%d; wait without '
+                        'deadline for fresh validated body'
+                        % external_epoch)
+            elif (
+                    not requested_enabled
+                    and self.external_follow_phase in (
+                        'disabling', 'blocked_localization')):
+                self._complete_external_stop(self.external_follow_epoch)
             return
         # A newer request arrived while this one was in flight.
         self._try_send_mode_request()

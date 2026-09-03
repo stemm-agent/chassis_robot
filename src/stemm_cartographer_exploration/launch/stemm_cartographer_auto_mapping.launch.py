@@ -193,6 +193,8 @@ def generate_launch_description():
             ('/stemm/save_map', '/stemm_cartographer/save_map'),
             ('/stemm/stop_navigation',
              '/stemm_cartographer/stop_navigation'),
+            ('/stemm/cancel_mapping',
+             '/stemm_cartographer/cancel_mapping'),
             ('/stemm/set_mapping_done',
              '/stemm_cartographer/set_mapping_done'),
             ('/stemm/nav_state', '/stemm_cartographer/nav_state'),
@@ -216,6 +218,9 @@ def generate_launch_description():
             'return_home_tf_stable_sec': 1.5,
             'return_home_max_retries': 3,
             'return_home_retry_delay_sec': 2.0,
+            'mapping_finish_confirm_timeout_sec': 90.0,
+            'return_home_hard_timeout_sec': 180.0,
+            'mapping_timeout_cancel_delay_sec': 5.0,
             'return_home_start_clearance': 0.22,
             'home_known_radius': 0.45,
             'front_stop_distance': 0.42,
@@ -274,6 +279,9 @@ def generate_launch_description():
             'request_timeout_sec': 1.5,
             'retry_delay_sec': 0.5,
             'retry_max_delay_sec': 2.0,
+            # Do not launch RRT until the normalized Cartographer map
+            # can answer a real GetMap request.
+            'rrt_map_service': '/stemm_cartographer/rrt_dynamic_map',
             'use_sim_time': use_sim_time,
         }],
     )
@@ -294,7 +302,7 @@ def generate_launch_description():
         if event.returncode == 0:
             return [
                 lidar,
-                TimerAction(period=0.5, actions=[sensor_preflight]),
+                sensor_preflight,
             ]
         return [
             LogInfo(msg='ERROR: System isolation preflight failed.'),
@@ -316,7 +324,7 @@ def generate_launch_description():
                 occupancy_grid,
                 map_service_adapter,
                 state_saver,
-                TimerAction(period=0.5, actions=[tf_guard]),
+                tf_guard,
             ]
         return [
             LogInfo(msg='ERROR: Mapping odometry session is not ready.'),
@@ -328,7 +336,7 @@ def generate_launch_description():
         if event.returncode == 0:
             return [
                 nav2,
-                TimerAction(period=1.0, actions=[nav2_ready_guard]),
+                nav2_ready_guard,
             ]
         return [
             LogInfo(msg='ERROR: Cartographer map/TF health check failed.'),

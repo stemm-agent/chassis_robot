@@ -3,7 +3,8 @@ from threading import RLock
 
 import pytest
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import PoseStamped, Twist
+from builtin_interfaces.msg import Time
+from geometry_msgs.msg import PoseStamped, Transform, Twist
 from lifecycle_msgs.msg import State
 
 import stemm_cartographer_exploration.cartographer_manager as manager_module
@@ -132,6 +133,25 @@ class FakePublisher:
         self.messages.append(message)
 
 
+class FakeTransformBroadcaster:
+    def __init__(self):
+        self.transforms = []
+
+    def sendTransform(self, transform):
+        self.transforms.append(transform)
+
+
+class FakeClock:
+    def __init__(self, nanoseconds=10_000_000_000):
+        self.nanoseconds = nanoseconds
+
+    def now(self):
+        return SimpleNamespace(
+            nanoseconds=self.nanoseconds,
+            to_msg=Time,
+        )
+
+
 class ManagerHarness(StemmCartographerNav2Manager):
     def __init__(self):
         pass
@@ -149,6 +169,14 @@ def make_manager():
     manager._goal_generation_counter = 0
     manager._pending_goal_generation = None
     manager._active_goal_generation = None
+    manager._return_home_xy_grace_started_at = None
+    manager._return_home_xy_grace_generation = None
+    manager._return_home_xy_cancel_handle = None
+    manager._return_home_xy_cancel_generation = None
+    manager._return_home_xy_cancel_result_future = None
+    manager._return_home_xy_cancel_distance_m = None
+    manager._return_home_xy_finalizing = False
+    manager._last_return_home_xy_wait_log = 0.0
     manager._latest_feedback_distance = None
     manager._distance_source = None
     manager._latest_recovery_count = 0
@@ -201,6 +229,23 @@ def make_manager():
     manager._spin_cancel_reason = None
     manager._spin_transport_fault = False
     manager._cartographer_spin_active = False
+    manager.cartographer_finish_client = FakeClient()
+    manager.cartographer_trajectory_id = 0
+    manager.cartographer_finish_timeout_sec = 10.0
+    manager.cartographer_finish_tf_translation_tolerance_m = 0.01
+    manager.cartographer_finish_tf_rotation_tolerance_rad = 0.01
+    manager._cartographer_finish_future = None
+    manager._cartographer_finish_started_at = 0.0
+    manager._cartographer_trajectory_finished = False
+    manager._cartographer_return_tf_anchor = None
+    manager._cartographer_return_tf_stable_since = 0.0
+    manager._last_cartographer_tf_motion_log = 0.0
+    manager._frozen_return_map_to_odom = None
+    manager._frozen_return_tf_broadcaster = FakeTransformBroadcaster()
+    manager.fake_clock = FakeClock()
+    manager.get_clock = lambda: manager.fake_clock
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: _tf_sample())
     manager._costmap_clear_clients = {}
     manager._costmap_clear_futures = []
     manager.spin_client = FakeSpinClient()
@@ -242,7 +287,30 @@ def make_manager():
     manager.return_home_quiet_sec = 2.0
     manager.return_home_ready_after = 0.0
     manager.return_home_tf_stable_since = 0.0
+    manager.last_return_home_wait_log = 0.0
     manager.return_home_retry_count = 0
+    manager.return_home_max_retries = 3
+    manager.return_home_retry_delay_sec = 2.0
+    manager.return_home_tf_max_age_sec = 0.20
+    manager.return_home_xy_completion_tolerance_m = 0.15
+    manager.return_home_orientation_grace_sec = 6.0
+    manager._map_revision = 0
+    manager._final_map_finish_revision = None
+    manager._final_map_wait_started_at = 0.0
+    manager._mapping_cancel_requested = False
+    manager._mapping_done_requested_at = 0.0
+    manager._mapping_done_requested_at_epoch_ms = 0
+    manager._mapping_done_requested_at_iso = ''
+    manager._return_home_started_at = 0.0
+    manager._return_home_started_at_epoch_ms = 0
+    manager._return_home_started_at_iso = ''
+    manager._mapping_timeout_failure_kind = ''
+    manager._mapping_timeout_failure_reason = ''
+    manager._mapping_timeout_auto_cancel_at = 0.0
+    manager.mapping_finish_confirm_timeout_sec = 90.0
+    manager.return_home_hard_timeout_sec = 180.0
+    manager.mapping_timeout_cancel_delay_sec = 5.0
+    manager._voice_pause_latched = False
     manager.nav_goal_active = False
     manager.goal_send_future = None
     manager.goal_result_future = None
@@ -277,6 +345,10 @@ def make_manager():
     manager.front_stop_distance = 0.42
     manager.front_emergency_distance = 0.25
     manager.global_frame = 'map'
+    manager.base_frame = 'base_footprint'
+    manager.home_x = 0.0
+    manager.home_y = 0.0
+    manager.shutdown_started = False
     manager.started_at = 0.0
     manager.explore_startup_delay_sec = 8.0
     manager.rrt_fallback_wait_sec = 5.0
@@ -310,6 +382,43 @@ def make_pose(x=0.0, y=0.0):
     return pose
 
 
+def make_base_tf(x=0.0, y=0.0, stamp_ns=10_000_000_000):
+    transform = Transform()
+    transform.translation.x = x
+    transform.translation.y = y
+    transform.rotation.w = 1.0
+    return SimpleNamespace(
+        header=SimpleNamespace(
+            frame_id='map',
+            stamp=Time(
+                sec=stamp_ns // 1_000_000_000,
+                nanosec=stamp_ns % 1_000_000_000,
+            ),
+        ),
+        child_frame_id='base_footprint',
+        transform=transform,
+    )
+
+
+def arm_active_home(manager, x=0.0, y=0.0, generation=7):
+    result = FakeFuture()
+    handle = FakeGoalHandle(result_future=result)
+    manager.mapping_done = True
+    manager.auto_explore = False
+    manager.shutdown_after_return_home = True
+    manager.return_home_requested = True
+    manager.pending_home_goal = False
+    manager.nav_goal_active = True
+    manager._active_goal_kind = 'home'
+    manager._active_goal_generation = generation
+    manager.current_goal_handle = handle
+    manager.goal_result_future = result
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: make_base_tf(
+            x, y, manager.fake_clock.nanoseconds))
+    return handle, result
+
+
 class FakeClient:
     def __init__(self):
         self.ready = True
@@ -322,6 +431,7 @@ class FakeClient:
 
     def call_async(self, _request):
         self.call_count += 1
+        self.last_request = _request
         self.last_future = FakeFuture()
         return self.last_future
 
@@ -356,6 +466,17 @@ class LifecycleHarness:
 
     def get_logger(self):
         return self.logger
+
+
+def test_voice_pause_latches_before_navigation_cancellation():
+    manager = make_manager()
+    response = SimpleNamespace()
+
+    manager.stop_navigation_callback(None, response)
+
+    assert response.success
+    assert manager._voice_pause_latched
+    assert manager.navigation_state == 'canceled'
 
 
 def test_pending_lifecycle_future_is_retired_and_retried(monkeypatch):
@@ -682,6 +803,121 @@ def test_mapping_done_stops_recovery_before_home_dispatch():
     assert manager.zero_count == 1
 
 
+def _finish_response(code=0, message='finished'):
+    return SimpleNamespace(
+        status=SimpleNamespace(code=code, message=message))
+
+
+def test_mapping_done_finishes_cartographer_before_home_dispatch(monkeypatch):
+    manager = make_manager()
+    manager._save_final_map_before_return = lambda: (
+        True, 'final map already saved')
+    dispatched = []
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        '_dispatch_pending_home_goal',
+        lambda _self: (dispatched.append('home') or (True, 'home dispatched')),
+    )
+
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=True), SimpleNamespace())
+
+    assert manager.cartographer_finish_client.call_count == 1
+    assert manager.cartographer_finish_client.last_request.trajectory_id == 0
+    assert dispatched == []
+
+    manager.cartographer_finish_client.last_future.resolve(_finish_response())
+    started, message = manager._dispatch_pending_home_goal()
+
+    assert started
+    assert message == 'home dispatched'
+    assert manager._cartographer_trajectory_finished
+    assert dispatched == ['home']
+
+
+def test_finished_cartographer_rebroadcasts_final_map_to_odom():
+    manager = make_manager()
+    sampled = _tf_sample(x=0.31, y=-0.27)
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: sampled)
+    manager._cartographer_finish_future = FakeFuture(
+        done=True, result_value=_finish_response())
+
+    finished, _ = manager._finish_cartographer_trajectory_before_return()
+
+    assert finished
+    assert manager._cartographer_trajectory_finished
+    assert manager._frozen_return_map_to_odom.header.frame_id == 'map'
+    assert manager._frozen_return_map_to_odom.child_frame_id == 'odom_combined'
+    assert manager._frozen_return_map_to_odom.transform.translation.x == 0.31
+    assert manager._frozen_return_map_to_odom.transform.translation.y == -0.27
+    assert len(manager._frozen_return_tf_broadcaster.transforms) == 1
+
+
+def test_cartographer_finish_failure_retries_before_home_dispatch(monkeypatch):
+    manager = make_manager()
+    dispatched = []
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        '_dispatch_pending_home_goal',
+        lambda _self: (dispatched.append('home') or (True, 'home dispatched')),
+    )
+
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=True), SimpleNamespace())
+    manager.cartographer_finish_client.last_future.resolve(
+        _finish_response(2, 'trajectory is not active'))
+    started, message = manager._dispatch_pending_home_goal()
+
+    assert not started
+    assert 'was rejected' in message
+    assert 'retrying return-home 1/3' in message
+    assert manager.navigation_state == 'return_home_retry_recovery'
+    assert manager.mode == 'returning_home'
+    assert manager.pending_home_goal
+    assert dispatched == []
+
+
+def _tf_sample(x=0.0, y=0.0):
+    transform = Transform()
+    transform.translation.x = x
+    transform.translation.y = y
+    transform.rotation.w = 1.0
+    return SimpleNamespace(
+        header=SimpleNamespace(frame_id='map'),
+        child_frame_id='odom_combined',
+        transform=transform)
+
+
+def test_finished_cartographer_requires_final_tf_settle_window(monkeypatch):
+    manager = make_manager()
+    manager.mapping_done = True
+    manager._cartographer_trajectory_finished = True
+    samples = [_tf_sample()]
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: samples[0])
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        '_tf_is_recent',
+        lambda *_args, **_kwargs: True,
+    )
+
+    assert not manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+    now[0] += 1.4
+    assert not manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+    now[0] += 0.2
+    assert manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+
+    samples[0] = _tf_sample(x=0.02)
+    assert not manager._tf_is_stably_recent(
+        'odom_combined', 'map', max_age=0.2, stable_sec=1.5)
+
+
 def test_mapping_done_waits_for_terminal_result_before_home(monkeypatch):
     now = [10.0]
     monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
@@ -728,7 +964,10 @@ def test_home_precheck_recovery_never_uses_exploration_spin(monkeypatch):
         lambda _self: calls.append('inherited_home_recovery'),
     )
     manager = make_manager()
+    manager._save_final_map_before_return = lambda: (
+        True, 'final map already saved')
     manager.mapping_done = True
+    manager._cartographer_trajectory_finished = True
     manager.auto_explore = False
     manager.pending_home_goal = True
     manager._active_goal_kind = 'exploration_manager'
@@ -1172,6 +1411,7 @@ def test_home_goal_uses_default_bt(monkeypatch):
     manager.auto_explore = False
     manager.mapping_done = True
     manager.nav_client = FakeNavClient(FakeGoalHandle())
+    manager.is_current_pose_goal = lambda _pose: True
     pose = PoseStamped()
     pose.header.frame_id = 'map'
 
@@ -1180,6 +1420,556 @@ def test_home_goal_uses_default_bt(monkeypatch):
     sent_goal = manager.nav_client.sent_goals[0][0]
     assert sent_goal.behavior_tree == ''
     assert manager._active_goal_kind == 'home'
+
+
+def test_non_home_current_pose_keeps_local_arrival_shortcut():
+    manager = make_manager()
+    manager.nav_client = FakeNavClient(FakeGoalHandle())
+    manager.is_current_pose_goal = lambda _pose: True
+    pose = PoseStamped()
+    pose.header.frame_id = 'map'
+
+    manager.send_nav_goal(pose, validate_map=False)
+
+    assert manager.nav_client.sent_goals == []
+    assert manager.navigation_state == 'succeeded'
+    assert manager.mode == 'arrived'
+
+
+def test_return_home_position_gate_starts_at_exact_boundary(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    position = [0.150001]
+    handle, _result = arm_active_home(manager)
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: make_base_tf(
+            position[0], 0.0, manager.fake_clock.nanoseconds))
+
+    assert not manager._maybe_complete_return_home_by_position(now[0])
+    assert manager._return_home_xy_grace_started_at is None
+
+    position[0] = 0.15
+    assert not manager._maybe_complete_return_home_by_position(now[0])
+    assert manager._return_home_xy_grace_started_at == pytest.approx(10.0)
+    assert manager._return_home_xy_grace_generation == 7
+    assert handle.cancel_count == 0
+
+
+def test_return_home_position_gate_gives_full_orientation_grace(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    handle, _result = arm_active_home(manager, x=0.10)
+
+    assert not manager._maybe_complete_return_home_by_position(now[0])
+    now[0] = 15.999
+    assert not manager._maybe_complete_return_home_by_position(now[0])
+    assert handle.cancel_count == 0
+
+    now[0] = 16.0
+    assert manager._maybe_complete_return_home_by_position(now[0])
+    assert handle.cancel_count == 1
+    assert manager._stall_cancel_requested
+    assert manager._cancel_context == (
+        manager.RETURN_HOME_ORIENTATION_TIMEOUT_CONTEXT)
+    assert manager.navigation_state == (
+        'return_home_orientation_timeout_canceling')
+    assert manager.zero_count >= 3
+
+    now[0] = 16.2
+    assert not manager._maybe_complete_return_home_by_position(now[0])
+    assert handle.cancel_count == 1
+
+
+def test_return_home_position_gate_waits_for_reentry_after_deadline(
+        monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    position = [0.10]
+    handle, _result = arm_active_home(manager)
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: make_base_tf(
+            position[0], 0.0, manager.fake_clock.nanoseconds))
+
+    manager._maybe_complete_return_home_by_position(now[0])
+    position[0] = 0.20
+    now[0] = 16.0
+    assert not manager._maybe_complete_return_home_by_position(now[0])
+    assert manager._return_home_xy_grace_started_at == pytest.approx(10.0)
+    assert handle.cancel_count == 0
+
+    position[0] = 0.14
+    now[0] = 16.2
+    assert manager._maybe_complete_return_home_by_position(now[0])
+    assert handle.cancel_count == 1
+
+
+@pytest.mark.parametrize('sample_kind', ['stale', 'future', 'nan'])
+def test_return_home_position_gate_rejects_untrusted_pose(sample_kind):
+    manager = make_manager()
+    arm_active_home(manager)
+    if sample_kind == 'stale':
+        sample = make_base_tf(stamp_ns=9_000_000_000)
+    elif sample_kind == 'future':
+        sample = make_base_tf(stamp_ns=10_100_000_000)
+    else:
+        sample = make_base_tf()
+        sample.transform.translation.x = float('nan')
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: sample)
+
+    assert not manager._maybe_complete_return_home_by_position(10.0)
+    assert manager._return_home_xy_grace_started_at is None
+
+
+def test_return_home_position_gate_does_not_cancel_completed_result():
+    manager = make_manager()
+    handle, result = arm_active_home(manager, x=0.10)
+    manager._return_home_xy_grace_started_at = 4.0
+    manager._return_home_xy_grace_generation = 7
+    result._done = True
+
+    assert not manager._maybe_complete_return_home_by_position(10.0)
+    assert handle.cancel_count == 0
+
+
+def test_exact_position_cancel_terminal_completes_normal_shutdown(
+        monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    handle, result = arm_active_home(manager, x=0.10)
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+
+    manager._maybe_complete_return_home_by_position(now[0])
+    now[0] = 16.0
+    manager._maybe_complete_return_home_by_position(now[0])
+    result.resolve(SimpleNamespace(status=GoalStatus.STATUS_CANCELED))
+    manager.goal_result_callback(result)
+
+    assert handle.cancel_count == 1
+    assert shutdown_reasons == [
+        'return-home position reached after orientation grace expired']
+    assert manager._return_home_xy_finalizing
+    assert not manager.nav_goal_active
+    assert manager.current_goal_handle is None
+    assert manager.goal_result_future is None
+    assert manager._active_goal_generation is None
+    assert not manager._stall_cancel_requested
+    assert manager.zero_count >= 4
+
+    manager.goal_result_callback(result)
+    assert shutdown_reasons == [
+        'return-home position reached after orientation grace expired']
+    assert manager._return_home_xy_finalizing
+
+
+def test_position_cancel_uses_fresh_pose_authorized_at_deadline(
+        monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    position = [0.10]
+    _handle, result = arm_active_home(manager)
+    manager.tf_buffer = SimpleNamespace(
+        lookup_transform=lambda *_args: make_base_tf(
+            position[0], 0.0, manager.fake_clock.nanoseconds))
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+
+    manager._maybe_complete_return_home_by_position(now[0])
+    now[0] = 16.0
+    manager._maybe_complete_return_home_by_position(now[0])
+    manager.tf_buffer = SimpleNamespace(lookup_transform=lambda *_args: None)
+    result.resolve(SimpleNamespace(status=GoalStatus.STATUS_CANCELED))
+    manager.goal_result_callback(result)
+
+    assert shutdown_reasons == [
+        'return-home position reached after orientation grace expired']
+    assert manager._return_home_xy_finalizing
+
+
+def test_orientation_timeout_cancel_succeeded_race_uses_native_success(
+        monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    _handle, result = arm_active_home(manager, x=0.10)
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+
+    manager._maybe_complete_return_home_by_position(now[0])
+    now[0] = 16.0
+    manager._maybe_complete_return_home_by_position(now[0])
+    result.resolve(SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED))
+    manager.goal_result_callback(result)
+
+    assert shutdown_reasons == ['return-home goal reached']
+    assert not manager._return_home_xy_finalizing
+
+
+def test_retagged_position_cancel_cannot_be_reported_as_success(monkeypatch):
+    base_calls = []
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        'goal_result_callback',
+        lambda _self, future: base_calls.append(future),
+    )
+    manager = make_manager()
+    _handle, result = arm_active_home(manager, x=0.10)
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+    manager._return_home_xy_grace_started_at = 4.0
+    manager._return_home_xy_grace_generation = 7
+    manager._maybe_complete_return_home_by_position(10.0)
+    manager._retag_monitored_cancel('stop_navigation', False)
+    result.resolve(SimpleNamespace(status=GoalStatus.STATUS_CANCELED))
+
+    manager.goal_result_callback(result)
+
+    assert base_calls == [result]
+    assert shutdown_reasons == []
+    assert not manager._return_home_xy_finalizing
+
+
+def test_timed_out_position_cancel_cannot_be_reported_as_success(monkeypatch):
+    base_calls = []
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        'goal_result_callback',
+        lambda _self, future: base_calls.append(future),
+    )
+    manager = make_manager()
+    _handle, result = arm_active_home(manager, x=0.10)
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+    manager._return_home_xy_grace_started_at = 4.0
+    manager._return_home_xy_grace_generation = 7
+    manager._maybe_complete_return_home_by_position(10.0)
+    manager._cancel_timeout_reported = True
+    manager._goal_transport_fault = True
+    result.resolve(SimpleNamespace(status=GoalStatus.STATUS_CANCELED))
+
+    manager.goal_result_callback(result)
+
+    assert base_calls == [result]
+    assert shutdown_reasons == []
+    assert not manager._return_home_xy_finalizing
+
+
+def test_stale_result_future_cannot_consume_current_home_goal():
+    manager = make_manager()
+    handle, current_result = arm_active_home(manager, x=0.10)
+    stale = FakeFuture(
+        done=True,
+        result_value=SimpleNamespace(status=GoalStatus.STATUS_CANCELED),
+    )
+
+    manager.goal_result_callback(stale)
+
+    assert manager.current_goal_handle is handle
+    assert manager.goal_result_future is current_result
+    assert manager.nav_goal_active
+    assert manager._active_goal_generation == 7
+    assert any('stale navigation result Future' in warning
+               for warning in manager.logger.warnings)
+
+
+@pytest.mark.parametrize('mismatch', ['handle', 'generation', 'aborted'])
+def test_position_cancel_requires_exact_identity_and_canceled_status(
+        monkeypatch, mismatch):
+    base_calls = []
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        'goal_result_callback',
+        lambda _self, future: base_calls.append(future),
+    )
+    manager = make_manager()
+    _handle, result = arm_active_home(manager, x=0.10)
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+    manager._return_home_xy_grace_started_at = 4.0
+    manager._return_home_xy_grace_generation = 7
+    manager._maybe_complete_return_home_by_position(10.0)
+    if mismatch == 'handle':
+        manager.current_goal_handle = FakeGoalHandle()
+    elif mismatch == 'generation':
+        manager._active_goal_generation = 8
+    status = (
+        GoalStatus.STATUS_ABORTED if mismatch == 'aborted'
+        else GoalStatus.STATUS_CANCELED)
+    result.resolve(SimpleNamespace(status=status))
+
+    manager.goal_result_callback(result)
+
+    assert base_calls == [result]
+    assert shutdown_reasons == []
+    assert not manager._return_home_xy_finalizing
+
+
+@pytest.mark.parametrize('inhibitor', ['shutdown', 'mapping_cancel'])
+def test_terminal_session_state_keeps_zero_guard_armed(inhibitor):
+    manager = make_manager()
+    manager._return_home_xy_finalizing = True
+    if inhibitor == 'shutdown':
+        manager.shutdown_started = True
+    else:
+        manager._mapping_cancel_requested = True
+    manager._reset_return_home_xy_completion()
+
+    assert not manager._return_home_xy_finalizing
+    assert manager._motion_is_inhibited()
+    manager._cancel_zero_guard_callback()
+    assert manager.zero_count == 1
+
+
+def test_mapping_exit_timeout_keeps_zero_guard_armed():
+    manager = make_manager()
+    manager._write_session_status = lambda: None
+    manager.mapping_done = True
+    manager.auto_explore = False
+    handle = FakeGoalHandle()
+    manager.current_goal_handle = handle
+    manager.nav_goal_active = True
+
+    manager._report_mapping_exit_timeout(
+        'return_home_timeout', 'return-home deadline expired')
+
+    assert manager._mapping_timeout_failure_kind == 'return_home_timeout'
+    assert handle.cancel_count == 1
+    assert manager._motion_is_inhibited()
+    zero_count = manager.zero_count
+    manager._cancel_zero_guard_callback()
+    assert manager.zero_count == zero_count + 1
+
+    start_response = SimpleNamespace()
+    manager.start_mapping_callback(SimpleNamespace(), start_response)
+    done_false_response = SimpleNamespace()
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=False), done_false_response)
+    done_true_response = SimpleNamespace()
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=True), done_true_response)
+    manager.nav_client = FakeNavClient(FakeGoalHandle())
+    manager.send_nav_goal(make_pose(1.0, 0.0))
+
+    assert not start_response.success
+    assert not done_false_response.success
+    assert not done_true_response.success
+    assert manager._mapping_timeout_failure_kind == 'return_home_timeout'
+    assert manager.mapping_done
+    assert not manager.auto_explore
+    assert manager._motion_is_inhibited()
+    assert manager.nav_client.sent_goals == []
+
+
+def test_safety_timer_drives_orientation_grace_cancel(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager,
+        '_safety_stop_callback_impl',
+        lambda _self: None,
+    )
+    manager = make_manager()
+    handle, _result = arm_active_home(manager, x=0.10)
+
+    manager._safety_stop_callback_impl()
+    assert handle.cancel_count == 0
+    now[0] = 16.0
+    manager._safety_stop_callback_impl()
+
+    assert handle.cancel_count == 1
+    assert manager._stall_cancel_requested
+    assert manager._cancel_context == (
+        manager.RETURN_HOME_ORIENTATION_TIMEOUT_CONTEXT)
+
+
+def test_ready_result_at_cancel_deadline_wins_over_transport_timeout(
+        monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    _handle, result = arm_active_home(manager, x=0.10)
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+    manager._return_home_xy_grace_started_at = 4.0
+    manager._return_home_xy_grace_generation = 7
+    manager._maybe_complete_return_home_by_position(now[0])
+    result._result_value = SimpleNamespace(
+        status=GoalStatus.STATUS_CANCELED)
+    result._done = True
+
+    now[0] = 15.0
+    manager._monitor_stall_cancel(now[0])
+
+    assert not manager._cancel_timeout_reported
+    assert not manager._goal_transport_fault
+    assert shutdown_reasons == [
+        'return-home position reached after orientation grace expired']
+    assert manager._return_home_xy_finalizing
+
+
+@pytest.mark.parametrize('terminal_latch', ['shutdown', 'finalizing'])
+@pytest.mark.parametrize('requested_done', [False, True])
+def test_mapping_done_requests_cannot_reopen_finalizing_session(
+        requested_done, terminal_latch):
+    manager = make_manager()
+    manager.mapping_done = True
+    manager.auto_explore = False
+    manager.shutdown_started = terminal_latch == 'shutdown'
+    manager._return_home_xy_finalizing = terminal_latch == 'finalizing'
+    manager._dispatch_pending_home_goal = lambda: pytest.fail(
+        'finalizing session must not dispatch another home goal')
+    manager._kill_rrt_nodes = lambda: pytest.fail(
+        'finalizing session must not restart mapping completion')
+    response = SimpleNamespace()
+
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=requested_done), response)
+
+    assert response.success is requested_done
+    assert manager.mapping_done
+    assert not manager.auto_explore
+    assert manager.shutdown_started is (terminal_latch == 'shutdown')
+    assert manager._return_home_xy_finalizing is (
+        terminal_latch == 'finalizing')
+    assert manager._motion_is_inhibited()
+
+
+@pytest.mark.parametrize('terminal_latch', ['shutdown', 'finalizing'])
+def test_start_mapping_cannot_reopen_finalizing_session(terminal_latch):
+    manager = make_manager()
+    manager.mapping_done = True
+    manager.auto_explore = False
+    manager.shutdown_started = terminal_latch == 'shutdown'
+    manager._return_home_xy_finalizing = terminal_latch == 'finalizing'
+    response = SimpleNamespace()
+
+    manager.start_mapping_callback(SimpleNamespace(), response)
+
+    assert not response.success
+    assert manager.mapping_done
+    assert not manager.auto_explore
+    assert manager.shutdown_started is (terminal_latch == 'shutdown')
+    assert manager._return_home_xy_finalizing is (
+        terminal_latch == 'finalizing')
+    assert manager._motion_is_inhibited()
+
+
+def test_mapping_cancel_remains_idempotent_after_shutdown_starts():
+    manager = make_manager()
+    manager._mapping_cancel_requested = True
+    manager.shutdown_started = True
+    response = SimpleNamespace()
+
+    manager.cancel_mapping_callback(SimpleNamespace(), response)
+
+    assert response.success
+    assert manager._mapping_cancel_requested
+    assert manager.shutdown_started
+    assert manager._motion_is_inhibited()
+
+
+@pytest.mark.parametrize('requested_done', [False, True])
+def test_mapping_done_cannot_override_cancel_shutdown(requested_done):
+    manager = make_manager()
+    manager._mapping_cancel_requested = True
+    manager.shutdown_started = True
+    manager.mapping_done = True
+    manager.auto_explore = False
+    response = SimpleNamespace()
+
+    manager.set_mapping_done_callback(
+        SimpleNamespace(data=requested_done), response)
+
+    assert not response.success
+    assert manager._mapping_cancel_requested
+    assert manager.shutdown_started
+    assert manager.mapping_done
+    assert not manager.auto_explore
+    assert manager._motion_is_inhibited()
+
+
+def test_orientation_grace_defers_return_home_hard_timeout(monkeypatch):
+    now = [181.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    handle, _result = arm_active_home(manager, x=0.10)
+    manager._return_home_started_at = 1.0
+    manager._return_home_xy_grace_started_at = 179.0
+    manager._return_home_xy_grace_generation = 7
+    reports = []
+    manager._report_mapping_exit_timeout = (
+        lambda kind, reason: reports.append((kind, reason)))
+
+    manager._maybe_enforce_mapping_exit_timeout()
+
+    assert reports == []
+    assert handle.cancel_count == 0
+
+
+def test_expired_grace_outside_xy_does_not_mask_hard_timeout(monkeypatch):
+    now = [185.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    handle, _result = arm_active_home(manager, x=0.20)
+    manager._return_home_started_at = 1.0
+    manager._return_home_xy_grace_started_at = 179.0
+    manager._return_home_xy_grace_generation = 7
+    reports = []
+    manager._report_mapping_exit_timeout = (
+        lambda kind, reason: reports.append((kind, reason)))
+
+    manager._maybe_enforce_mapping_exit_timeout()
+
+    assert [kind for kind, _reason in reports] == ['return_home_timeout']
+    assert handle.cancel_count == 0
+
+
+def test_position_cancel_handshake_defers_return_home_hard_timeout(
+        monkeypatch):
+    now = [185.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    handle, _result = arm_active_home(manager, x=0.10)
+    manager._return_home_started_at = 1.0
+    manager._return_home_xy_grace_started_at = 179.0
+    manager._return_home_xy_grace_generation = 7
+    reports = []
+    manager._report_mapping_exit_timeout = (
+        lambda kind, reason: reports.append((kind, reason)))
+
+    manager._maybe_enforce_mapping_exit_timeout()
+
+    assert reports == []
+    assert handle.cancel_count == 1
+    assert manager._stall_cancel_requested
+    assert manager._return_home_xy_defers_hard_timeout(now[0])
+
+
+def test_native_success_at_hard_timeout_wins_with_unavailable_tf(
+        monkeypatch):
+    now = [181.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    _handle, result = arm_active_home(manager, x=0.10)
+    manager._return_home_started_at = 1.0
+    manager.tf_buffer = SimpleNamespace(lookup_transform=lambda *_args: None)
+    shutdown_reasons = []
+    manager.request_launch_shutdown = shutdown_reasons.append
+    result._result_value = SimpleNamespace(
+        status=GoalStatus.STATUS_SUCCEEDED)
+    result._done = True
+
+    manager._maybe_enforce_mapping_exit_timeout()
+
+    assert shutdown_reasons == ['return-home goal reached']
+    assert manager._mapping_timeout_failure_kind == ''
+    assert not manager._mapping_cancel_requested
 
 
 def test_acceptance_timeout_late_goal_is_canceled_exactly(monkeypatch):
@@ -1677,6 +2467,7 @@ def test_success_with_static_front_block_never_auto_starts_recovery(
         done=True,
         result_value=SimpleNamespace(status=GoalStatus.STATUS_SUCCEEDED),
     )
+    manager.goal_result_future = result
 
     manager.goal_result_callback(result)
     for _ in range(300):
@@ -2222,3 +3013,36 @@ def test_rrt_projection_rejects_area_without_known_free_cell():
     assert projected is None
     assert not changed
     assert 'no safe known-free projection' in error
+
+def test_return_home_setup_failures_are_retried_before_manual_takeover(
+        monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    manager.return_home_max_retries = 3
+    manager.return_home_retry_delay_sec = 2.0
+    manager._final_map_finish_revision = None
+    manager._final_map_wait_started_at = 0.0
+
+    started, message = manager._fail_return_home_before_dispatch(
+        'temporary Cartographer TF gap')
+
+    assert not started
+    assert 'retrying return-home 1/3' in message
+    assert manager.return_home_retry_count == 1
+    assert manager.pending_home_goal
+    assert not manager.return_home_requested
+    assert manager.mode == 'returning_home'
+    assert manager.navigation_state == 'return_home_retry_recovery'
+    assert manager.return_home_ready_after == pytest.approx(102.0)
+
+    manager.return_home_retry_count = manager.return_home_max_retries
+    started, message = manager._fail_return_home_before_dispatch(
+        'persistent Cartographer TF gap')
+
+    assert not started
+    assert 'failed after 3 retries' in message
+    assert manager.return_home_retry_count == 4
+    assert not manager.pending_home_goal
+    assert manager.mode == 'stopped'
+    assert manager.navigation_state == 'return_home_failed_waiting_manual'

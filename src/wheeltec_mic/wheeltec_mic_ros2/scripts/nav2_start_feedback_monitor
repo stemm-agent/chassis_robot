@@ -1,97 +1,802 @@
 #!/usr/bin/env python3
+import json
+import math
 import os
 import time
 
 import rclpy
+from lifecycle_msgs.msg import State
+from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
+from rclpy.duration import Duration
 from rclpy.node import Node
-from std_msgs.msg import String
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time as RosTime
+from std_msgs.msg import Bool, String
+from tf2_ros import Buffer, TransformException, TransformListener
+
+
+DEFAULT_NAVIGATION_START_TIMEOUT_SEC = 120.0
+
+
+def navigation_start_timeout_reached(elapsed_sec, timeout_sec):
+    return elapsed_sec >= timeout_sec
+
+
+def parse_navigation_start_event(raw_payload):
+    payload = json.loads(raw_payload)
+    if not isinstance(payload, dict):
+        raise ValueError('navigation start event must be an object')
+    if int(payload.get('schemaVersion')) != 2:
+        raise ValueError('unsupported navigation start event schema')
+    event = str(payload.get('event') or '')
+    if event not in {
+        'accepted', 'rejected', 'cancelled', 'launch_exited',
+        'completed', 'health_failed',
+    }:
+        raise ValueError('unsupported navigation start event: %s' % event)
+    generation = int(payload.get('generation'))
+    bridge_pid = int(payload.get('bridgePid'))
+    published_at_epoch_ms = int(payload.get('publishedAtEpochMs'))
+    started_at_epoch_ms = int(payload.get('startedAtEpochMs'))
+    published_at_monotonic_ms = int(payload.get('publishedAtMonotonicMs'))
+    started_at_monotonic_ms = int(payload.get('startedAtMonotonicMs'))
+    if (
+        generation <= 0
+        or bridge_pid <= 0
+        or published_at_epoch_ms <= 0
+        or started_at_epoch_ms <= 0
+        or started_at_epoch_ms > published_at_epoch_ms
+        or published_at_monotonic_ms <= 0
+        or started_at_monotonic_ms <= 0
+        or started_at_monotonic_ms > published_at_monotonic_ms
+    ):
+        raise ValueError('navigation start event identity is invalid')
+    return {
+        'event': event,
+        'generation': generation,
+        'bridgePid': bridge_pid,
+        'publishedAtEpochMs': published_at_epoch_ms,
+        'startedAtEpochMs': started_at_epoch_ms,
+        'publishedAtMonotonicMs': published_at_monotonic_ms,
+        'startedAtMonotonicMs': started_at_monotonic_ms,
+        'detail': str(payload.get('detail') or ''),
+    }
 
 
 class Nav2StartFeedbackMonitor(Node):
     def __init__(self):
         super().__init__('nav2_start_feedback_monitor')
         self.declare_parameter('start_commands', ['开启导航'])
+        self.declare_parameter('cancel_commands', ['取消导航'])
         self.declare_parameter('started_audio', '/navigation_started.wav')
+        self.declare_parameter('failed_audio', '/stop.wav')
         self.declare_parameter('fallback_audio', '/OK.wav')
         self.declare_parameter('audio_path', '')
-        self.declare_parameter('monitor_timeout_sec', 60.0)
+        self.declare_parameter('status_topic', 'nav2_start_status')
+        self.declare_parameter(
+            'start_event_topic', '/voice_navigation_start_event')
+        self.declare_parameter(
+            'start_result_topic', '/voice_navigation_start_result')
+        self.declare_parameter('start_event_max_age_sec', 10.0)
+        self.declare_parameter(
+            'monitor_timeout_sec', DEFAULT_NAVIGATION_START_TIMEOUT_SEC)
         self.declare_parameter('check_period_sec', 0.5)
+        self.declare_parameter('health_stable_sec', 1.0)
+        self.declare_parameter('health_stable_checks', 3)
+        self.declare_parameter('lifecycle_poll_period_sec', 0.75)
+        self.declare_parameter('lifecycle_state_max_age_sec', 2.5)
+        self.declare_parameter('guard_topic', '/amcl_tf_guard/anomaly')
+        self.declare_parameter('guard_max_age_sec', 1.0)
+        self.declare_parameter(
+            'interlock_ready_topic', '/nav2_guard_interlock/ready')
+        self.declare_parameter(
+            'interlock_blocked_topic', '/nav2_guard_interlock/blocked')
+        self.declare_parameter('interlock_max_age_sec', 2.0)
+        self.declare_parameter('global_frame', 'map')
+        self.declare_parameter('odom_frame', 'odom_combined')
+        self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('tf_max_age_sec', 0.5)
+        self.declare_parameter('tf_future_tolerance_sec', 0.25)
+        self.declare_parameter('tf_continuity_hold_sec', 1.5)
+        self.declare_parameter('tf_continuity_min_samples', 4)
+        self.declare_parameter('tf_continuity_max_gap_sec', 1.0)
+        self.declare_parameter('map_odom_max_step_translation', 0.10)
+        self.declare_parameter('map_odom_max_step_yaw', 0.10)
+        self.declare_parameter('base_max_linear_speed', 0.8)
+        self.declare_parameter('base_max_angular_speed', 2.5)
+        self.declare_parameter('base_step_translation_margin', 0.10)
+        self.declare_parameter('base_step_yaw_margin', 0.12)
+        # Keep the legacy parameter name so deployed launch/config overrides
+        # remain valid; these names are now checked through lifecycle get_state.
         self.declare_parameter('required_nav2_nodes', [
-            'bt_navigator',
+            'map_server',
+            'amcl',
             'controller_server',
+            'smoother_server',
             'planner_server',
+            'behavior_server',
+            'bt_navigator',
+            'waypoint_follower',
         ])
 
         self.start_commands = set(self.get_parameter('start_commands').value)
-        self.started_audio = self.get_parameter('started_audio').value
-        self.fallback_audio = self.get_parameter('fallback_audio').value
-        self.audio_path = self.get_parameter('audio_path').value
-        self.monitor_timeout_sec = float(self.get_parameter('monitor_timeout_sec').value)
-        self.check_period_sec = float(self.get_parameter('check_period_sec').value)
-        self.required_nav2_nodes = set(self.get_parameter('required_nav2_nodes').value)
+        self.cancel_commands = set(self.get_parameter('cancel_commands').value)
+        self.started_audio = str(self.get_parameter('started_audio').value)
+        self.failed_audio = str(self.get_parameter('failed_audio').value)
+        self.fallback_audio = str(self.get_parameter('fallback_audio').value)
+        self.audio_path = str(self.get_parameter('audio_path').value)
+        self.status_topic = str(self.get_parameter('status_topic').value)
+        self.start_event_topic = str(
+            self.get_parameter('start_event_topic').value)
+        self.start_result_topic = str(
+            self.get_parameter('start_result_topic').value)
+        self.start_event_max_age_sec = max(
+            1.0, float(self.get_parameter('start_event_max_age_sec').value))
+        self.monitor_timeout_sec = min(
+            DEFAULT_NAVIGATION_START_TIMEOUT_SEC,
+            max(
+                1.0,
+                float(self.get_parameter('monitor_timeout_sec').value),
+            ),
+        )
+        self.check_period_sec = max(
+            0.1, float(self.get_parameter('check_period_sec').value))
+        self.health_stable_sec = max(
+            0.0, float(self.get_parameter('health_stable_sec').value))
+        self.health_stable_checks = max(
+            1, int(self.get_parameter('health_stable_checks').value))
+        self.lifecycle_poll_period_sec = max(
+            0.1, float(self.get_parameter('lifecycle_poll_period_sec').value))
+        self.lifecycle_state_max_age_sec = max(
+            self.lifecycle_poll_period_sec,
+            float(self.get_parameter('lifecycle_state_max_age_sec').value),
+        )
+        self.guard_topic = str(self.get_parameter('guard_topic').value)
+        self.guard_max_age_sec = max(
+            0.1, float(self.get_parameter('guard_max_age_sec').value))
+        self.interlock_ready_topic = str(
+            self.get_parameter('interlock_ready_topic').value)
+        self.interlock_blocked_topic = str(
+            self.get_parameter('interlock_blocked_topic').value)
+        self.interlock_max_age_sec = max(
+            0.1, float(self.get_parameter('interlock_max_age_sec').value))
+        self.global_frame = str(self.get_parameter('global_frame').value)
+        self.odom_frame = str(self.get_parameter('odom_frame').value)
+        self.base_frame = str(self.get_parameter('base_frame').value)
+        self.tf_max_age_sec = max(
+            0.05, float(self.get_parameter('tf_max_age_sec').value))
+        self.tf_future_tolerance_sec = max(
+            0.0, float(self.get_parameter('tf_future_tolerance_sec').value))
+        self.tf_continuity_hold_sec = max(
+            0.0, float(self.get_parameter('tf_continuity_hold_sec').value))
+        self.tf_continuity_min_samples = max(
+            2, int(self.get_parameter('tf_continuity_min_samples').value))
+        self.tf_continuity_max_gap_sec = max(
+            self.check_period_sec,
+            float(self.get_parameter('tf_continuity_max_gap_sec').value),
+        )
+        self.map_odom_max_step_translation = max(
+            0.0,
+            float(self.get_parameter('map_odom_max_step_translation').value),
+        )
+        self.map_odom_max_step_yaw = max(
+            0.0, float(self.get_parameter('map_odom_max_step_yaw').value))
+        self.base_max_linear_speed = max(
+            0.0, float(self.get_parameter('base_max_linear_speed').value))
+        self.base_max_angular_speed = max(
+            0.0, float(self.get_parameter('base_max_angular_speed').value))
+        self.base_step_translation_margin = max(
+            0.0,
+            float(self.get_parameter('base_step_translation_margin').value),
+        )
+        self.base_step_yaw_margin = max(
+            0.0, float(self.get_parameter('base_step_yaw_margin').value))
+        self.required_lifecycle_nodes = tuple(dict.fromkeys(
+            self._normalize_node_name(name)
+            for name in self.get_parameter('required_nav2_nodes').value
+            if self._normalize_node_name(name)
+        ))
 
+        latched_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.feedback_pub = self.create_publisher(String, 'feedback_audio', 10)
-        self.voice_sub = self.create_subscription(String, 'voice_words', self._voice_words_callback, 10)
-        self.nav_to_pose_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self.status_pub = self.create_publisher(
+            String, self.status_topic, latched_qos)
+        self.result_pub = self.create_publisher(
+            String, self.start_result_topic, 10)
+        self.start_event_sub = self.create_subscription(
+            String,
+            self.start_event_topic,
+            self._navigation_start_event_callback,
+            latched_qos,
+        )
+        self.guard_sub = self.create_subscription(
+            Bool, self.guard_topic, self._guard_callback, latched_qos)
+        self.interlock_ready_sub = self.create_subscription(
+            Bool,
+            self.interlock_ready_topic,
+            self._interlock_ready_callback,
+            latched_qos,
+        )
+        self.interlock_blocked_sub = self.create_subscription(
+            Bool,
+            self.interlock_blocked_topic,
+            self._interlock_blocked_callback,
+            latched_qos,
+        )
+        self.mapping_block_sub = self.create_subscription(
+            Bool,
+            '/stemm_cartographer/motion_blocked',
+            self._mapping_motion_blocked_callback,
+            10,
+        )
+        self.nav_to_pose_client = ActionClient(
+            self, NavigateToPose, 'navigate_to_pose')
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.lifecycle_clients = {
+            name: self.create_client(GetState, '/%s/get_state' % name)
+            for name in self.required_lifecycle_nodes
+        }
 
         self._watching = False
-        self._deadline = 0.0
-        self._timer = self.create_timer(self.check_period_sec, self._check_nav2)
-        self.get_logger().info('nav2_start_feedback_monitor ready: commands=%s audio=%s' % (
-            sorted(self.start_commands), self.started_audio))
+        self._watch_generation = 0
+        self._bridge_pid = 0
+        self._watch_started_at = 0.0
+        self._last_wait_log_at = 0.0
+        self._last_blockers = []
+        self._all_healthy_since = None
+        self._all_healthy_checks = 0
+        self._guard_anomaly = None
+        self._guard_received_at = 0.0
+        self._interlock_ready = None
+        self._interlock_ready_received_at = 0.0
+        self._interlock_blocked = None
+        self._interlock_blocked_received_at = 0.0
+        self._mapping_motion_blocked = False
+        self._lifecycle_futures = {}
+        self._lifecycle_states = {}
+        self._lifecycle_last_request_at = {
+            name: 0.0 for name in self.required_lifecycle_nodes
+        }
+        self._reset_tf_continuity()
 
-    def _voice_words_callback(self, msg):
-        command = msg.data.strip()
-        if command not in self.start_commands:
+        self._timer = self.create_timer(
+            self.check_period_sec, self._check_nav2)
+        self.get_logger().info(
+            'nav2_start_feedback_monitor ready: commands=%s lifecycle=%s '
+            'guard=%s interlock=%s|%s TF=%s->%s->%s audio=%s'
+            % (
+                sorted(self.start_commands),
+                list(self.required_lifecycle_nodes),
+                self.guard_topic,
+                self.interlock_ready_topic,
+                self.interlock_blocked_topic,
+                self.global_frame,
+                self.odom_frame,
+                self.base_frame,
+                self.started_audio,
+            )
+        )
+
+    @staticmethod
+    def _normalize_node_name(name):
+        return str(name).strip().strip('/')
+
+    def _navigation_start_event_callback(self, msg):
+        try:
+            event = parse_navigation_start_event(msg.data)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.get_logger().warn(
+                'Ignore malformed navigation start event: %s' % exc)
             return
+        age_sec = (
+            int(time.monotonic() * 1000)
+            - event['publishedAtMonotonicMs']
+        ) / 1000.0
+        event_name = event['event']
+        if (
+            age_sec < -1.0
+            or (
+                event_name != 'accepted'
+                and age_sec > self.start_event_max_age_sec
+            )
+        ):
+            self.get_logger().warn(
+                'Ignore stale navigation start event generation=%d age=%.3fs'
+                % (event['generation'], age_sec))
+            return
+        if event['bridgePid'] != self._bridge_pid:
+            self._bridge_pid = event['bridgePid']
+            self._watch_generation = 0
+            self._watching = False
+        generation = event['generation']
+        detail = event['detail']
+
+        if event_name == 'accepted':
+            if generation <= self._watch_generation:
+                return
+            if self._mapping_motion_blocked:
+                self._watch_generation = generation
+                self._fail_startup(
+                    'Cartographer mapping owns motion after launch acceptance')
+                return
+            self._begin_health_watch(
+                generation, event['startedAtMonotonicMs'])
+            return
+        if generation < self._watch_generation:
+            return
+        if event_name == 'rejected':
+            if not self._watching:
+                self._watch_generation = generation
+            self._publish_status(
+                'rejected generation=%d: %s' % (generation, detail))
+            return
+        if generation != self._watch_generation:
+            return
+        if event_name in {'completed', 'health_failed'}:
+            self._watching = False
+            return
+        if event_name == 'cancelled':
+            self._watching = False
+            self._publish_status(
+                'cancelled generation=%d: %s' % (generation, detail))
+            return
+        if event_name == 'launch_exited' and self._watching:
+            self._fail_startup(detail or 'navigation launch exited before ready')
+
+    def _begin_health_watch(self, generation, started_at_monotonic_ms):
+        self._watch_generation = generation
         self._watching = True
-        self._deadline = time.monotonic() + self.monitor_timeout_sec
-        self.get_logger().info('Start monitoring Nav2 startup after voice command: %s' % command)
+        self._watch_started_at = started_at_monotonic_ms / 1000.0
+        self._last_wait_log_at = 0.0
+        self._last_blockers = []
+        self._all_healthy_since = None
+        self._all_healthy_checks = 0
+        self._lifecycle_states.clear()
+        for name in self.required_lifecycle_nodes:
+            self._lifecycle_last_request_at[name] = 0.0
+        self._reset_tf_continuity()
+        try:
+            self.tf_buffer.clear()
+        except AttributeError:
+            pass
+        self._publish_status(
+            'waiting generation=%d: Nav2 startup health checks started'
+            % generation)
+        self.get_logger().info(
+            'Start monitoring accepted Nav2 generation %d.' % generation)
+
+    def _fail_startup(self, detail):
+        self._watching = False
+        message = 'failed generation=%d: %s' % (
+            self._watch_generation, detail)
+        self._publish_status(message)
+        self._publish_failure_feedback()
+        self._publish_terminal_result('failed', detail)
+        self.get_logger().error('Nav2 startup health gate %s' % message)
+
+    def _guard_callback(self, msg):
+        self._guard_anomaly = bool(msg.data)
+        self._guard_received_at = time.monotonic()
+
+    def _interlock_ready_callback(self, msg):
+        self._interlock_ready = bool(msg.data)
+        self._interlock_ready_received_at = time.monotonic()
+
+    def _interlock_blocked_callback(self, msg):
+        self._interlock_blocked = bool(msg.data)
+        self._interlock_blocked_received_at = time.monotonic()
+
+    def _mapping_motion_blocked_callback(self, msg):
+        self._mapping_motion_blocked = bool(msg.data)
+        if self._mapping_motion_blocked and self._watching:
+            detail = 'failed: Cartographer mapping gate became active during startup'
+            self._fail_startup(detail)
 
     def _check_nav2(self):
         if not self._watching:
             return
 
-        if self._nav2_online():
-            self._watching = False
-            self._publish_feedback(self._select_audio())
-            self.get_logger().info('Nav2 is online; navigation-start feedback published.')
+        now = time.monotonic()
+        self._refresh_lifecycle_states(now)
+        blockers = self._collect_health_blockers(now)
+
+        if navigation_start_timeout_reached(
+            now - self._watch_started_at, self.monitor_timeout_sec
+        ):
+            detail = 'timeout after %.1fs: %s' % (
+                self.monitor_timeout_sec, '; '.join(blockers))
+            self._fail_startup(detail)
             return
 
-        if time.monotonic() > self._deadline:
-            self._watching = False
-            self.get_logger().warn('Nav2 did not become online within %.1fs after start command.' %
-                                   self.monitor_timeout_sec)
+        if not blockers:
+            if self._all_healthy_since is None:
+                self._all_healthy_since = now
+                self._all_healthy_checks = 1
+            else:
+                self._all_healthy_checks += 1
+            stable_for = now - self._all_healthy_since
+            if (
+                stable_for >= self.health_stable_sec
+                and self._all_healthy_checks >= self.health_stable_checks
+            ):
+                self._watching = False
+                self._publish_feedback(self._select_started_audio())
+                self._publish_status(
+                    'ready: lifecycle active, guard healthy, interlock ready, '
+                    'TF fresh and continuous')
+                self._publish_terminal_result(
+                    'ready',
+                    'lifecycle active, guard healthy, interlock ready, '
+                    'TF fresh and continuous',
+                )
+                self.get_logger().info(
+                    'Nav2 startup health gate passed after %.3fs: all lifecycle '
+                    'nodes active, guard false, motion interlock ready, and TF '
+                    '%s->%s->%s fresh/continuous.'
+                    % (
+                        now - self._watch_started_at,
+                        self.global_frame,
+                        self.odom_frame,
+                        self.base_frame,
+                    )
+                )
+                return
+            blockers = [
+                'all checks healthy; stability window %.2f/%.2fs (%d/%d checks)'
+                % (
+                    stable_for,
+                    self.health_stable_sec,
+                    self._all_healthy_checks,
+                    self.health_stable_checks,
+                )
+            ]
+        else:
+            self._all_healthy_since = None
+            self._all_healthy_checks = 0
 
-    def _nav2_online(self):
-        if not self.nav_to_pose_client.wait_for_server(timeout_sec=0.05):
-            return False
+        self._last_blockers = blockers
+        if self._last_wait_log_at == 0.0 or now - self._last_wait_log_at >= 5.0:
+            self._last_wait_log_at = now
+            detail = 'waiting: %s' % '; '.join(blockers)
+            self._publish_status(detail)
+            self.get_logger().info('Nav2 startup health gate %s' % detail)
 
-        active_nodes = {name.lstrip('/') for name in self.get_node_names()}
-        missing_nodes = self.required_nav2_nodes - active_nodes
-        if missing_nodes:
-            self.get_logger().debug('Nav2 action server exists, waiting for nodes: %s' % sorted(missing_nodes))
-            return False
-        return True
+    def _collect_health_blockers(self, now):
+        blockers = []
+        if not self.nav_to_pose_client.server_is_ready():
+            blockers.append('navigate_to_pose action server unavailable')
+        blockers.extend(self._lifecycle_blockers(now))
 
-    def _select_audio(self):
+        if self._guard_received_at < self._watch_started_at:
+            blockers.append(
+                'no guard status received after this start command')
+        else:
+            guard_age = now - self._guard_received_at
+            if guard_age > self.guard_max_age_sec:
+                blockers.append('guard status stale (%.3fs)' % guard_age)
+            elif self._guard_anomaly is not False:
+                blockers.append('guard anomaly is asserted')
+
+        blockers.extend(self._interlock_blockers(now))
+
+        tf_ready, tf_blocker = self._tf_chain_ready(now)
+        if not tf_ready:
+            blockers.append(tf_blocker)
+        return blockers
+
+    def _interlock_blockers(self, now):
+        try:
+            ready_publishers = self.count_publishers(
+                self.interlock_ready_topic)
+            blocked_publishers = self.count_publishers(
+                self.interlock_blocked_topic)
+        except Exception as exc:
+            return ['failed to inspect interlock publishers: %s' % exc]
+
+        if ready_publishers > 0:
+            if self._interlock_ready_received_at < self._watch_started_at:
+                return ['no interlock ready status received after this start command']
+            age = now - self._interlock_ready_received_at
+            if age > self.interlock_max_age_sec:
+                return ['interlock ready status stale (%.3fs)' % age]
+            if self._interlock_ready is not True:
+                return ['navigation motion interlock is not ready']
+            return []
+
+        if blocked_publishers > 0:
+            if self._interlock_blocked_received_at < self._watch_started_at:
+                return ['no interlock blocked status received after this start command']
+            age = now - self._interlock_blocked_received_at
+            if age > self.interlock_max_age_sec:
+                return ['interlock blocked status stale (%.3fs)' % age]
+            if self._interlock_blocked is not False:
+                return ['navigation motion interlock is blocked']
+            return []
+
+        return [
+            'navigation motion interlock publisher unavailable (%s or %s)'
+            % (self.interlock_ready_topic, self.interlock_blocked_topic)
+        ]
+
+    def _refresh_lifecycle_states(self, now):
+        generation = self._watch_generation
+        for name, client in self.lifecycle_clients.items():
+            pending = self._lifecycle_futures.get(name)
+            if pending is not None and not pending.done():
+                continue
+            if pending is not None:
+                self._lifecycle_futures.pop(name, None)
+            if (
+                now - self._lifecycle_last_request_at[name]
+                < self.lifecycle_poll_period_sec
+            ):
+                continue
+            self._lifecycle_last_request_at[name] = now
+            if not client.service_is_ready():
+                continue
+            future = client.call_async(GetState.Request())
+            self._lifecycle_futures[name] = future
+            future.add_done_callback(
+                lambda completed, node_name=name, request_generation=generation:
+                self._lifecycle_state_response(
+                    node_name, request_generation, completed))
+
+    def _lifecycle_state_response(self, name, generation, future):
+        if self._lifecycle_futures.get(name) is future:
+            self._lifecycle_futures.pop(name, None)
+        if generation != self._watch_generation or not self._watching:
+            return
+        try:
+            state = future.result().current_state
+        except Exception as exc:
+            self.get_logger().warn(
+                'Lifecycle get_state failed for %s: %s' % (name, exc))
+            return
+        self._lifecycle_states[name] = (
+            int(state.id), str(state.label), time.monotonic())
+
+    def _lifecycle_blockers(self, now):
+        unavailable = []
+        pending = []
+        stale = []
+        inactive = []
+        for name, client in self.lifecycle_clients.items():
+            if not client.service_is_ready():
+                unavailable.append(name)
+                continue
+            observation = self._lifecycle_states.get(name)
+            if observation is None or observation[2] < self._watch_started_at:
+                pending.append(name)
+                continue
+            state_id, state_label, received_at = observation
+            age = now - received_at
+            if age > self.lifecycle_state_max_age_sec:
+                stale.append('%s=%.2fs' % (name, age))
+            elif state_id != State.PRIMARY_STATE_ACTIVE:
+                inactive.append('%s=%s(%d)' % (
+                    name, state_label or 'unknown', state_id))
+
+        blockers = []
+        if unavailable:
+            blockers.append(
+                'lifecycle get_state unavailable: %s' % ','.join(unavailable))
+        if pending:
+            blockers.append(
+                'lifecycle state pending: %s' % ','.join(pending))
+        if stale:
+            blockers.append('lifecycle state stale: %s' % ','.join(stale))
+        if inactive:
+            blockers.append('lifecycle not active: %s' % ','.join(inactive))
+        return blockers
+
+    def _tf_chain_ready(self, now):
+        try:
+            map_odom = self.tf_buffer.lookup_transform(
+                self.global_frame, self.odom_frame, RosTime())
+        except TransformException as exc:
+            self._reset_tf_continuity()
+            return False, 'TF %s->%s unavailable: %s' % (
+                self.global_frame, self.odom_frame, exc)
+        try:
+            odom_base = self.tf_buffer.lookup_transform(
+                self.odom_frame, self.base_frame, RosTime())
+        except TransformException as exc:
+            self._reset_tf_continuity()
+            return False, 'TF %s->%s unavailable: %s' % (
+                self.odom_frame, self.base_frame, exc)
+
+        ros_now_ns = self.get_clock().now().nanoseconds
+        observations = {
+            'map_odom': self._transform_observation(map_odom),
+            'odom_base': self._transform_observation(odom_base),
+        }
+        for label, observation in observations.items():
+            age = (ros_now_ns - observation['stamp_ns']) / 1.0e9
+            edge = (
+                '%s->%s' % (self.global_frame, self.odom_frame)
+                if label == 'map_odom'
+                else '%s->%s' % (self.odom_frame, self.base_frame)
+            )
+            if observation['stamp_ns'] <= 0:
+                self._reset_tf_continuity()
+                return False, 'TF %s has a zero timestamp' % edge
+            if age > self.tf_max_age_sec:
+                self._reset_tf_continuity()
+                return False, 'TF %s stale (%.3fs)' % (edge, age)
+            if age < -self.tf_future_tolerance_sec:
+                self._reset_tf_continuity()
+                return False, 'TF %s is %.3fs in the future' % (edge, -age)
+
+        if not self._tf_observations:
+            self._tf_observations = observations
+            self._tf_continuity_since = now
+            self._tf_unique_samples = 1
+            return False, 'TF continuity collecting (1/%d samples)' % (
+                self.tf_continuity_min_samples)
+
+        discontinuity = self._tf_discontinuity(observations)
+        if discontinuity:
+            self._tf_observations = observations
+            self._tf_continuity_since = now
+            self._tf_unique_samples = 1
+            return False, 'TF discontinuity; window restarted: %s' % discontinuity
+
+        stamps_changed = any(
+            observations[label]['stamp_ns']
+            != self._tf_observations[label]['stamp_ns']
+            for label in observations
+        )
+        self._tf_observations = observations
+        if stamps_changed:
+            self._tf_unique_samples += 1
+        continuous_for = now - self._tf_continuity_since
+        if (
+            self._tf_unique_samples < self.tf_continuity_min_samples
+            or continuous_for < self.tf_continuity_hold_sec
+        ):
+            return False, (
+                'TF continuity collecting (%.2f/%.2fs, %d/%d samples)'
+                % (
+                    continuous_for,
+                    self.tf_continuity_hold_sec,
+                    self._tf_unique_samples,
+                    self.tf_continuity_min_samples,
+                )
+            )
+        return True, ''
+
+    def _tf_discontinuity(self, observations):
+        for label, current in observations.items():
+            previous = self._tf_observations[label]
+            dt = (current['stamp_ns'] - previous['stamp_ns']) / 1.0e9
+            edge = (
+                '%s->%s' % (self.global_frame, self.odom_frame)
+                if label == 'map_odom'
+                else '%s->%s' % (self.odom_frame, self.base_frame)
+            )
+            distance = math.hypot(
+                current['x'] - previous['x'],
+                current['y'] - previous['y'],
+            )
+            yaw_step = abs(self._angle_delta(
+                current['yaw'], previous['yaw']))
+            if dt < -1.0e-6:
+                return '%s timestamp regressed by %.3fs' % (edge, -dt)
+            if dt <= 1.0e-6:
+                if distance > 1.0e-4 or yaw_step > 1.0e-4:
+                    return '%s changed at an unchanged timestamp' % edge
+                continue
+            if dt > self.tf_continuity_max_gap_sec:
+                return '%s sample gap %.3fs exceeds %.3fs' % (
+                    edge, dt, self.tf_continuity_max_gap_sec)
+
+            if label == 'map_odom':
+                max_distance = self.map_odom_max_step_translation
+                max_yaw = self.map_odom_max_step_yaw
+            else:
+                max_distance = (
+                    self.base_max_linear_speed * dt
+                    + self.base_step_translation_margin
+                )
+                max_yaw = (
+                    self.base_max_angular_speed * dt
+                    + self.base_step_yaw_margin
+                )
+            if distance > max_distance or yaw_step > max_yaw:
+                return (
+                    '%s step %.3fm/%.3frad over %.3fs exceeds '
+                    '%.3fm/%.3frad'
+                    % (edge, distance, yaw_step, dt, max_distance, max_yaw)
+                )
+        return ''
+
+    @classmethod
+    def _transform_observation(cls, stamped):
+        translation = stamped.transform.translation
+        rotation = stamped.transform.rotation
+        return {
+            'stamp_ns': (
+                int(stamped.header.stamp.sec) * 1000000000
+                + int(stamped.header.stamp.nanosec)
+            ),
+            'x': float(translation.x),
+            'y': float(translation.y),
+            'yaw': cls._quaternion_yaw(rotation),
+        }
+
+    @staticmethod
+    def _quaternion_yaw(rotation):
+        sin_yaw = 2.0 * (
+            float(rotation.w) * float(rotation.z)
+            + float(rotation.x) * float(rotation.y)
+        )
+        cos_yaw = 1.0 - 2.0 * (
+            float(rotation.y) * float(rotation.y)
+            + float(rotation.z) * float(rotation.z)
+        )
+        return math.atan2(sin_yaw, cos_yaw)
+
+    @staticmethod
+    def _angle_delta(current, previous):
+        return math.atan2(
+            math.sin(current - previous), math.cos(current - previous))
+
+    def _reset_tf_continuity(self):
+        self._tf_observations = {}
+        self._tf_continuity_since = None
+        self._tf_unique_samples = 0
+
+    def _select_started_audio(self):
         if self._audio_file_exists(self.started_audio):
             return self.started_audio
-        self.get_logger().warn('Feedback audio %s is missing; fallback to %s.' %
-                               (self.started_audio, self.fallback_audio))
+        self.get_logger().warn(
+            'Feedback audio %s is missing; fallback to %s.'
+            % (self.started_audio, self.fallback_audio))
         return self.fallback_audio
+
+    def _publish_failure_feedback(self):
+        if self._audio_file_exists(self.failed_audio):
+            self._publish_feedback(self.failed_audio)
+        else:
+            self.get_logger().error(
+                'Failure feedback audio is missing: %s' % self.failed_audio)
 
     def _audio_file_exists(self, audio_file):
         if not self.audio_path:
             return True
-        return os.path.exists(os.path.join(self.audio_path, audio_file.lstrip('/')))
+        return os.path.exists(os.path.join(
+            self.audio_path, audio_file.lstrip('/')))
 
     def _publish_feedback(self, audio_file):
         msg = String()
         msg.data = audio_file
         self.feedback_pub.publish(msg)
+
+    def _publish_status(self, status):
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+    def _publish_terminal_result(self, result, detail):
+        msg = String()
+        msg.data = json.dumps({
+            'schemaVersion': 1,
+            'result': str(result),
+            'generation': int(self._watch_generation),
+            'bridgePid': int(self._bridge_pid),
+            'detail': str(detail),
+            'monitorPid': os.getpid(),
+            'publishedAtEpochMs': int(time.time() * 1000),
+        }, ensure_ascii=False, sort_keys=True)
+        self.result_pub.publish(msg)
 
 
 def main(args=None):

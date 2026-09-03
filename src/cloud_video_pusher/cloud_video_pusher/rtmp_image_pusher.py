@@ -8,6 +8,7 @@ from typing import Optional
 import cv2
 from cv_bridge import CvBridge
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
@@ -83,7 +84,7 @@ class RtmpImagePusher(Node):
             self._publish_status('idle')
 
     def destroy_node(self) -> bool:
-        self._stop_ffmpeg()
+        self._stop_ffmpeg(publish_status=rclpy.ok())
         return super().destroy_node()
 
     def _handle_set_streaming(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
@@ -222,16 +223,18 @@ class RtmpImagePusher(Node):
             self._publish_session(True)
             return True
 
-    def _stop_ffmpeg(self) -> None:
+    def _stop_ffmpeg(self, publish_status: bool = True) -> None:
         with self._process_lock:
             proc = self._process
             self._process = None
 
         if not proc:
-            self._publish_status('idle')
+            if publish_status:
+                self._publish_status('idle')
             return
 
-        self.get_logger().info('Stopping ffmpeg RTMP push process.')
+        if publish_status:
+            self.get_logger().info('Stopping ffmpeg RTMP push process.')
         try:
             if proc.stdin:
                 proc.stdin.close()
@@ -242,8 +245,9 @@ class RtmpImagePusher(Node):
             proc.wait(timeout=3.0)
         except Exception as exc:  # noqa: BLE001 - cleanup should never crash shutdown.
             self.get_logger().warn(f'Error while stopping ffmpeg: {exc}')
-        self._publish_status('idle')
-        self._publish_session(False)
+        if publish_status:
+            self._publish_status('idle')
+            self._publish_session(False)
 
     def _push_latest_frame(self) -> None:
         with self._process_lock:
@@ -328,11 +332,12 @@ def main(args=None) -> None:
     node = RtmpImagePusher()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

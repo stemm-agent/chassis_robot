@@ -105,6 +105,10 @@ def test_manager_starts_only_after_nav2_is_stably_active():
     assert "'/behavior_server'" in guard_text
     assert "ActionClient(self, Spin, '/spin')" in guard_text
     assert 'self.spin_action_client.server_is_ready()' in guard_text
+    assert 'from nav_msgs.srv import GetMap' in guard_text
+    assert "'rrt_map_service', '/stemm_cartographer/rrt_dynamic_map'" in guard_text
+    assert 'self.map_ready' in guard_text
+    assert 'GetMap.Request()' in guard_text
 
 
 def test_launch_uses_cartographer_specific_manager():
@@ -133,6 +137,7 @@ def test_launch_uses_cartographer_specific_manager():
     assert "'blocked_recovery_delay_sec': 1.5" in launch_text
     assert "'blocked_recovery_cooldown_sec': 5.0" in launch_text
     assert "'cancel_zero_guard_period_sec': 0.05" in launch_text
+    assert "'rrt_map_service': '/stemm_cartographer/rrt_dynamic_map'" in launch_text
 
 
 def test_launch_uses_independent_nonzero_odom_session_guard():
@@ -229,6 +234,8 @@ def test_service_guard_gracefully_cancels_recharge_before_stop():
     assert 'STOP_GRACE_ATTEMPTS=80' in guard
     assert 'STOP_KILL_ATTEMPTS=30' in guard
     assert 'systemctl stop --no-block "${unit}"' in guard
+    assert 'wait_for_units_stopped' in guard
+    assert 'stop_units()' in guard
     assert 'systemctl kill --kill-who=all --signal=KILL "${unit}"' in guard
     assert 'stopping feature service: ${unit}' in guard
     assert 'stopped feature service: ${unit}' in guard
@@ -236,7 +243,7 @@ def test_service_guard_gracefully_cancels_recharge_before_stop():
     assert 'restarted feature service: ${unit}' in guard
     assert 'restart_status=0' in guard
     assert 'restart_status=1' in guard
-    assert guard.index('request_recharge_stop\n') < guard.index(
+    assert guard.index('if ! request_recharge_stop; then') < guard.index(
         'systemctl stop --no-block "${unit}"')
 
 

@@ -1,15 +1,24 @@
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <exception>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include "action_msgs/msg/goal_status.hpp"
+#include "action_msgs/msg/goal_status_array.hpp"
+#include "action_msgs/srv/cancel_goal.hpp"
+#include "bodyreader_msg/msg/body_jump_event.hpp"
 #include "bodyreader_msg/msg/bodyposture.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -18,6 +27,7 @@
 #include "nav2_msgs/action/spin.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
+#include "rclcpp_action/qos.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/int8.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -47,6 +57,7 @@
 namespace
 {
 volatile std::sig_atomic_t g_shutdown_requested = 0;
+constexpr int64_t kExactObservationFlushNs = 200000000LL;
 
 void handle_shutdown_signal(int)
 {
@@ -68,6 +79,16 @@ class BodyNav2Follower : public rclcpp::Node
     AVOID_GATE
   };
 
+  enum class VisualTakeoverPhase
+  {
+    NONE,
+    CANCEL_PENDING_CLEAR,
+    CANCEL_PENDING_REACQUIRE,
+    NAV_DRAINING_CLEAR,
+    NAV_DRAINING_REACQUIRE,
+    SAFETY_GATE
+  };
+
   enum class ObstacleSector
   {
     NONE,
@@ -81,6 +102,8 @@ class BodyNav2Follower : public rclcpp::Node
     ObstacleSector sector{ObstacleSector::NONE};
     double distance{std::numeric_limits<double>::infinity()};
     double angle{0.0};
+    // Historical field name: positive infinity is also a valid open-space return.
+    std::size_t finite_ray_count{0};
   };
 
   struct ObstacleScan
@@ -88,6 +111,22 @@ class BodyNav2Follower : public rclcpp::Node
     ObstacleObservation front;
     ObstacleObservation left;
     ObstacleObservation right;
+  };
+
+  using GoalUUID = std::array<uint8_t, 16>;
+
+  struct NavigationActionTracker
+  {
+    std::string action_name;
+    std::set<GoalUUID> episode_goal_ids;
+    std::set<GoalUUID> active_goal_ids_in_latest_status;
+    std::map<GoalUUID, int8_t> goal_statuses;
+    std::map<GoalUUID, int64_t> last_goal_status_update_ns;
+    std::map<GoalUUID, int64_t> last_cancel_request_ns;
+    std::map<GoalUUID, uint64_t> cancel_request_sequences;
+    std::set<GoalUUID> cancel_requests_in_flight;
+    rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr status_sub;
+    rclcpp::Client<action_msgs::srv::CancelGoal>::SharedPtr cancel_client;
   };
 
 public:
@@ -106,6 +145,8 @@ public:
     avoidance_stage_(AvoidanceStage::IDLE),
     last_sent_goal_kind_(NavGoalKind::NORMAL),
     has_body_(false),
+    position_jump_hold_active_(false),
+    position_jump_recovery_waiting_(false),
     has_last_person_map_(false),
     has_sent_goal_(false),
     goal_active_(false),
@@ -176,11 +217,11 @@ public:
     obstacle_slow_distance_m_ = declare_parameter<double>("obstacle_slow_distance_m", 1.25);
     obstacle_nav_distance_m_ = declare_parameter<double>("obstacle_nav_distance_m", 0.75);
     obstacle_nav_release_distance_m_ =
-      declare_parameter<double>("obstacle_nav_release_distance_m", 1.35);
+      declare_parameter<double>("obstacle_nav_release_distance_m", 0.80);
     side_obstacle_nav_distance_m_ =
       declare_parameter<double>("side_obstacle_nav_distance_m", 0.40);
     side_obstacle_release_distance_m_ =
-      declare_parameter<double>("side_obstacle_release_distance_m", 0.50);
+      declare_parameter<double>("side_obstacle_release_distance_m", 0.45);
     visual_min_linear_scale_ = declare_parameter<double>("visual_min_linear_scale", 0.25);
     target_exemption_angle_rad_ = declare_parameter<double>("target_exemption_angle_rad", 0.20);
     target_exemption_distance_margin_m_ =
@@ -195,16 +236,47 @@ public:
     visual_clear_takeover_front_clearance_m_ =
       declare_parameter<double>("visual_clear_takeover_front_clearance_m", 0.80);
     visual_clear_takeover_side_clearance_m_ =
-      declare_parameter<double>("visual_clear_takeover_side_clearance_m", 0.50);
+      declare_parameter<double>("visual_clear_takeover_side_clearance_m", 0.45);
     visual_clear_takeover_min_avoidance_s_ =
       declare_parameter<double>("visual_clear_takeover_min_avoidance_s", 0.60);
     visual_clear_takeover_body_max_age_s_ =
       declare_parameter<double>("visual_clear_takeover_body_max_age_s", 0.30);
     visual_clear_takeover_confirm_frames_ = static_cast<int>(
-      declare_parameter<int>("visual_clear_takeover_confirm_frames", 3));
+      declare_parameter<int>("visual_clear_takeover_confirm_frames", 2));
     visual_clear_takeover_confirm_frames_ =
       std::max(1, visual_clear_takeover_confirm_frames_);
-
+    visual_reacquire_takeover_body_max_age_s_ =
+      std::max(
+      0.05, declare_parameter<double>("visual_reacquire_takeover_body_max_age_s", 0.35));
+    visual_reacquire_takeover_min_frame_interval_s_ =
+      std::max(
+      0.0, declare_parameter<double>("visual_reacquire_takeover_min_frame_interval_s", 0.05));
+    visual_reacquire_takeover_max_frame_interval_s_ =
+      std::max(
+      visual_reacquire_takeover_min_frame_interval_s_,
+      declare_parameter<double>("visual_reacquire_takeover_max_frame_interval_s", 0.45));
+    visual_reacquire_takeover_confirm_frames_ = static_cast<int>(
+      declare_parameter<int>("visual_reacquire_takeover_confirm_frames", 2));
+    visual_reacquire_takeover_confirm_frames_ =
+      std::max(1, visual_reacquire_takeover_confirm_frames_);
+    visual_safety_release_confirm_frames_ = static_cast<int>(
+      declare_parameter<int>("visual_safety_release_confirm_frames", 2));
+    visual_safety_release_confirm_frames_ =
+      std::max(1, visual_safety_release_confirm_frames_);
+    visual_safety_min_finite_rays_per_sector_ = static_cast<int>(
+      declare_parameter<int>("visual_safety_min_finite_rays_per_sector", 1));
+    visual_safety_min_finite_rays_per_sector_ =
+      std::max(1, visual_safety_min_finite_rays_per_sector_);
+    nav_takeover_child_capture_slop_s_ = std::max(
+      0.0, declare_parameter<double>("nav_takeover_child_capture_slop_s", 0.10));
+    nav_takeover_cancel_retry_s_ = std::max(
+      0.10, declare_parameter<double>("nav_takeover_cancel_retry_s", 0.35));
+    nav_takeover_status_quiet_s_ = std::max(
+      0.10, declare_parameter<double>("nav_takeover_status_quiet_s", 0.30));
+    nav_takeover_cmd_quiet_s_ = std::max(
+      0.10, declare_parameter<double>("nav_takeover_cmd_quiet_s", 0.30));
+    nav_takeover_child_discovery_s_ = std::max(
+      0.50, declare_parameter<double>("nav_takeover_child_discovery_s", 1.20));
     visual_x_p_ = declare_parameter<double>("visual_x_p", 0.5);
     visual_x_d_ = declare_parameter<double>("visual_x_d", 0.33);
     visual_z_p_ = declare_parameter<double>("visual_z_p", 1.2);
@@ -243,9 +315,16 @@ public:
 
     nav_client_ = rclcpp_action::create_client<NavigateToPose>(this, nav_action_name_);
     spin_client_ = rclcpp_action::create_client<Spin>(this, spin_action_name_);
+    create_navigation_action_tracker("/compute_path_to_pose");
+    create_navigation_action_tracker("/follow_path");
+    create_navigation_action_tracker(spin_action_name_);
+    create_navigation_action_tracker("/drive_on_heading");
+    create_navigation_action_tracker("/wait");
+    create_navigation_action_tracker("/backup");
+    create_navigation_action_tracker("/assisted_teleop");
 
     body_sub_ = create_subscription<bodyreader_msg::msg::Bodyposture>(
-      "/body_posture_yolo_validated", 10,
+      "/body_posture_yolo_validated", rclcpp::QoS(1).reliable(),
       std::bind(&BodyNav2Follower::body_callback, this, std::placeholders::_1));
 
     mode_sub_ = create_subscription<std_msgs::msg::Int8>(
@@ -309,6 +388,10 @@ public:
     last_avoidance_goal_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     avoidance_start_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     avoidance_goal_accept_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    last_dual_presence_body_time_ =
+      rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    active_visual_body_time_ =
+      rclcpp::Time(0, 0, get_clock()->get_clock_type());
     filtered_x_angle_ = 0.0;
     last_visual_error_angle_ = 0.0;
     last_visual_error_distance_ = 0.0;
@@ -329,6 +412,10 @@ public:
     if (timer_) {
       timer_->cancel();
     }
+    dual_handoff_active_ = false;
+    dual_handoff_reacquire_armed_ = false;
+    dual_handoff_retired_by_strict_ = false;
+    dual_handoff_strict_confirm_count_ = 0;
     cancel_goal(reason);
     cancel_spin(reason);
     reset_avoidance_episode();
@@ -375,14 +462,198 @@ private:
     return value;
   }
 
+  // Legacy skeleton-ID jump/dual callbacks are intentionally compiled out.
+  // The active control path below consumes only exact observations emitted by
+  // the YOLO identity bridge.  A skeleton ID is never a cross-frame key.
+#if 0
+  void reset_position_jump_recovery_confirmation()
+  {
+    position_jump_recovery_valid_count_ = 0;
+    position_jump_recovery_body_id_ = 0;
+    position_jump_recovery_last_valid_time_ =
+      rclcpp::Time(0, 0, get_clock()->get_clock_type());
+  }
+
+  void reset_position_jump_event_context(bool clear_strict_target = false)
+  {
+    position_jump_hold_active_ = false;
+    position_jump_recovery_waiting_ = false;
+    position_jump_source_epoch_ = 0;
+    position_jump_event_id_ = 0;
+    position_jump_event_update_seq_ = 0;
+    position_jump_origin_body_id_ = 0;
+    position_jump_expected_body_id_ = 0;
+    position_jump_native_body_id_ = 0;
+    position_jump_trusted_depth_mm_ = 0.0;
+    position_jump_observed_depth_mm_ = 0.0;
+    position_jump_confirmed_depth_mm_ = 0.0;
+    position_jump_phase_ = 0;
+    position_jump_outcome_ = 0;
+    position_jump_bound_goal_sequence_ = 0;
+    position_jump_source_reset_recovery_ = false;
+    pending_position_jump_events_.clear();
+    reset_position_jump_recovery_confirmation();
+    if (clear_strict_target) {
+      strict_target_body_id_ = 0;
+    }
+  }
+
+  bool position_jump_recovery_sample_confirmed(
+    const bodyreader_msg::msg::Bodyposture & sample,
+    const rclcpp::Time & now)
+  {
+    constexpr int kRequiredFrames = 2;
+    constexpr double kMinFrameIntervalS = 0.03;
+    constexpr double kMaxFrameIntervalS = 0.45;
+    constexpr double kConsistencyMm = 150.0;
+
+    bool continue_confirmation = position_jump_recovery_valid_count_ > 0;
+    double interval_s = 0.0;
+    if (continue_confirmation) {
+      interval_s = (now - position_jump_recovery_last_valid_time_).seconds();
+      if (interval_s < kMinFrameIntervalS) {
+        return false;
+      }
+      const double dx = static_cast<double>(sample.centerofmass_x) -
+        static_cast<double>(position_jump_recovery_candidate_.centerofmass_x);
+      const double dz = static_cast<double>(sample.centerofmass_z) -
+        static_cast<double>(position_jump_recovery_candidate_.centerofmass_z);
+      continue_confirmation = interval_s <= kMaxFrameIntervalS &&
+        sample.bodyid == position_jump_recovery_body_id_ &&
+        std::hypot(dx, dz) <= kConsistencyMm;
+    }
+
+    if (!continue_confirmation) {
+      position_jump_recovery_valid_count_ = 1;
+    } else {
+      position_jump_recovery_valid_count_ = std::min(
+        position_jump_recovery_valid_count_ + 1, kRequiredFrames);
+    }
+    position_jump_recovery_candidate_ = sample;
+    position_jump_recovery_body_id_ = sample.bodyid;
+    position_jump_recovery_last_valid_time_ = now;
+
+    if (position_jump_recovery_valid_count_ < kRequiredFrames) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Position-jump recovery candidate: body=%d depth_mm=%.0f required_frames=%d",
+        sample.bodyid, sample.centerofmass_z, kRequiredFrames);
+      return false;
+    }
+    return true;
+  }
+
   void body_callback(const bodyreader_msg::msg::Bodyposture::SharedPtr msg)
   {
+    const auto now = this->now();
     const bool valid_lock = msg->lock_status == 2;
-    const bool valid_depth = msg->centerofmass_z > 100.0f;
+    const bool valid_depth =
+      std::isfinite(msg->centerofmass_x) &&
+      std::isfinite(msg->centerofmass_y) &&
+      std::isfinite(msg->centerofmass_z) &&
+      msg->centerofmass_z > 100.0f;
+    bool position_jump_recovery_completed = false;
+    bool position_jump_danger_cancel = false;
+
+    if (valid_lock && valid_depth && position_jump_source_reset_recovery_ &&
+        !position_jump_hold_active_)
+    {
+      const auto pending_event = pending_position_jump_events_.find(msg->bodyid);
+      if (pending_event != pending_position_jump_events_.end()) {
+        position_jump_expected_body_id_ = msg->bodyid;
+        auto event = std::make_shared<bodyreader_msg::msg::BodyJumpEvent>(
+          pending_event->second);
+        pending_position_jump_events_.erase(pending_event);
+        position_jump_event_callback(event);
+      }
+    }
+
+    if (position_jump_hold_active_) {
+      reset_position_jump_recovery_confirmation();
+      return;
+    }
+
+    if (position_jump_recovery_waiting_) {
+      if (!valid_lock || !valid_depth) {
+        reset_position_jump_recovery_confirmation();
+        return;
+      }
+      if (position_jump_expected_body_id_ <= 0) {
+        // A body_main source reset restarts its persistent-ID allocator. The
+        // first strict sample establishes the new epoch's target candidate;
+        // the ordinary two-frame confirmation still gates motion.
+        position_jump_expected_body_id_ = msg->bodyid;
+      }
+      if (msg->bodyid != position_jump_expected_body_id_)
+      {
+        reset_position_jump_recovery_confirmation();
+        if (position_jump_source_reset_recovery_) {
+          position_jump_expected_body_id_ = msg->bodyid;
+        } else {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Position-jump recovery waits for target body=%d; received body=%d",
+            position_jump_expected_body_id_, msg->bodyid);
+          return;
+        }
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Body source-reset recovery candidate changed; restart two-frame "
+          "confirmation with body=%d", msg->bodyid);
+      }
+      if (position_jump_confirmed_depth_mm_ > 100.0 &&
+          std::fabs(
+            static_cast<double>(msg->centerofmass_z) -
+            position_jump_confirmed_depth_mm_) > 150.0)
+      {
+        reset_position_jump_recovery_confirmation();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Position-jump recovery depth mismatch: target=%d sample=%.0f confirmed=%.0f",
+          msg->bodyid, msg->centerofmass_z,
+          position_jump_confirmed_depth_mm_);
+        return;
+      }
+      if (!position_jump_recovery_sample_confirmed(*msg, now)) {
+        return;
+      }
+      position_jump_recovery_waiting_ = false;
+      reset_position_jump_recovery_confirmation();
+      strict_target_body_id_ = msg->bodyid;
+      position_jump_recovery_completed = true;
+      const bool confirmed_nearer =
+        position_jump_outcome_ ==
+        bodyreader_msg::msg::BodyJumpEvent::OUTCOME_REBASED &&
+        position_jump_confirmed_depth_mm_ > 100.0 &&
+        position_jump_trusted_depth_mm_ - position_jump_confirmed_depth_mm_ > 200.0;
+      const bool dangerous_near =
+        position_jump_confirmed_depth_mm_ * 0.001 <
+        follow_distance_m_ - hold_distance_band_m_ &&
+        static_cast<double>(msg->centerofmass_z) * 0.001 <
+        follow_distance_m_ - hold_distance_band_m_;
+      const bool same_avoidance_goal =
+        position_jump_bound_goal_sequence_ != 0 &&
+        position_jump_bound_goal_sequence_ == goal_sequence_ &&
+        last_sent_goal_kind_ == NavGoalKind::AVOID_GATE &&
+        avoidance_episode_active() && (goal_active_ || has_sent_goal_);
+      position_jump_danger_cancel =
+        confirmed_nearer && dangerous_near && same_avoidance_goal;
+      RCLCPP_INFO(
+        get_logger(),
+        "Position-jump target recovery confirmed: body=%d event=%llu depth=%.0f "
+        "confirmed=%.0f dangerous_cancel=%s",
+        msg->bodyid,
+        static_cast<unsigned long long>(position_jump_event_id_),
+        msg->centerofmass_z, position_jump_confirmed_depth_mm_,
+        position_jump_danger_cancel ? "true" : "false");
+    } else if (valid_lock && valid_depth) {
+      strict_target_body_id_ = msg->bodyid;
+    }
+
     if (valid_lock && valid_depth) {
       if (has_body_ && invalid_body_since_.nanoseconds() != 0) {
         const double invalid_duration_s =
-          (this->now() - invalid_body_since_).seconds();
+          (now - invalid_body_since_).seconds();
         RCLCPP_INFO(
           get_logger(), "Body observation recovered after %.3fs invalid interval",
           invalid_duration_s);
@@ -390,10 +661,43 @@ private:
       invalid_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       latest_body_ = *msg;
       has_body_ = true;
-      last_body_time_ = this->now();
+      last_body_time_ = now;
       ++body_generation_;
+      if (dual_handoff_active_ || dual_handoff_reacquire_armed_) {
+        ++dual_handoff_strict_confirm_count_;
+        if (dual_handoff_strict_confirm_count_ >= 3) {
+          dual_handoff_active_ = false;
+          dual_handoff_reacquire_armed_ = false;
+          dual_handoff_retired_by_strict_ = true;
+          dual_handoff_strict_confirm_count_ = 0;
+          RCLCPP_INFO(
+            get_logger(),
+            "Strict validated body stable for 3 frames; retire raw dual visual fallback");
+          }
+      }
+      if (position_jump_recovery_completed) {
+        const uint64_t recovered_event_id = position_jump_event_id_;
+        reset_position_jump_event_context(false);
+        if (position_jump_danger_cancel &&
+            visual_takeover_phase_ == VisualTakeoverPhase::NONE)
+        {
+          visual_takeover_phase_ = VisualTakeoverPhase::CANCEL_PENDING_CLEAR;
+          awaiting_visual_after_avoidance_ = false;
+          RCLCPP_WARN(
+            get_logger(),
+            "Confirmed same-target dangerous-near jump event=%llu; "
+            "cancel and drain only the bound Nav2 avoidance task",
+            static_cast<unsigned long long>(recovered_event_id));
+          request_visual_takeover_cancel(
+            "confirmed_target_position_jump_near");
+          cancel_tracked_navigation_children();
+          reset_visual_controller();
+          publish_safety_stop_cmd(
+            "confirmed_target_position_jump_near_cancel");
+        }
+      }
     } else {
-      const auto now = this->now();
+      dual_handoff_strict_confirm_count_ = 0;
       if (invalid_body_since_.nanoseconds() == 0) {
         invalid_body_since_ = now;
       }
@@ -409,8 +713,16 @@ private:
       }
 
       if (has_body_) {
+        if (avoidance_episode_active()) {
+          avoidance_visual_loss_seen_ = true;
+          if (!visual_takeover_cancel_pending()) {
+            reset_visual_reacquire_takeover_confirmation();
+          }
+          RCLCPP_INFO(
+            get_logger(),
+            "Visual target loss observed during Nav2 avoidance; arm dual-presence reacquire");
+        }
         has_body_ = false;
-        reset_visual_clear_takeover_confirmation();
         RCLCPP_WARN(
           get_logger(),
           "Body loss confirmed after %.3fs invalid interval: lock_status=%d depth_mm=%.0f",
@@ -419,10 +731,373 @@ private:
     }
   }
 
+  void position_jump_event_callback(
+    const bodyreader_msg::msg::BodyJumpEvent::SharedPtr msg)
+  {
+    using Event = bodyreader_msg::msg::BodyJumpEvent;
+    if (msg->phase == Event::PHASE_RESET) {
+      if (position_jump_source_epoch_ != 0 &&
+          msg->source_epoch < position_jump_source_epoch_)
+      {
+        return;
+      }
+      const bool had_target_context =
+        strict_target_body_id_ > 0 || has_body_ ||
+        position_jump_hold_active_ || position_jump_recovery_waiting_;
+      reset_position_jump_event_context(true);
+      position_jump_source_epoch_ = msg->source_epoch;
+      has_body_ = false;
+      dual_handoff_active_ = false;
+      dual_handoff_reacquire_armed_ = false;
+      dual_handoff_strict_confirm_count_ = 0;
+      reset_visual_reacquire_takeover_confirmation();
+      reset_visual_controller();
+      if (had_target_context) {
+        position_jump_recovery_waiting_ = true;
+        position_jump_expected_body_id_ = 0;
+        position_jump_source_reset_recovery_ = true;
+      }
+      RCLCPP_INFO(
+        get_logger(),
+        "Body jump source reset: epoch=%llu old_target_cleared=true "
+        "recovery_waiting=%s",
+        static_cast<unsigned long long>(msg->source_epoch),
+        position_jump_recovery_waiting_ ? "true" : "false");
+      return;
+    }
+
+    if (position_jump_source_epoch_ != 0 &&
+        msg->source_epoch < position_jump_source_epoch_)
+    {
+      return;
+    }
+    if (msg->source_epoch != position_jump_source_epoch_) {
+      reset_position_jump_event_context(false);
+      position_jump_source_epoch_ = msg->source_epoch;
+    }
+
+    if (msg->phase == Event::PHASE_PENDING) {
+      const int current_target = strict_target_body_id_ > 0 ?
+        strict_target_body_id_ :
+        (has_body_ ? latest_body_.bodyid :
+        (position_jump_source_reset_recovery_ ?
+        position_jump_expected_body_id_ : 0));
+      if (current_target <= 0 && position_jump_source_reset_recovery_ &&
+          msg->origin_persistent_body_id > 0)
+      {
+        pending_position_jump_events_[msg->origin_persistent_body_id] = *msg;
+        RCLCPP_INFO(
+          get_logger(),
+          "Cache body jump event=%llu origin=%d until the reset source "
+          "produces a strict target candidate",
+          static_cast<unsigned long long>(msg->event_id),
+          msg->origin_persistent_body_id);
+        return;
+      }
+      if (msg->origin_persistent_body_id <= 0 ||
+          msg->origin_persistent_body_id != current_target)
+      {
+        RCLCPP_INFO(
+          get_logger(),
+          "Ignore non-target body jump: event=%llu native=%d origin=%d target=%d "
+          "old_z=%.0f raw_z=%.0f",
+          static_cast<unsigned long long>(msg->event_id),
+          msg->native_body_id, msg->origin_persistent_body_id,
+          current_target, msg->trusted_depth_mm, msg->observed_depth_mm);
+        return;
+      }
+      if (position_jump_event_id_ == msg->event_id &&
+          msg->update_seq <= position_jump_event_update_seq_)
+      {
+        return;
+      }
+
+      reset_position_jump_event_context(false);
+      position_jump_source_epoch_ = msg->source_epoch;
+      position_jump_event_id_ = msg->event_id;
+      position_jump_event_update_seq_ = msg->update_seq;
+      position_jump_origin_body_id_ = msg->origin_persistent_body_id;
+      position_jump_expected_body_id_ = msg->origin_persistent_body_id;
+      position_jump_native_body_id_ = msg->native_body_id;
+      position_jump_trusted_depth_mm_ = msg->trusted_depth_mm;
+      position_jump_observed_depth_mm_ = msg->observed_depth_mm;
+      position_jump_confirmed_depth_mm_ = 0.0;
+      position_jump_phase_ = msg->phase;
+      position_jump_outcome_ = msg->outcome;
+      position_jump_hold_active_ = true;
+      position_jump_recovery_waiting_ = true;
+      if ((goal_active_ || has_sent_goal_) &&
+          last_sent_goal_kind_ == NavGoalKind::AVOID_GATE &&
+          avoidance_episode_active())
+      {
+        position_jump_bound_goal_sequence_ = goal_sequence_;
+      }
+      reset_position_jump_recovery_confirmation();
+      dual_handoff_active_ = false;
+      dual_handoff_reacquire_armed_ = false;
+      dual_handoff_strict_confirm_count_ = 0;
+      reset_visual_reacquire_takeover_confirmation();
+      reset_visual_controller();
+
+      const bool nav_engaged = goal_active_ || has_sent_goal_;
+      RCLCPP_WARN(
+        get_logger(),
+        "Target body jump pending: event=%llu native=%d target=%d old_z=%.0f "
+        "raw_z=%.0f nav2_continue=%s goal_sequence=%llu",
+        static_cast<unsigned long long>(msg->event_id),
+        msg->native_body_id, msg->origin_persistent_body_id,
+        msg->trusted_depth_mm, msg->observed_depth_mm,
+        nav_engaged ? "true" : "false",
+        static_cast<unsigned long long>(position_jump_bound_goal_sequence_));
+      if (nav_engaged) {
+        publish_state("target_position_jump_blocks_visual_nav2_continue");
+      } else {
+        cancel_spin("target_position_jump_direct_hold");
+        if (motion_enabled_ && (!respect_mode_topic_ || mode_ == mode_required_) &&
+            !visual_takeover_drain_active())
+        {
+          publish_safety_stop_cmd("target_position_jump_direct_hold_stop");
+        }
+      }
+      return;
+    }
+
+    const auto cached_event = pending_position_jump_events_.find(
+      msg->origin_persistent_body_id);
+    if (cached_event != pending_position_jump_events_.end() &&
+        cached_event->second.event_id == msg->event_id)
+    {
+      if (msg->phase == Event::PHASE_RELEASED ||
+          msg->phase == Event::PHASE_EXPIRED)
+      {
+        pending_position_jump_events_.erase(cached_event);
+      }
+    }
+
+    if (msg->event_id != position_jump_event_id_ ||
+        msg->origin_persistent_body_id != position_jump_origin_body_id_ ||
+        msg->update_seq <= position_jump_event_update_seq_)
+    {
+      return;
+    }
+
+    position_jump_event_update_seq_ = msg->update_seq;
+    position_jump_native_body_id_ = msg->native_body_id;
+    position_jump_observed_depth_mm_ = msg->observed_depth_mm;
+    position_jump_phase_ = msg->phase;
+    position_jump_outcome_ = msg->outcome;
+    if (msg->current_persistent_body_id > 0) {
+      position_jump_expected_body_id_ = msg->current_persistent_body_id;
+    }
+    if (msg->confirmed_depth_mm > 100.0f) {
+      position_jump_confirmed_depth_mm_ = msg->confirmed_depth_mm;
+    }
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Target body jump update: event=%llu phase=%u outcome=%u native=%d "
+      "origin=%d current=%d old_z=%.0f raw_z=%.0f confirmed_z=%.0f good=%u",
+      static_cast<unsigned long long>(msg->event_id),
+      static_cast<unsigned int>(msg->phase),
+      static_cast<unsigned int>(msg->outcome), msg->native_body_id,
+      msg->origin_persistent_body_id, msg->current_persistent_body_id,
+      msg->trusted_depth_mm, msg->observed_depth_mm,
+      msg->confirmed_depth_mm, static_cast<unsigned int>(msg->good_count));
+
+    if (msg->phase == Event::PHASE_RELEASED ||
+        msg->phase == Event::PHASE_EXPIRED)
+    {
+      position_jump_hold_active_ = false;
+      position_jump_recovery_waiting_ = true;
+      reset_position_jump_recovery_confirmation();
+      RCLCPP_INFO(
+        get_logger(),
+        "Target body jump source hold ended; event=%llu wait for two fresh "
+        "validated frames of body=%d",
+        static_cast<unsigned long long>(msg->event_id),
+        position_jump_expected_body_id_);
+    } else {
+      position_jump_hold_active_ = true;
+    }
+  }
+
+  void dual_presence_body_callback(
+    const bodyreader_msg::msg::Bodyposture::SharedPtr msg)
+  {
+    const auto now = this->now();
+    if (position_jump_hold_active_ || position_jump_recovery_waiting_) {
+      dual_handoff_active_ = false;
+      dual_handoff_reacquire_armed_ = false;
+      dual_handoff_strict_confirm_count_ = 0;
+      reset_visual_reacquire_takeover_confirmation();
+      return;
+    }
+    const bool valid =
+      msg->lock_status == 2 &&
+      std::isfinite(msg->centerofmass_x) &&
+      std::isfinite(msg->centerofmass_y) &&
+      std::isfinite(msg->centerofmass_z) &&
+      msg->centerofmass_z > 100.0f;
+    if (!valid) {
+      if (
+        dual_handoff_active_ || dual_handoff_reacquire_armed_ ||
+        visual_takeover_phase_is_reacquire(visual_takeover_phase_))
+      {
+        dual_handoff_active_ = false;
+        dual_handoff_reacquire_armed_ = !dual_handoff_retired_by_strict_;
+      }
+      if (avoidance_episode_active() && !avoidance_visual_loss_seen_) {
+        avoidance_visual_loss_seen_ = true;
+        RCLCPP_INFO(
+          get_logger(),
+          "Skeleton/YOLO co-presence lost during Nav2 avoidance; "
+          "arm two-frame dual-presence reacquire");
+      }
+      reset_visual_reacquire_takeover_confirmation();
+      return;
+    }
+
+    if (visual_reacquire_takeover_count_ > 0) {
+      const double interval_s = (now - last_dual_presence_body_time_).seconds();
+      if (interval_s > visual_reacquire_takeover_max_frame_interval_s_) {
+        reset_visual_reacquire_takeover_confirmation();
+      } else if (interval_s < visual_reacquire_takeover_min_frame_interval_s_) {
+        return;
+      }
+    }
+
+    visual_reacquire_body_id_ = msg->bodyid;
+    latest_dual_presence_body_ = *msg;
+    last_dual_presence_body_time_ = now;
+    visual_reacquire_takeover_count_ = std::min(
+      visual_reacquire_takeover_count_ + 1,
+      visual_reacquire_takeover_confirm_frames_);
+    if (dual_handoff_reacquire_armed_ &&
+        visual_reacquire_takeover_count_ >= visual_reacquire_takeover_confirm_frames_)
+    {
+      dual_handoff_active_ = true;
+      dual_handoff_reacquire_armed_ = false;
+      dual_handoff_retired_by_strict_ = false;
+      dual_handoff_strict_confirm_count_ = 0;
+      RCLCPP_INFO(
+        get_logger(),
+        "Raw dual visual fallback reacquired after %d fresh frames",
+        visual_reacquire_takeover_count_);
+    }
+    if (dual_takeover_gate_open_ && visual_reacquire_takeover_count_ == 1) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Post-clearance dual-presence candidate: body=%d required_frames=%d",
+        visual_reacquire_body_id_, visual_reacquire_takeover_confirm_frames_);
+    }
+  }
+
+#endif
+
+  void reset_position_jump_recovery_confirmation()
+  {
+  }
+
+  void reset_position_jump_event_context(bool clear_strict_target = false)
+  {
+    position_jump_hold_active_ = false;
+    position_jump_recovery_waiting_ = false;
+    if (clear_strict_target) {
+      strict_target_body_id_ = 0;
+    }
+  }
+
+  void body_callback(const bodyreader_msg::msg::Bodyposture::SharedPtr msg)
+  {
+    const auto sample_time = this->now();
+    const bool exact_observation =
+      msg->lock_status == 2 &&
+      std::isfinite(msg->centerofmass_x) &&
+      std::isfinite(msg->centerofmass_y) &&
+      std::isfinite(msg->centerofmass_z) &&
+      msg->centerofmass_z > 100.0f;
+
+    if (exact_observation &&
+        sample_time.nanoseconds() < exact_observation_accept_after_ns_)
+    {
+      RCLCPP_DEBUG(
+        get_logger(),
+        "Discard exact observation during mode/navigation handoff flush window");
+      return;
+    }
+
+    if (exact_observation) {
+      if (has_body_ && invalid_body_since_.nanoseconds() != 0) {
+        RCLCPP_INFO(
+          get_logger(), "Exact YOLO+skeleton observation recovered after %.3fs",
+          (sample_time - invalid_body_since_).seconds());
+      }
+      invalid_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      latest_body_ = *msg;
+      has_body_ = true;
+      last_body_time_ = sample_time;
+      ++body_generation_;
+      RCLCPP_DEBUG(
+        get_logger(),
+        "Exact target observation: skeleton=%d x=%.0f z=%.0f generation=%llu "
+        "(skeleton ID is diagnostic only)",
+        msg->bodyid, msg->centerofmass_x, msg->centerofmass_z,
+        static_cast<unsigned long long>(body_generation_));
+      return;
+    }
+
+    if (invalid_body_since_.nanoseconds() == 0) {
+      invalid_body_since_ = sample_time;
+    }
+    // A soft grace may keep the last exact geometry usable for ordinary visual
+    // continuity, but an explicit loss must break body-dependent confirmation.
+    visual_reverse_takeover_count_ = 0;
+    visual_reverse_takeover_last_body_generation_ = body_generation_;
+    visual_reverse_takeover_pending_ = false;
+    const double invalid_duration_s =
+      (sample_time - invalid_body_since_).seconds();
+    if (has_body_ && invalid_duration_s < body_invalid_grace_s_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 250,
+        "Transient exact-observation loss ignored: age=%.3fs grace=%.3fs",
+        invalid_duration_s, body_invalid_grace_s_);
+      return;
+    }
+
+    if (has_body_) {
+      if (avoidance_episode_active()) {
+        avoidance_visual_loss_seen_ = true;
+      }
+      has_body_ = false;
+      RCLCPP_WARN(
+        get_logger(),
+        "Exact YOLO+skeleton target loss confirmed after %.3fs; "
+        "skeleton ID is not retained for reacquisition",
+        invalid_duration_s);
+    }
+  }
+
   void mode_callback(const std_msgs::msg::Int8::SharedPtr msg)
   {
     const int previous_mode = mode_;
     mode_ = msg->data;
+    if (previous_mode != mode_) {
+      ++follow_session_epoch_;
+      awaiting_visual_after_avoidance_ = false;
+      avoidance_rearm_required_ = false;
+      has_last_person_map_ = false;
+      has_last_clear_person_pose_ = false;
+      has_side_trigger_target_ = false;
+      last_person_map_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      last_clear_person_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      clear_exact_visual_observation();
+      dual_handoff_active_ = false;
+      dual_handoff_reacquire_armed_ = false;
+      dual_handoff_retired_by_strict_ = false;
+      dual_handoff_strict_confirm_count_ = 0;
+      strict_target_body_id_ = 0;
+      reset_position_jump_event_context(true);
+    }
     if (respect_mode_topic_ && mode_ == mode_required_) {
       paused_stop_published_ = false;
     }
@@ -446,6 +1121,10 @@ private:
     const bool requested_enabled = request->data;
     motion_enabled_ = requested_enabled;
     if (!motion_enabled_) {
+      dual_handoff_active_ = false;
+      dual_handoff_reacquire_armed_ = false;
+      dual_handoff_retired_by_strict_ = false;
+      dual_handoff_strict_confirm_count_ = 0;
       cancel_goal("motion_gate_disabled");
       cancel_spin("motion_gate_disabled");
       reset_avoidance_episode();
@@ -499,6 +1178,7 @@ private:
   {
     last_scan_ = *msg;
     scan_received_ = true;
+    ++scan_generation_;
     last_scan_time_ = this->now();
   }
 
@@ -580,14 +1260,14 @@ private:
     double person_distance = 0.0;
     double person_angle_tolerance = target_exemption_angle_rad_;
     const bool person_exemption =
-      visual_recent && latest_body_.centerofmass_z > 100.0f &&
+      visual_recent && active_visual_body_.centerofmass_z > 100.0f &&
       target_exemption_distance_margin_m_ > 0.0;
 
     if (person_exemption) {
       const double camera_forward =
-        latest_body_.centerofmass_z * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
+        active_visual_body_.centerofmass_z * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
       const double camera_lateral =
-        latest_body_.centerofmass_x * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
+        active_visual_body_.centerofmass_x * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
       const double laser_forward = camera_forward - BODY_NAV2_DEPTH_CAMERA_BEHIND_LIDAR_M;
       person_angle = std::atan2(camera_lateral, laser_forward);
       person_distance = std::hypot(laser_forward, camera_lateral);
@@ -602,9 +1282,30 @@ private:
     double angle = last_scan_.angle_min;
     for (const auto range : last_scan_.ranges) {
       const double normalized_angle = normalize_angle(angle);
-      if (std::isfinite(range) &&
-          range >= last_scan_.range_min &&
-          range <= last_scan_.range_max) {
+      const bool in_front = std::fabs(normalized_angle) <= obstacle_front_angle_rad_;
+      const bool in_left = normalized_angle >= side_min && normalized_angle <= side_max;
+      const bool in_right = normalized_angle <= -side_min && normalized_angle >= -side_max;
+      const bool finite_valid =
+        std::isfinite(range) &&
+        range >= last_scan_.range_min &&
+        range <= last_scan_.range_max;
+      const bool open_return = std::isinf(range) && range > 0.0;
+
+      // LaserScan uses +inf for a valid ray with no return inside range_max.
+      // Count it as observed open space, but never as a finite obstacle.
+      if (finite_valid || open_return) {
+        if (in_front) {
+          ++obstacles.front.finite_ray_count;
+        }
+        if (in_left) {
+          ++obstacles.left.finite_ray_count;
+        }
+        if (in_right) {
+          ++obstacles.right.finite_ray_count;
+        }
+      }
+
+      if (finite_valid) {
         const double target_range_error = static_cast<double>(range) - person_distance;
         const double distance_margin = clamp_value(
           target_exemption_distance_margin_m_, 0.0, 0.12);
@@ -619,19 +1320,16 @@ private:
 
         if (!is_target) {
           const double distance = static_cast<double>(range);
-          if (std::fabs(normalized_angle) <= obstacle_front_angle_rad_ &&
-              distance < obstacles.front.distance) {
+          if (in_front && distance < obstacles.front.distance) {
             obstacles.front.distance = distance;
             obstacles.front.angle = normalized_angle;
           }
 
-          if (normalized_angle >= side_min && normalized_angle <= side_max &&
-              distance < obstacles.left.distance) {
+          if (in_left && distance < obstacles.left.distance) {
             obstacles.left.distance = distance;
             obstacles.left.angle = normalized_angle;
           }
-          if (normalized_angle <= -side_min && normalized_angle >= -side_max &&
-              distance < obstacles.right.distance) {
+          if (in_right && distance < obstacles.right.distance) {
             obstacles.right.distance = distance;
             obstacles.right.angle = normalized_angle;
           }
@@ -674,6 +1372,16 @@ private:
       !std::isfinite(obstacles.right.distance) ||
       obstacles.right.distance >= side_obstacle_release_distance_m_;
     return front_released && left_released && right_released;
+  }
+
+  bool scan_sectors_valid(const ObstacleScan & obstacles) const
+  {
+    const auto minimum =
+      static_cast<std::size_t>(visual_safety_min_finite_rays_per_sector_);
+    return
+      obstacles.front.finite_ray_count >= minimum &&
+      obstacles.left.finite_ray_count >= minimum &&
+      obstacles.right.finite_ray_count >= minimum;
   }
 
   void estimate_obstacle_point(
@@ -768,7 +1476,7 @@ private:
       reference_error = std::hypot(reference_dx, reference_dy);
     }
 
-    const double body_age = (sample_time - last_body_time_).seconds();
+    const double body_age = (sample_time - active_visual_body_time_).seconds();
     const double scan_age = scan_received_ ?
       (sample_time - last_scan_time_).seconds() : -1.0;
     const double clear_pose_age = has_last_clear_person_pose_ ?
@@ -788,11 +1496,11 @@ private:
         << ",\"state\":\"" << last_state_ << "\""
         << ",\"mode\":" << mode_
         << ",\"avoidance_active\":" << (avoidance_episode_active() ? "true" : "false")
-        << ",\"body\":{\"id\":" << latest_body_.bodyid
-        << ",\"lock\":" << static_cast<int>(latest_body_.lock_status)
+        << ",\"body\":{\"id\":" << active_visual_body_.bodyid
+        << ",\"lock\":" << static_cast<int>(active_visual_body_.lock_status)
         << ",\"age_s\":" << body_age
-        << ",\"raw_mm\":[" << latest_body_.centerofmass_x << ","
-        << latest_body_.centerofmass_y << "," << latest_body_.centerofmass_z << "]}"
+        << ",\"raw_mm\":[" << active_visual_body_.centerofmass_x << ","
+        << active_visual_body_.centerofmass_y << "," << active_visual_body_.centerofmass_z << "]}"
         << ",\"person_base_m\":[" << base_x << "," << base_y << "," << base_z << "]"
         << ",\"person_map_m\":[" << map_person.point.x << ","
         << map_person.point.y << "," << map_person.point.z << "]"
@@ -863,8 +1571,9 @@ private:
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
       "CALIB body=%d raw_mm=(%.0f,%.0f,%.0f) base=(%.3f,%.3f) map=(%.3f,%.3f) ref_err=%.3f scan=(%.3f@%.3f) effective=%.3f",
-      latest_body_.bodyid,
-      latest_body_.centerofmass_x, latest_body_.centerofmass_y, latest_body_.centerofmass_z,
+      active_visual_body_.bodyid,
+      active_visual_body_.centerofmass_x, active_visual_body_.centerofmass_y,
+      active_visual_body_.centerofmass_z,
       base_x, base_y, map_person.point.x, map_person.point.y, reference_error,
       ray_distance, ray_angle, effective_front_distance);
   }
@@ -874,6 +1583,9 @@ private:
     if (!has_body_ || (now - last_body_time_).seconds() > lost_timeout_s_) {
       return;
     }
+
+    active_visual_body_ = latest_body_;
+    active_visual_body_time_ = last_body_time_;
 
     double person_x = 0.0;
     double person_y = 0.0;
@@ -1038,6 +1750,8 @@ private:
       left_avoidance_trigger_count_ == 0 &&
       right_avoidance_trigger_count_ == 0;
     if (first_close_sample) {
+      avoidance_visual_loss_seen_ = false;
+      reset_visual_reacquire_takeover_confirmation();
       avoidance_start_time_ = this->now();
       avoidance_goal_accept_time_ =
         rclcpp::Time(0, 0, get_clock()->get_clock_type());
@@ -1152,7 +1866,7 @@ private:
     return true;
   }
 
-  void reset_avoidance_episode()
+  void reset_avoidance_episode(bool preserve_takeover_phase = false)
   {
     avoidance_stage_ = AvoidanceStage::IDLE;
     last_sent_goal_kind_ = NavGoalKind::NORMAL;
@@ -1162,9 +1876,18 @@ private:
     right_avoidance_trigger_count_ = 0;
     active_avoidance_obstacle_ = ObstacleObservation();
     visual_reverse_takeover_count_ = 0;
+    visual_reverse_takeover_last_body_generation_ = body_generation_;
     visual_reverse_takeover_pending_ = false;
-    visual_clear_takeover_pending_ = false;
+    avoidance_visual_loss_seen_ = false;
+    dual_takeover_gate_open_ = false;
+    dual_handoff_retired_by_strict_ = false;
     reset_visual_clear_takeover_confirmation();
+    reset_visual_reacquire_takeover_confirmation(dual_handoff_active_);
+    reset_visual_safety_release_confirmation();
+    if (!preserve_takeover_phase) {
+      visual_takeover_phase_ = VisualTakeoverPhase::NONE;
+      reset_navigation_episode_tracking();
+    }
     has_side_trigger_target_ = false;
     avoidance_motion_logged_ = false;
     avoidance_start_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
@@ -1301,11 +2024,13 @@ private:
     double linear_scale,
     const std::string & state,
     double decel_limit_override = -1.0,
-    double minimum_forward_mps = 0.0)
+    double minimum_forward_mps = 0.0,
+    bool scale_angular_fully = false)
   {
     const auto now = this->now();
-    const double raw_x_angle = latest_body_.centerofmass_x / latest_body_.centerofmass_z;
-    const double raw_distance_mm = latest_body_.centerofmass_z;
+    const double raw_x_angle =
+      active_visual_body_.centerofmass_x / active_visual_body_.centerofmass_z;
+    const double raw_distance_mm = active_visual_body_.centerofmass_z;
 
     if (!visual_filter_init_) {
       filtered_x_angle_ = raw_x_angle;
@@ -1377,7 +2102,8 @@ private:
 
     const double safe_linear_scale = clamp_value(linear_scale, 0.0, 1.0);
     desired.linear.x *= safe_linear_scale;
-    desired.angular.z *= std::max(safe_linear_scale, 0.55);
+    desired.angular.z *= scale_angular_fully ?
+      safe_linear_scale : std::max(safe_linear_scale, 0.55);
 
     if (desired.linear.x > 0.0 && minimum_forward_mps > 0.0) {
       desired.linear.x = std::max(desired.linear.x, minimum_forward_mps);
@@ -1405,6 +2131,14 @@ private:
       (desired.linear.x < 0.0 ? visual_reverse_accel_limit_ : visual_linear_accel_limit_);
     const auto cmd = smooth_direct_cmd(desired, now, decel_limit);
     visual_cmd_pub_->publish(cmd);
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Visual cmd source=%s state=%s body=%d raw_x=%.0fmm raw_z=%.0fmm "
+      "scale=%.2f linear=%.3f angular=%.3f",
+      active_visual_body_is_dual_ ? "raw_dual" : "strict_validated",
+      state.c_str(), active_visual_body_.bodyid,
+      active_visual_body_.centerofmass_x, active_visual_body_.centerofmass_z,
+      safe_linear_scale, cmd.linear.x, cmd.angular.z);
     last_visual_error_angle_ = error_x_angle;
     last_visual_error_distance_ = error_distance;
     publish_state(visual_hold_active_ ? "visual_distance_hold" : state);
@@ -1420,24 +2154,64 @@ private:
     last_visual_error_distance_ = 0.0;
   }
 
+  void clear_exact_visual_observation()
+  {
+    has_body_ = false;
+    latest_body_ = bodyreader_msg::msg::Bodyposture();
+    active_visual_body_ = bodyreader_msg::msg::Bodyposture();
+    active_visual_body_is_dual_ = false;
+    last_body_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    active_visual_body_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    invalid_body_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    exact_observation_accept_after_ns_ =
+      now().nanoseconds() + kExactObservationFlushNs;
+    reset_visual_clear_takeover_confirmation();
+    reset_visual_reacquire_takeover_confirmation();
+    reset_visual_safety_release_confirmation();
+    visual_reverse_takeover_count_ = 0;
+    visual_reverse_takeover_last_body_generation_ = body_generation_;
+    visual_reverse_takeover_pending_ = false;
+  }
+
   void reset_visual_clear_takeover_confirmation()
   {
     visual_clear_takeover_count_ = 0;
-    visual_clear_takeover_last_body_generation_ = body_generation_;
+    visual_clear_takeover_last_scan_generation_ = scan_generation_;
   }
 
-  bool visual_clear_takeover_confirmed(
+  void reset_visual_reacquire_takeover_confirmation(
+    bool preserve_latest_sample = false)
+  {
+    visual_reacquire_takeover_count_ = 0;
+    visual_reacquire_body_id_ = 0;
+    if (!preserve_latest_sample) {
+      last_dual_presence_body_time_ =
+        rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    }
+  }
+
+  double dual_handoff_freshness_s() const
+  {
+    return std::max(
+      visual_reacquire_takeover_body_max_age_s_,
+      visual_reacquire_takeover_max_frame_interval_s_);
+  }
+
+  bool visual_takeover_progress_clearance_ready(
     const rclcpp::Time & now,
     const ObstacleScan & obstacles,
     bool avoidance_active,
-    bool nav_engaged,
-    bool visual_too_close)
+    bool nav_engaged) const
   {
-    const bool body_fresh =
-      (now - last_body_time_).seconds() <= visual_clear_takeover_body_max_age_s_;
-    const double avoidance_elapsed_s =
-      avoidance_start_time_.nanoseconds() == 0 ? 0.0 :
-      std::max(0.0, (now - avoidance_start_time_).seconds());
+    if (!avoidance_active || !nav_engaged || !scan_recent(now) ||
+        !scan_sectors_valid(obstacles) ||
+        avoidance_start_time_.nanoseconds() == 0 ||
+        (now - avoidance_start_time_).seconds() <
+        visual_clear_takeover_min_avoidance_s_)
+    {
+      return false;
+    }
+
     const bool front_clear =
       !std::isfinite(obstacles.front.distance) ||
       obstacles.front.distance >= visual_clear_takeover_front_clearance_m_;
@@ -1447,39 +2221,570 @@ private:
     const bool right_clear =
       !std::isfinite(obstacles.right.distance) ||
       obstacles.right.distance >= visual_clear_takeover_side_clearance_m_;
+    return front_clear && left_clear && right_clear;
+  }
+
+  bool visual_reacquire_takeover_confirmed(
+    const rclcpp::Time & now,
+    bool avoidance_active,
+    bool nav_engaged) const
+  {
+    const bool body_fresh =
+      last_dual_presence_body_time_.nanoseconds() != 0 &&
+      (now - last_dual_presence_body_time_).seconds() <=
+      dual_handoff_freshness_s();
+    return avoidance_active && nav_engaged && body_fresh &&
+      visual_reacquire_takeover_count_ >= visual_reacquire_takeover_confirm_frames_;
+  }
+
+  void reset_visual_safety_release_confirmation()
+  {
+    visual_safety_release_count_ = 0;
+    visual_safety_release_last_scan_generation_ = scan_generation_;
+  }
+
+  bool visual_safety_release_confirmed(const ObstacleScan & obstacles)
+  {
+    if (!scan_sectors_valid(obstacles) || !obstacles_released(obstacles)) {
+      reset_visual_safety_release_confirmation();
+      return false;
+    }
+    if (visual_safety_release_last_scan_generation_ == scan_generation_) {
+      return false;
+    }
+
+    visual_safety_release_last_scan_generation_ = scan_generation_;
+    visual_safety_release_count_ = std::min(
+      visual_safety_release_count_ + 1, visual_safety_release_confirm_frames_);
+    if (visual_safety_release_count_ < visual_safety_release_confirm_frames_) {
+      publish_state("visual_takeover_safety_release_confirming");
+      return false;
+    }
+    return true;
+  }
+
+  static bool navigation_goal_status_active(int8_t status)
+  {
+    using GoalStatus = action_msgs::msg::GoalStatus;
+    return status == GoalStatus::STATUS_ACCEPTED ||
+      status == GoalStatus::STATUS_EXECUTING ||
+      status == GoalStatus::STATUS_CANCELING;
+  }
+
+  static bool navigation_goal_status_cancelable(int8_t status)
+  {
+    using GoalStatus = action_msgs::msg::GoalStatus;
+    return status == GoalStatus::STATUS_ACCEPTED ||
+      status == GoalStatus::STATUS_EXECUTING;
+  }
+
+  static bool navigation_goal_status_terminal(int8_t status)
+  {
+    using GoalStatus = action_msgs::msg::GoalStatus;
+    return status == GoalStatus::STATUS_SUCCEEDED ||
+      status == GoalStatus::STATUS_CANCELED ||
+      status == GoalStatus::STATUS_ABORTED;
+  }
+
+  static std::string goal_uuid_string(const GoalUUID & uuid)
+  {
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0');
+    for (const auto byte : uuid) {
+      stream << std::setw(2) << static_cast<unsigned int>(byte);
+    }
+    return stream.str();
+  }
+
+  void attach_navigation_status_subscription(
+    const std::shared_ptr<NavigationActionTracker> & tracker)
+  {
+    const std::weak_ptr<NavigationActionTracker> weak_tracker = tracker;
+    tracker->status_sub = create_subscription<action_msgs::msg::GoalStatusArray>(
+      tracker->action_name + "/_action/status",
+      rclcpp_action::DefaultActionStatusQoS(),
+      [this, weak_tracker](const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
+        const auto tracker = weak_tracker.lock();
+        if (!tracker) {
+          return;
+        }
+        const int64_t receipt_ns = this->now().nanoseconds();
+        tracker->active_goal_ids_in_latest_status.clear();
+        for (const auto & status : msg->status_list) {
+          if (navigation_goal_status_active(status.status)) {
+            tracker->active_goal_ids_in_latest_status.insert(
+              status.goal_info.goal_id.uuid);
+          }
+        }
+        if (!navigation_episode_tracking_) {
+          return;
+        }
+
+        std::set<GoalUUID> ids_in_snapshot;
+        for (const auto & status : msg->status_list) {
+          const GoalUUID uuid = status.goal_info.goal_id.uuid;
+          ids_in_snapshot.insert(uuid);
+          const int64_t accepted_ns = rclcpp::Time(
+            status.goal_info.stamp, get_clock()->get_clock_type()).nanoseconds();
+          const int64_t capture_floor_ns = navigation_episode_start_ns_ -
+            static_cast<int64_t>(nav_takeover_child_capture_slop_s_ * 1e9);
+          const int64_t capture_ceiling_ns = navigation_parent_terminal_ ?
+            navigation_parent_terminal_ns_ +
+            static_cast<int64_t>(nav_takeover_child_capture_slop_s_ * 1e9) :
+            std::numeric_limits<int64_t>::max();
+          const bool eligible_for_episode =
+            accepted_ns > 0 && accepted_ns >= capture_floor_ns &&
+            accepted_ns <= capture_ceiling_ns;
+          if (eligible_for_episode &&
+              status.status != action_msgs::msg::GoalStatus::STATUS_UNKNOWN)
+          {
+            const bool inserted = tracker->episode_goal_ids.insert(uuid).second;
+            if (inserted) {
+              RCLCPP_INFO(
+                get_logger(),
+                "Captured navigation child action: action=%s uuid=%s status=%d",
+                tracker->action_name.c_str(), goal_uuid_string(uuid).c_str(),
+                static_cast<int>(status.status));
+            }
+          }
+
+          if (tracker->episode_goal_ids.count(uuid) != 0U) {
+            tracker->goal_statuses[uuid] = status.status;
+            tracker->last_goal_status_update_ns[uuid] = receipt_ns;
+          }
+        }
+
+        for (const auto & owned_uuid : tracker->episode_goal_ids) {
+          if (ids_in_snapshot.count(owned_uuid) == 0U) {
+            tracker->goal_statuses[owned_uuid] =
+              action_msgs::msg::GoalStatus::STATUS_UNKNOWN;
+            tracker->last_goal_status_update_ns[owned_uuid] = receipt_ns;
+          }
+        }
+
+        if (!tracker->active_goal_ids_in_latest_status.empty()) {
+          navigation_children_idle_since_ns_ = 0;
+        }
+      });
+  }
+
+  void create_navigation_action_tracker(const std::string & action_name)
+  {
+    auto tracker = std::make_shared<NavigationActionTracker>();
+    tracker->action_name = action_name;
+    tracker->cancel_client = create_client<action_msgs::srv::CancelGoal>(
+      action_name + "/_action/cancel_goal");
+    attach_navigation_status_subscription(tracker);
+    navigation_action_trackers_.push_back(tracker);
+  }
+
+  void start_navigation_episode_tracking()
+  {
+    navigation_episode_tracking_ = true;
+    navigation_parent_terminal_ = false;
+    navigation_episode_start_ns_ = this->now().nanoseconds();
+    navigation_parent_terminal_ns_ = 0;
+    navigation_drain_start_ns_ = 0;
+    navigation_children_idle_since_ns_ = 0;
+    navigation_parent_outcome_.clear();
+    ++navigation_episode_sequence_;
+    for (const auto & tracker : navigation_action_trackers_) {
+      tracker->episode_goal_ids.clear();
+      tracker->goal_statuses.clear();
+      tracker->last_goal_status_update_ns.clear();
+      tracker->last_cancel_request_ns.clear();
+      tracker->cancel_request_sequences.clear();
+      tracker->cancel_requests_in_flight.clear();
+    }
+    RCLCPP_INFO(
+      get_logger(), "Started navigation child tracking: episode=%llu",
+      static_cast<unsigned long long>(navigation_episode_sequence_));
+  }
+
+  void reset_navigation_episode_tracking()
+  {
+    navigation_episode_tracking_ = false;
+    navigation_parent_terminal_ = false;
+    navigation_episode_start_ns_ = 0;
+    navigation_parent_terminal_ns_ = 0;
+    navigation_drain_start_ns_ = 0;
+    navigation_children_idle_since_ns_ = 0;
+    navigation_parent_outcome_.clear();
+    ++navigation_episode_sequence_;
+    for (const auto & tracker : navigation_action_trackers_) {
+      tracker->episode_goal_ids.clear();
+      tracker->goal_statuses.clear();
+      tracker->last_goal_status_update_ns.clear();
+      tracker->last_cancel_request_ns.clear();
+      tracker->cancel_request_sequences.clear();
+      tracker->cancel_requests_in_flight.clear();
+    }
+  }
+
+  void cancel_tracked_navigation_children()
+  {
+    if (!navigation_episode_tracking_) {
+      return;
+    }
+    const int64_t now_ns = this->now().nanoseconds();
+    const int64_t retry_ns = static_cast<int64_t>(nav_takeover_cancel_retry_s_ * 1e9);
+    const auto episode_sequence = navigation_episode_sequence_;
+    for (const auto & tracker : navigation_action_trackers_) {
+      for (const auto & uuid : tracker->episode_goal_ids) {
+        const auto status_it = tracker->goal_statuses.find(uuid);
+        if (status_it == tracker->goal_statuses.end() ||
+            !navigation_goal_status_cancelable(status_it->second))
+        {
+          continue;
+        }
+        const auto cancel_it = tracker->last_cancel_request_ns.find(uuid);
+        if (tracker->cancel_requests_in_flight.count(uuid) != 0U) {
+          if (cancel_it != tracker->last_cancel_request_ns.end() &&
+              now_ns - cancel_it->second < retry_ns)
+          {
+            continue;
+          }
+          tracker->cancel_requests_in_flight.erase(uuid);
+          RCLCPP_WARN(
+            get_logger(),
+            "Navigation child cancel response timed out; retry exact UUID: action=%s uuid=%s",
+            tracker->action_name.c_str(), goal_uuid_string(uuid).c_str());
+        } else if (cancel_it != tracker->last_cancel_request_ns.end() &&
+          now_ns - cancel_it->second < retry_ns)
+        {
+          continue;
+        }
+        if (!tracker->cancel_client->service_is_ready()) {
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Navigation child cancel service unavailable: %s/_action/cancel_goal",
+            tracker->action_name.c_str());
+          navigation_children_idle_since_ns_ = 0;
+          continue;
+        }
+
+        auto request = std::make_shared<action_msgs::srv::CancelGoal::Request>();
+        request->goal_info.goal_id.uuid = uuid;
+        request->goal_info.stamp.sec = 0;
+        request->goal_info.stamp.nanosec = 0;
+        tracker->last_cancel_request_ns[uuid] = now_ns;
+        const uint64_t request_sequence = ++tracker->cancel_request_sequences[uuid];
+        tracker->cancel_requests_in_flight.insert(uuid);
+        navigation_children_idle_since_ns_ = 0;
+        tracker->cancel_client->async_send_request(
+          request,
+          [this, tracker, uuid, episode_sequence, request_sequence](
+            rclcpp::Client<action_msgs::srv::CancelGoal>::SharedFuture future) {
+            if (episode_sequence != navigation_episode_sequence_) {
+              return;
+            }
+            const auto request_it = tracker->cancel_request_sequences.find(uuid);
+            if (request_it == tracker->cancel_request_sequences.end() ||
+                request_it->second != request_sequence)
+            {
+              return;
+            }
+            tracker->cancel_requests_in_flight.erase(uuid);
+            try {
+              const auto response = future.get();
+              RCLCPP_INFO(
+                get_logger(),
+                "Navigation child cancel response: action=%s uuid=%s return_code=%d",
+                tracker->action_name.c_str(), goal_uuid_string(uuid).c_str(),
+                static_cast<int>(response->return_code));
+            } catch (const std::exception & ex) {
+              RCLCPP_ERROR(
+                get_logger(), "Navigation child cancel failed: action=%s error=%s",
+                tracker->action_name.c_str(), ex.what());
+            }
+          });
+      }
+    }
+  }
+
+  bool navigation_children_drained() const
+  {
+    if (!navigation_parent_terminal_) {
+      return false;
+    }
+    const int64_t now_ns = this->now().nanoseconds();
+    const int64_t discovery_ns =
+      static_cast<int64_t>(nav_takeover_child_discovery_s_ * 1e9);
+    if (now_ns - navigation_parent_terminal_ns_ < discovery_ns) {
+      return false;
+    }
+    for (const auto & tracker : navigation_action_trackers_) {
+      if (!tracker->active_goal_ids_in_latest_status.empty()) {
+        return false;
+      }
+      for (const auto & uuid : tracker->episode_goal_ids) {
+        const auto status_it = tracker->goal_statuses.find(uuid);
+        const bool explicit_terminal =
+          status_it != tracker->goal_statuses.end() &&
+          navigation_goal_status_terminal(status_it->second);
+        if (explicit_terminal) {
+          continue;
+        }
+
+        int64_t required_status_after_ns = navigation_parent_terminal_ns_;
+        const auto cancel_it = tracker->last_cancel_request_ns.find(uuid);
+        if (cancel_it != tracker->last_cancel_request_ns.end()) {
+          required_status_after_ns = std::max(
+            required_status_after_ns, cancel_it->second);
+        }
+        const auto update_it = tracker->last_goal_status_update_ns.find(uuid);
+        if (update_it == tracker->last_goal_status_update_ns.end() ||
+            update_it->second <= required_status_after_ns)
+        {
+          return false;
+        }
+        const bool confirmed_absent_in_fresh_full_snapshot =
+          status_it != tracker->goal_statuses.end() &&
+          status_it->second == action_msgs::msg::GoalStatus::STATUS_UNKNOWN &&
+          tracker->active_goal_ids_in_latest_status.count(uuid) == 0U;
+        if (!confirmed_absent_in_fresh_full_snapshot) {
+          return false;
+        }
+      }
+    }
+    return !spin_active_;
+  }
+
+  std::string active_navigation_children_summary() const
+  {
+    std::ostringstream stream;
+    bool first = true;
+    for (const auto & tracker : navigation_action_trackers_) {
+      for (const auto & uuid : tracker->active_goal_ids_in_latest_status) {
+        const auto status_it = tracker->goal_statuses.find(uuid);
+        if (!first) {
+          stream << ',';
+        }
+        first = false;
+        stream << tracker->action_name << ':';
+        if (status_it != tracker->goal_statuses.end()) {
+          stream << static_cast<int>(status_it->second);
+        } else {
+          stream << "unowned";
+        }
+        stream << ':' << goal_uuid_string(uuid).substr(0, 8);
+      }
+    }
+    if (first) {
+      return "none";
+    }
+    return stream.str();
+  }
+
+  bool visual_takeover_cancel_pending() const
+  {
+    return
+      visual_takeover_phase_ == VisualTakeoverPhase::CANCEL_PENDING_CLEAR ||
+      visual_takeover_phase_ == VisualTakeoverPhase::CANCEL_PENDING_REACQUIRE;
+  }
+
+  bool visual_takeover_drain_active() const
+  {
+    return
+      visual_takeover_phase_ == VisualTakeoverPhase::NAV_DRAINING_CLEAR ||
+      visual_takeover_phase_ == VisualTakeoverPhase::NAV_DRAINING_REACQUIRE;
+  }
+
+  static bool visual_takeover_phase_is_reacquire(VisualTakeoverPhase phase)
+  {
+    return
+      phase == VisualTakeoverPhase::CANCEL_PENDING_REACQUIRE ||
+      phase == VisualTakeoverPhase::NAV_DRAINING_REACQUIRE;
+  }
+
+  void reset_parent_cancel_tracking()
+  {
+    ++parent_cancel_request_sequence_;
+    parent_cancel_in_flight_ = false;
+    parent_cancel_acknowledged_ = false;
+    parent_cancel_last_request_ns_ = 0;
+    active_parent_goal_sequence_ = 0;
+    cancel_sent_ = false;
+  }
+
+  void request_current_navigation_goal_cancel(const std::string & reason)
+  {
+    if (!goal_handle_) {
+      if (goal_active_ || has_sent_goal_) {
+        publish_state("wait_goal_handle_to_cancel_" + reason);
+      }
+      return;
+    }
+    if (parent_cancel_acknowledged_) {
+      return;
+    }
+
+    const int64_t now_ns = this->now().nanoseconds();
+    const int64_t retry_ns = static_cast<int64_t>(nav_takeover_cancel_retry_s_ * 1e9);
+    if (parent_cancel_last_request_ns_ != 0 &&
+        now_ns - parent_cancel_last_request_ns_ < retry_ns)
+    {
+      return;
+    }
+    if (parent_cancel_in_flight_) {
+      RCLCPP_WARN(
+        get_logger(),
+        "NavigateToPose cancel response timed out; retry exact current goal");
+      parent_cancel_in_flight_ = false;
+    }
+
+    const auto goal_handle = goal_handle_;
+    const auto goal_uuid = goal_handle->get_goal_id();
+    const uint64_t goal_sequence = active_parent_goal_sequence_;
+    const uint64_t request_sequence = ++parent_cancel_request_sequence_;
+    parent_cancel_in_flight_ = true;
+    parent_cancel_last_request_ns_ = now_ns;
+    cancel_sent_ = true;
+    try {
+      nav_client_->async_cancel_goal(
+        goal_handle,
+        [this, goal_sequence, request_sequence, goal_uuid](auto response) {
+          if (goal_sequence == 0 || goal_sequence != active_parent_goal_sequence_ ||
+              request_sequence != parent_cancel_request_sequence_ ||
+              !goal_handle_ || goal_handle_->get_goal_id() != goal_uuid)
+          {
+            return;
+          }
+          parent_cancel_in_flight_ = false;
+          if (response && response->return_code == 0) {
+            parent_cancel_acknowledged_ = true;
+            RCLCPP_INFO(
+              get_logger(),
+              "NavigateToPose exact cancel accepted: uuid=%s; wait for terminal result",
+              goal_uuid_string(goal_uuid).c_str());
+          } else {
+            parent_cancel_acknowledged_ = false;
+            cancel_sent_ = false;
+            RCLCPP_WARN(
+              get_logger(),
+              "NavigateToPose exact cancel rejected: uuid=%s return_code=%d; retry",
+              goal_uuid_string(goal_uuid).c_str(),
+              response ? static_cast<int>(response->return_code) : -1);
+          }
+        });
+      publish_state("cancel_" + reason);
+    } catch (const std::exception & ex) {
+      parent_cancel_in_flight_ = false;
+      parent_cancel_acknowledged_ = false;
+      cancel_sent_ = false;
+      RCLCPP_ERROR(
+        get_logger(), "NavigateToPose exact cancel failed: %s", ex.what());
+    }
+  }
+
+  void request_visual_takeover_cancel(const std::string & reason)
+  {
+    request_current_navigation_goal_cancel(reason);
+  }
+
+  void complete_visual_takeover_transition(
+    VisualTakeoverPhase requested_phase,
+    const std::string & nav_outcome)
+  {
+    if (!takeover_phase_is_pending(requested_phase)) {
+      return;
+    }
+
+    if (!navigation_episode_tracking_) {
+      start_navigation_episode_tracking();
+      if (last_goal_send_time_.nanoseconds() != 0) {
+        navigation_episode_start_ns_ = last_goal_send_time_.nanoseconds();
+      }
+    }
+    navigation_parent_terminal_ = true;
+    navigation_parent_terminal_ns_ = this->now().nanoseconds();
+    navigation_drain_start_ns_ = navigation_parent_terminal_ns_;
+    navigation_children_idle_since_ns_ = 0;
+    navigation_parent_outcome_ = nav_outcome;
+    visual_takeover_phase_ =
+      requested_phase == VisualTakeoverPhase::CANCEL_PENDING_REACQUIRE ?
+      VisualTakeoverPhase::NAV_DRAINING_REACQUIRE :
+      VisualTakeoverPhase::NAV_DRAINING_CLEAR;
+    cancel_tracked_navigation_children();
+    reset_visual_controller();
+    RCLCPP_INFO(
+      get_logger(),
+      "NavigateToPose %s; enter navigation drain before visual takeover",
+      nav_outcome.c_str());
+    publish_state("visual_takeover_navigation_draining");
+  }
+
+  void finish_visual_takeover_transition(VisualTakeoverPhase drain_phase)
+  {
+    if (drain_phase != VisualTakeoverPhase::NAV_DRAINING_CLEAR &&
+        drain_phase != VisualTakeoverPhase::NAV_DRAINING_REACQUIRE)
+    {
+      return;
+    }
+
+    nav_retry_waiting_ = false;
+    reset_avoidance_episode(true);
+    visual_takeover_phase_ = VisualTakeoverPhase::SAFETY_GATE;
+    reset_navigation_episode_tracking();
+    avoidance_rearm_required_ = true;
+    awaiting_visual_after_avoidance_ = true;
+    clear_exact_visual_observation();
+    reset_visual_controller();
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Navigation actions drained for exact YOLO+skeleton visual takeover; "
+      "hold zero until a fresh exact observation and two safe scans");
+    publish_state("visual_takeover_safety_gate");
+  }
+
+  static bool takeover_phase_is_pending(VisualTakeoverPhase phase)
+  {
+    return
+      phase == VisualTakeoverPhase::CANCEL_PENDING_CLEAR ||
+      phase == VisualTakeoverPhase::CANCEL_PENDING_REACQUIRE;
+  }
+
+  bool visual_clear_takeover_confirmed(
+    const rclcpp::Time & now,
+    const ObstacleScan & obstacles,
+    bool avoidance_active,
+    bool nav_engaged)
+  {
+    const double avoidance_elapsed_s =
+      avoidance_start_time_.nanoseconds() == 0 ? 0.0 :
+      std::max(0.0, (now - avoidance_start_time_).seconds());
     const bool candidate =
-      avoidance_active && nav_engaged && !visual_too_close && body_fresh &&
-      avoidance_elapsed_s >= visual_clear_takeover_min_avoidance_s_ &&
-      front_clear && left_clear && right_clear;
+      visual_takeover_progress_clearance_ready(
+      now, obstacles, avoidance_active, nav_engaged);
 
     if (!candidate) {
       reset_visual_clear_takeover_confirmation();
       return false;
     }
-    if (visual_clear_takeover_last_body_generation_ == body_generation_) {
+    if (visual_clear_takeover_last_scan_generation_ == scan_generation_) {
       return false;
     }
 
-    visual_clear_takeover_last_body_generation_ = body_generation_;
+    visual_clear_takeover_last_scan_generation_ = scan_generation_;
     ++visual_clear_takeover_count_;
     if (visual_clear_takeover_count_ == 1) {
       RCLCPP_INFO(
         get_logger(),
-        "Visual clear takeover candidate: front=%.2f left=%.2f right=%.2f "
-        "body_age=%.3f avoidance_elapsed=%.2f required_frames=%d",
+        "Physical-clear takeover candidate: front=%.2f left=%.2f right=%.2f "
+        "avoidance_elapsed=%.2f required_scans=%d",
         obstacles.front.distance, obstacles.left.distance, obstacles.right.distance,
-        (now - last_body_time_).seconds(), avoidance_elapsed_s,
-        visual_clear_takeover_confirm_frames_);
+        avoidance_elapsed_s, visual_clear_takeover_confirm_frames_);
     }
 
     if (visual_clear_takeover_count_ < visual_clear_takeover_confirm_frames_) {
-      publish_state("visual_clear_takeover_confirming");
+      publish_state("physical_clear_takeover_confirming");
       return false;
     }
 
     RCLCPP_INFO(
       get_logger(),
-      "Visual clear takeover confirmed: front=%.2f left=%.2f right=%.2f frames=%d",
+      "Physical-clear takeover confirmed: front=%.2f left=%.2f right=%.2f scans=%d",
       obstacles.front.distance, obstacles.left.distance, obstacles.right.distance,
       visual_clear_takeover_count_);
     return true;
@@ -1526,15 +2831,334 @@ private:
     }
     motion_gate_stop_published_ = false;
 
+    if (has_body_ && invalid_body_since_.nanoseconds() != 0 &&
+        (now - invalid_body_since_).seconds() >= body_invalid_grace_s_)
+    {
+      if (avoidance_episode_active()) {
+        avoidance_visual_loss_seen_ = true;
+      }
+      has_body_ = false;
+      active_visual_body_ = bodyreader_msg::msg::Bodyposture();
+      active_visual_body_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      visual_reverse_takeover_count_ = 0;
+      visual_reverse_takeover_last_body_generation_ = body_generation_;
+      visual_reverse_takeover_pending_ = false;
+      RCLCPP_WARN(
+        get_logger(),
+        "Exact YOLO+skeleton observation grace expired after %.3fs; stop using cached geometry",
+        (now - invalid_body_since_).seconds());
+    }
+
     geometry_msgs::msg::PoseStamped goal;
     NavGoalKind goal_kind = NavGoalKind::NORMAL;
-    const bool visual_recent = has_body_ && (now - last_body_time_).seconds() <= lost_timeout_s_;
+    const bool visual_recent =
+      has_body_ && (now - last_body_time_).seconds() <= lost_timeout_s_;
+    if (visual_recent) {
+      active_visual_body_ = latest_body_;
+      active_visual_body_time_ = last_body_time_;
+      active_visual_body_is_dual_ = false;
+    }
     const bool has_memory = has_last_person_map_;
     const double memory_age = has_memory ? (now - last_person_map_time_).seconds() : 0.0;
     const bool avoidance_active = avoidance_episode_active();
+    const bool nav_engaged = goal_active_ || has_sent_goal_;
     if (!visual_recent) {
-      reset_visual_clear_takeover_confirmation();
+      visual_reverse_takeover_count_ = 0;
+      visual_reverse_takeover_last_body_generation_ = body_generation_;
     }
+
+    if (visual_takeover_cancel_pending()) {
+      const auto requested_phase = visual_takeover_phase_;
+      cancel_spin("visual_takeover_pending");
+      request_visual_takeover_cancel("visual_takeover_during_avoidance");
+      cancel_tracked_navigation_children();
+      if (!goal_active_ && !has_sent_goal_) {
+        complete_visual_takeover_transition(requested_phase, "not_active");
+      }
+      reset_visual_controller();
+      publish_safety_stop_cmd("cancel_nav2_visual_takeover_pending");
+      return;
+    }
+
+    if (visual_takeover_drain_active()) {
+      const auto drain_phase = visual_takeover_phase_;
+      cancel_spin("visual_takeover_navigation_draining");
+      cancel_tracked_navigation_children();
+
+      const bool children_drained = navigation_children_drained();
+      const bool cmd_quiet =
+        (now - last_cmd_motion_time_).seconds() >= nav_takeover_cmd_quiet_s_;
+      if (!children_drained || !cmd_quiet) {
+        navigation_children_idle_since_ns_ = 0;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Navigation drain holds visual takeover: children=%s active=%s "
+          "cmd_quiet=%s age=%.3f/%.3f",
+          children_drained ? "drained" : "pending",
+          active_navigation_children_summary().c_str(),
+          cmd_quiet ? "true" : "false",
+          (now - last_cmd_motion_time_).seconds(), nav_takeover_cmd_quiet_s_);
+        reset_visual_controller();
+        publish_safety_stop_cmd("visual_takeover_navigation_draining_stop");
+        return;
+      }
+
+      if (navigation_children_idle_since_ns_ == 0) {
+        navigation_children_idle_since_ns_ = now.nanoseconds();
+      }
+      const double idle_s =
+        static_cast<double>(now.nanoseconds() - navigation_children_idle_since_ns_) * 1e-9;
+      if (idle_s < nav_takeover_status_quiet_s_) {
+        reset_visual_controller();
+        publish_safety_stop_cmd("visual_takeover_navigation_quiet_confirming");
+        return;
+      }
+
+      RCLCPP_INFO(
+        get_logger(),
+        "Navigation drain complete: parent=%s child_idle=%.3fs cmd_idle=%.3fs",
+        navigation_parent_outcome_.c_str(), idle_s,
+        (now - last_cmd_motion_time_).seconds());
+      finish_visual_takeover_transition(drain_phase);
+      publish_safety_stop_cmd("visual_takeover_navigation_drained_stop");
+      return;
+    }
+
+    if (visual_takeover_phase_ == VisualTakeoverPhase::NONE && !nav_engaged &&
+        now.nanoseconds() < exact_observation_accept_after_ns_)
+    {
+      cancel_spin("exact_stream_handoff_flush");
+      reset_visual_controller();
+      publish_safety_stop_cmd("exact_stream_handoff_flush_stop");
+      return;
+    }
+
+#if 0
+    if (position_jump_hold_active_ || position_jump_recovery_waiting_) {
+      reset_visual_controller();
+      if (nav_engaged) {
+        // An unconfirmed target-depth jump invalidates visual evidence, not
+        // the already-running obstacle-avoidance task. Do not publish a
+        // competing zero cmd_vel and do not cancel any Nav2 action here.
+        publish_state(position_jump_hold_active_ ?
+          "target_position_jump_pending_nav2_continue" :
+          "target_position_jump_wait_fresh_nav2_continue");
+        return;
+      }
+      if (spin_active_) {
+        cancel_spin("target_position_jump_direct_hold");
+      }
+      if (avoidance_active && !nav_engaged && !spin_active_ &&
+          visual_takeover_phase_ == VisualTakeoverPhase::NONE)
+      {
+        reset_avoidance_episode();
+        avoidance_rearm_required_ = false;
+      }
+      publish_safety_stop_cmd(position_jump_hold_active_ ?
+        "target_position_jump_direct_hold_stop" :
+        "target_position_jump_wait_fresh_stop");
+      return;
+    }
+#endif
+
+    if (visual_takeover_phase_ == VisualTakeoverPhase::SAFETY_GATE) {
+      cancel_spin("visual_takeover_safety_gate");
+      if (spin_active_) {
+        reset_visual_safety_release_confirmation();
+        reset_visual_controller();
+        publish_safety_stop_cmd("visual_takeover_spin_cancel_pending");
+        return;
+      }
+      const bool strict_visual_recent =
+        visual_recent &&
+        (now - last_body_time_).seconds() <= visual_clear_takeover_body_max_age_s_;
+      if (!strict_visual_recent) {
+        reset_visual_safety_release_confirmation();
+        reset_visual_controller();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Visual safety gate holds: fresh exact body is stale or absent");
+        publish_safety_stop_cmd("visual_takeover_body_stale_hold");
+        return;
+      }
+      if (!scan_recent(now)) {
+        reset_visual_safety_release_confirmation();
+        reset_visual_controller();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Visual safety gate holds: laser scan is stale");
+        publish_safety_stop_cmd("visual_takeover_scan_stale_hold");
+        return;
+      }
+
+      const ObstacleScan gate_obstacles = scan_obstacles(false);
+      if (!scan_sectors_valid(gate_obstacles)) {
+        reset_visual_safety_release_confirmation();
+        reset_visual_controller();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Visual safety gate holds: invalid scan sectors front=%zu left=%zu right=%zu",
+          gate_obstacles.front.finite_ray_count,
+          gate_obstacles.left.finite_ray_count,
+          gate_obstacles.right.finite_ray_count);
+        publish_safety_stop_cmd("visual_takeover_scan_invalid_hold");
+        return;
+      }
+      const bool front_blocked =
+        std::isfinite(gate_obstacles.front.distance) &&
+        gate_obstacles.front.distance <= obstacle_nav_distance_m_;
+      const bool left_not_released =
+        std::isfinite(gate_obstacles.left.distance) &&
+        gate_obstacles.left.distance < side_obstacle_release_distance_m_;
+      const bool right_not_released =
+        std::isfinite(gate_obstacles.right.distance) &&
+        gate_obstacles.right.distance < side_obstacle_release_distance_m_;
+      const bool visual_too_close =
+        active_visual_body_.centerofmass_z * 0.001 <
+        follow_distance_m_ - hold_distance_band_m_;
+
+      if (front_blocked || left_not_released || right_not_released || visual_too_close) {
+        reset_visual_safety_release_confirmation();
+        reset_visual_controller();
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Visual safety gate holds zero velocity: front=%.2f left=%.2f right=%.2f "
+          "too_close=%s",
+          gate_obstacles.front.distance, gate_obstacles.left.distance,
+          gate_obstacles.right.distance, visual_too_close ? "true" : "false");
+        publish_safety_stop_cmd("visual_takeover_obstacle_hold");
+        return;
+      }
+
+      if (!obstacles_released(gate_obstacles)) {
+        reset_visual_safety_release_confirmation();
+        reset_visual_controller();
+        publish_safety_stop_cmd("visual_takeover_obstacle_release_hold");
+        return;
+      }
+
+      if (!visual_safety_release_confirmed(gate_obstacles)) {
+        reset_visual_controller();
+        publish_safety_stop_cmd("visual_takeover_release_confirming_stop");
+        return;
+      }
+
+      visual_takeover_phase_ = VisualTakeoverPhase::NONE;
+      avoidance_rearm_required_ = false;
+      reset_visual_safety_release_confirmation();
+      RCLCPP_INFO(
+        get_logger(),
+        "Visual safety gate released after fresh scan confirmation: "
+        "front=%.2f left=%.2f right=%.2f",
+        gate_obstacles.front.distance, gate_obstacles.left.distance,
+        gate_obstacles.right.distance);
+      publish_state("visual_takeover_safety_released");
+    }
+
+#if 0
+    const bool dual_gate_scan_fresh = scan_recent(now);
+    const ObstacleScan dual_gate_obstacles =
+      dual_gate_scan_fresh ? scan_obstacles(visual_recent) : ObstacleScan();
+    const bool dual_sample_fresh =
+      last_dual_presence_body_time_.nanoseconds() != 0 &&
+      (now - last_dual_presence_body_time_).seconds() <=
+      dual_handoff_freshness_s();
+    const bool dual_visual_too_close =
+      dual_sample_fresh &&
+      latest_dual_presence_body_.centerofmass_z * 0.001 <
+      follow_distance_m_ - hold_distance_band_m_;
+    const bool dual_takeover_gate_ready =
+      dual_gate_scan_fresh &&
+      scan_sectors_valid(dual_gate_obstacles) &&
+      !dual_visual_too_close &&
+      visual_takeover_progress_clearance_ready(
+      now, dual_gate_obstacles, avoidance_active, nav_engaged);
+
+    if (avoidance_active && nav_engaged &&
+        visual_takeover_phase_ == VisualTakeoverPhase::NONE)
+    {
+      if (!dual_takeover_gate_ready) {
+        const double scan_age = last_scan_time_.nanoseconds() == 0 ? -1.0 :
+          (now - last_scan_time_).seconds();
+        const double avoidance_elapsed = avoidance_start_time_.nanoseconds() == 0 ? -1.0 :
+          (now - avoidance_start_time_).seconds();
+        const double dual_age = last_dual_presence_body_time_.nanoseconds() == 0 ? -1.0 :
+          (now - last_dual_presence_body_time_).seconds();
+        const bool sectors_valid = scan_sectors_valid(dual_gate_obstacles);
+        const bool elapsed_ready = avoidance_elapsed >= visual_clear_takeover_min_avoidance_s_;
+        const bool front_clear =
+          !std::isfinite(dual_gate_obstacles.front.distance) ||
+          dual_gate_obstacles.front.distance >= visual_clear_takeover_front_clearance_m_;
+        const bool left_clear =
+          !std::isfinite(dual_gate_obstacles.left.distance) ||
+          dual_gate_obstacles.left.distance >= visual_clear_takeover_side_clearance_m_;
+        const bool right_clear =
+          !std::isfinite(dual_gate_obstacles.right.distance) ||
+          dual_gate_obstacles.right.distance >= visual_clear_takeover_side_clearance_m_;
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Dual takeover gate closed: scan_fresh=%s age=%.3f/%.3f "
+          "sectors_valid=%s rays=%zu/%zu/%zu elapsed_ready=%s elapsed=%.2f/%.2f "
+          "too_close=%s "
+          "clear=%s/%s/%s dist=%.2f/%.2f/%.2f threshold=%.2f/%.2f "
+          "dual_fresh=%s age=%.3f count=%d/%d goal_active=%s handle=%s cancel_sent=%s",
+          dual_gate_scan_fresh ? "true" : "false", scan_age, scan_timeout_s_,
+          sectors_valid ? "true" : "false",
+          dual_gate_obstacles.front.finite_ray_count,
+          dual_gate_obstacles.left.finite_ray_count,
+          dual_gate_obstacles.right.finite_ray_count,
+          elapsed_ready ? "true" : "false",
+          avoidance_elapsed, visual_clear_takeover_min_avoidance_s_,
+          dual_visual_too_close ? "true" : "false",
+          front_clear ? "true" : "false",
+          left_clear ? "true" : "false",
+          right_clear ? "true" : "false",
+          dual_gate_obstacles.front.distance,
+          dual_gate_obstacles.left.distance,
+          dual_gate_obstacles.right.distance,
+          visual_clear_takeover_front_clearance_m_,
+          visual_clear_takeover_side_clearance_m_,
+          dual_sample_fresh ? "true" : "false", dual_age,
+          visual_reacquire_takeover_count_,
+          visual_reacquire_takeover_confirm_frames_,
+          goal_active_ ? "true" : "false",
+          goal_handle_ ? "true" : "false",
+          cancel_sent_ ? "true" : "false");
+        dual_takeover_gate_open_ = false;
+        reset_visual_reacquire_takeover_confirmation();
+      } else if (!dual_takeover_gate_open_) {
+        dual_takeover_gate_open_ = true;
+        reset_visual_reacquire_takeover_confirmation();
+        RCLCPP_INFO(
+          get_logger(),
+          "Avoidance progress/clearance satisfied: front=%.2f left=%.2f right=%.2f; "
+          "wait for %d fresh skeleton+YOLO frames",
+          dual_gate_obstacles.front.distance,
+          dual_gate_obstacles.left.distance,
+          dual_gate_obstacles.right.distance,
+          visual_reacquire_takeover_confirm_frames_);
+      }
+    } else if (!avoidance_active || !nav_engaged) {
+      dual_takeover_gate_open_ = false;
+    }
+
+    if (visual_takeover_phase_ == VisualTakeoverPhase::NONE &&
+        dual_takeover_gate_open_ &&
+        visual_reacquire_takeover_confirmed(now, avoidance_active, nav_engaged))
+    {
+      dual_handoff_retired_by_strict_ = false;
+      visual_takeover_phase_ = VisualTakeoverPhase::CANCEL_PENDING_REACQUIRE;
+      awaiting_visual_after_avoidance_ = false;
+      RCLCPP_INFO(
+        get_logger(),
+        "Post-clearance skeleton+YOLO confirmed after %d frames; cancel current Nav2 goal",
+        visual_reacquire_takeover_count_);
+      request_visual_takeover_cancel("post_clearance_dual_presence");
+      reset_visual_controller();
+      publish_safety_stop_cmd("cancel_nav2_post_clearance_dual_presence");
+      return;
+    }
+#endif
 
     if (avoidance_active && has_sent_goal_ && !avoidance_motion_logged_ &&
         avoidance_start_time_.nanoseconds() != 0 &&
@@ -1548,27 +3172,33 @@ private:
         avoidance_goal_accept_time_.nanoseconds() == 0 ? "false" : "true");
     }
 
-    if (visual_clear_takeover_pending_) {
-      cancel_goal("visual_clear_takeover_during_avoidance");
-      if (!goal_active_ && !has_sent_goal_) {
-        reset_avoidance_episode();
-        avoidance_rearm_required_ = true;
-        awaiting_visual_after_avoidance_ = false;
-      }
-      reset_visual_controller();
-      publish_safety_stop_cmd("cancel_nav2_visual_clear_during_avoidance");
-      return;
-    }
-
     if (visual_reverse_takeover_pending_) {
-      cancel_goal("visual_reverse_takeover_during_avoidance");
-      if (!goal_active_ && !has_sent_goal_) {
-        reset_avoidance_episode();
-        avoidance_rearm_required_ = true;
+      if (visual_takeover_phase_ == VisualTakeoverPhase::NONE) {
+        visual_takeover_phase_ = VisualTakeoverPhase::CANCEL_PENDING_CLEAR;
       }
+      request_visual_takeover_cancel("visual_reverse_takeover_during_avoidance");
       reset_visual_controller();
       publish_safety_stop_cmd("cancel_nav2_visual_reverse_during_avoidance");
       return;
+    }
+
+    if (visual_takeover_phase_ == VisualTakeoverPhase::NONE &&
+        avoidance_active && nav_engaged)
+    {
+      const ObstacleScan takeover_obstacles =
+        scan_recent(now) ? scan_obstacles(false) : ObstacleScan();
+      if (visual_clear_takeover_confirmed(
+          now, takeover_obstacles, avoidance_active, nav_engaged))
+      {
+        visual_takeover_phase_ = VisualTakeoverPhase::CANCEL_PENDING_CLEAR;
+        awaiting_visual_after_avoidance_ = true;
+        request_visual_takeover_cancel("physical_clear_takeover");
+        reset_visual_controller();
+        publish_safety_stop_cmd("cancel_nav2_physical_clear_takeover");
+        return;
+      }
+    } else if (!avoidance_active || !nav_engaged) {
+      reset_visual_clear_takeover_confirmation();
     }
 
     if (visual_recent) {
@@ -1618,41 +3248,29 @@ private:
         obstacles.right.distance < side_obstacle_release_distance_m_);
       const bool front_clear_for_side_approach =
         !std::isfinite(front_distance) || front_distance >= obstacle_slow_distance_m_;
-      const bool nav_engaged = goal_active_ || has_sent_goal_;
       const bool visual_too_close =
-        latest_body_.centerofmass_z * 0.001 < follow_distance_m_ - hold_distance_band_m_;
+        active_visual_body_.centerofmass_z * 0.001 <
+        follow_distance_m_ - hold_distance_band_m_;
 
-      visual_reverse_takeover_count_ =
-        avoidance_active && visual_allow_reverse_ && visual_too_close ?
-        std::min(
+      const bool reverse_takeover_candidate =
+        avoidance_active && visual_allow_reverse_ && visual_too_close;
+      if (!reverse_takeover_candidate) {
+        visual_reverse_takeover_count_ = 0;
+        visual_reverse_takeover_last_body_generation_ = body_generation_;
+      } else if (visual_reverse_takeover_last_body_generation_ != body_generation_) {
+        visual_reverse_takeover_last_body_generation_ = body_generation_;
+        visual_reverse_takeover_count_ = std::min(
           visual_reverse_takeover_count_ + 1,
-          BODY_NAV2_VISUAL_REVERSE_TAKEOVER_CONFIRM_TICKS) : 0;
+          BODY_NAV2_VISUAL_REVERSE_TAKEOVER_CONFIRM_TICKS);
+      }
       if (visual_reverse_takeover_count_ >=
           BODY_NAV2_VISUAL_REVERSE_TAKEOVER_CONFIRM_TICKS)
       {
         visual_reverse_takeover_pending_ = true;
-        cancel_goal("visual_reverse_takeover_during_avoidance");
-        if (!goal_active_ && !has_sent_goal_) {
-          reset_avoidance_episode();
-          avoidance_rearm_required_ = true;
-        }
+        visual_takeover_phase_ = VisualTakeoverPhase::CANCEL_PENDING_CLEAR;
+        request_visual_takeover_cancel("visual_reverse_takeover_during_avoidance");
         reset_visual_controller();
         publish_safety_stop_cmd("cancel_nav2_visual_reverse_during_avoidance");
-        return;
-      }
-
-      if (visual_clear_takeover_confirmed(
-          now, obstacles, avoidance_active, nav_engaged, visual_too_close))
-      {
-        visual_clear_takeover_pending_ = true;
-        awaiting_visual_after_avoidance_ = false;
-        cancel_goal("visual_clear_takeover_during_avoidance");
-        if (!goal_active_ && !has_sent_goal_) {
-          reset_avoidance_episode();
-          avoidance_rearm_required_ = true;
-        }
-        reset_visual_controller();
-        publish_safety_stop_cmd("cancel_nav2_visual_clear_during_avoidance");
         return;
       }
 
@@ -1677,9 +3295,9 @@ private:
       } else {
           if (visual_allow_reverse_ && visual_too_close) {
           if (nav_engaged) {
-            cancel_goal("visual_reverse_takeover");
-            reset_avoidance_episode();
-            publish_stop_cmd("cancel_nav2_visual_reverse");
+            visual_takeover_phase_ = VisualTakeoverPhase::CANCEL_PENDING_CLEAR;
+            request_visual_takeover_cancel("visual_reverse_takeover");
+            publish_safety_stop_cmd("cancel_nav2_visual_reverse");
             return;
           }
 
@@ -1737,9 +3355,9 @@ private:
           remember_last_clear_person_pose();
 
           if (nav_engaged) {
-            cancel_goal("visual_direct_takeover");
-            reset_avoidance_episode();
-            publish_stop_cmd("cancel_nav2_visual_direct");
+            visual_takeover_phase_ = VisualTakeoverPhase::CANCEL_PENDING_CLEAR;
+            request_visual_takeover_cancel("visual_direct_takeover");
+            publish_safety_stop_cmd("cancel_nav2_visual_direct");
             return;
           }
 
@@ -1773,6 +3391,12 @@ private:
       reset_visual_controller();
       cancel_goal("awaiting_visual_after_avoidance");
 
+      if (now.nanoseconds() < exact_observation_accept_after_ns_) {
+        cancel_spin("post_avoidance_exact_stream_flush");
+        publish_safety_stop_cmd("post_avoidance_exact_stream_flush_stop");
+        return;
+      }
+
       if (!scan_recent(now)) {
         cancel_spin("post_avoidance_scan_stale");
         publish_safety_stop_cmd("post_avoidance_scan_stale_stop");
@@ -1791,7 +3415,12 @@ private:
         return;
       }
 
-      start_reacquire_spin("post_avoidance_reacquire", true);
+      if (!reacquire_yaw_goal_) {
+        publish_stop_cmd("post_avoidance_wait_exact_target");
+        return;
+      }
+
+      start_reacquire_spin("post_avoidance_reacquire");
       if (!spin_active_) {
         publish_stop_cmd("post_avoidance_reacquire_wait");
       }
@@ -2069,12 +3698,23 @@ private:
     options.goal_response_callback =
       [this, spin_sequence](GoalHandleSpin::SharedPtr goal_handle) {
         if (spin_sequence != spin_sequence_) {
+          if (goal_handle) {
+            spin_client_->async_cancel_goal(goal_handle);
+            RCLCPP_WARN(
+              get_logger(),
+              "Cancel accepted stale spin response: seq=%llu current=%llu",
+              static_cast<unsigned long long>(spin_sequence),
+              static_cast<unsigned long long>(spin_sequence_));
+          }
           return;
         }
 
         if (!goal_handle) {
           spin_active_ = false;
           spin_handle_.reset();
+          if (spin_cancel_requested_sequence_ == spin_sequence) {
+            spin_cancel_requested_sequence_ = 0;
+          }
           publish_state("spin_rejected");
           RCLCPP_WARN(get_logger(), "Nav2 rejected reacquire spin goal");
           return;
@@ -2084,6 +3724,12 @@ private:
         spin_cancel_sent_ = false;
         spin_handle_ = goal_handle;
         publish_state("spin_accepted");
+        if (spin_cancel_requested_sequence_ == spin_sequence ||
+            visual_takeover_phase_ != VisualTakeoverPhase::NONE ||
+            position_jump_hold_active_ || position_jump_recovery_waiting_)
+        {
+          cancel_spin("visual_or_position_hold_after_spin_accept");
+        }
       };
 
     options.result_callback =
@@ -2095,6 +3741,9 @@ private:
         spin_active_ = false;
         spin_cancel_sent_ = false;
         spin_handle_.reset();
+        if (spin_cancel_requested_sequence_ == spin_sequence) {
+          spin_cancel_requested_sequence_ = 0;
+        }
 
         switch (result.code) {
           case rclcpp_action::ResultCode::SUCCEEDED:
@@ -2185,10 +3834,10 @@ private:
   bool person_in_base(double & x, double & y, double & z)
   {
     const double camera_forward =
-      latest_body_.centerofmass_z * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
+      active_visual_body_.centerofmass_z * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
     const double camera_left =
-      latest_body_.centerofmass_x * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
-    const double camera_up = latest_body_.centerofmass_y * 0.001;
+      active_visual_body_.centerofmass_x * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
+    const double camera_up = active_visual_body_.centerofmass_y * 0.001;
 
     if (!body_frame_id_.empty()) {
       geometry_msgs::msg::PointStamped body_point;
@@ -2245,24 +3894,60 @@ private:
     const geometry_msgs::msg::PoseStamped & goal_pose,
     NavGoalKind goal_kind = NavGoalKind::NORMAL)
   {
+    if (goal_kind == NavGoalKind::AVOID_GATE &&
+        last_sent_goal_kind_ != NavGoalKind::AVOID_GATE)
+    {
+      start_navigation_episode_tracking();
+    }
     NavigateToPose::Goal goal;
     goal.pose = goal_pose;
     goal.behavior_tree = behavior_tree_;
 
     const auto goal_sequence = ++goal_sequence_;
+    const auto follow_session_epoch = follow_session_epoch_;
     auto options = rclcpp_action::Client<NavigateToPose>::SendGoalOptions();
     options.goal_response_callback =
-      [this, goal_sequence, goal_kind](GoalHandleNavigate::SharedPtr goal_handle) {
+      [this, goal_sequence, goal_kind, follow_session_epoch](
+        GoalHandleNavigate::SharedPtr goal_handle) {
+        if (follow_session_epoch != follow_session_epoch_) {
+          if (goal_handle) {
+            nav_client_->async_cancel_goal(goal_handle);
+          }
+          if (goal_sequence == goal_sequence_) {
+            goal_active_ = false;
+            goal_handle_.reset();
+            has_sent_goal_ = false;
+            reset_parent_cancel_tracking();
+          }
+          return;
+        }
         if (goal_sequence != goal_sequence_) {
+          if (goal_handle) {
+            nav_client_->async_cancel_goal(goal_handle);
+            RCLCPP_WARN(
+              get_logger(),
+              "Cancel accepted stale Nav2 goal response: seq=%llu current=%llu",
+              static_cast<unsigned long long>(goal_sequence),
+              static_cast<unsigned long long>(goal_sequence_));
+          }
           return;
         }
 
         if (!goal_handle) {
+          const auto requested_phase = visual_takeover_phase_;
           goal_active_ = false;
           goal_handle_.reset();
           has_sent_goal_ = false;
+          reset_parent_cancel_tracking();
           nav_retry_waiting_ = true;
           last_failed_goal_time_ = this->now();
+          if (goal_kind == NavGoalKind::AVOID_GATE &&
+              takeover_phase_is_pending(requested_phase))
+          {
+            complete_visual_takeover_transition(requested_phase, "rejected");
+            publish_safety_stop_cmd("nav2_avoid_rejected_visual_takeover");
+            return;
+          }
           if (goal_kind == NavGoalKind::AVOID_GATE) {
             publish_safety_stop_cmd("nav2_avoid_goal_rejected_stop");
           } else {
@@ -2273,7 +3958,8 @@ private:
         }
 
         goal_active_ = true;
-        cancel_sent_ = false;
+        reset_parent_cancel_tracking();
+        active_parent_goal_sequence_ = goal_sequence;
         goal_handle_ = goal_handle;
         if (goal_kind == NavGoalKind::AVOID_GATE) {
           avoidance_goal_accept_time_ = this->now();
@@ -2290,38 +3976,66 @@ private:
             trigger_to_accept_ms, send_to_accept_ms);
         }
         publish_state("goal_accepted");
+        if (goal_kind == NavGoalKind::AVOID_GATE && visual_takeover_cancel_pending()) {
+          request_visual_takeover_cancel("visual_takeover_after_accept");
+          publish_safety_stop_cmd("cancel_nav2_visual_takeover_after_accept");
+        }
       };
 
     options.result_callback =
-      [this, goal_sequence, goal_kind](const GoalHandleNavigate::WrappedResult & result) {
+      [this, goal_sequence, goal_kind, follow_session_epoch](
+        const GoalHandleNavigate::WrappedResult & result) {
         if (goal_sequence != goal_sequence_) {
           return;
         }
 
+        if (follow_session_epoch != follow_session_epoch_) {
+          goal_active_ = false;
+          goal_handle_.reset();
+          has_sent_goal_ = false;
+          reset_parent_cancel_tracking();
+          awaiting_visual_after_avoidance_ = false;
+          avoidance_rearm_required_ = false;
+          return;
+        }
+
+        const auto requested_phase = visual_takeover_phase_;
         goal_active_ = false;
-        cancel_sent_ = false;
         goal_handle_.reset();
         has_sent_goal_ = false;
-        const bool visual_clear_takeover_requested = visual_clear_takeover_pending_;
+        reset_parent_cancel_tracking();
+
+        if (goal_kind == NavGoalKind::AVOID_GATE &&
+            takeover_phase_is_pending(requested_phase))
+        {
+          const char * outcome = "unknown";
+          switch (result.code) {
+            case rclcpp_action::ResultCode::SUCCEEDED:
+              outcome = "completed";
+              break;
+            case rclcpp_action::ResultCode::ABORTED:
+              outcome = "aborted";
+              break;
+            case rclcpp_action::ResultCode::CANCELED:
+              outcome = "canceled";
+              break;
+            default:
+              break;
+          }
+          nav_retry_waiting_ = false;
+          complete_visual_takeover_transition(requested_phase, outcome);
+          return;
+        }
 
         switch (result.code) {
           case rclcpp_action::ResultCode::SUCCEEDED:
             nav_retry_waiting_ = false;
             if (goal_kind == NavGoalKind::AVOID_GATE) {
-              if (visual_clear_takeover_requested) {
-                reset_avoidance_episode();
-                avoidance_rearm_required_ = true;
-                awaiting_visual_after_avoidance_ = false;
-                RCLCPP_INFO(
-                  get_logger(),
-                  "Avoidance goal completed while visual clear takeover was pending");
-                publish_state("nav2_avoid_completed_for_visual_clear");
-              } else {
-                reset_avoidance_episode();
-                avoidance_rearm_required_ = true;
-                awaiting_visual_after_avoidance_ = true;
-                publish_state("nav2_avoid_gate_succeeded_wait_visual");
-              }
+              reset_avoidance_episode();
+              avoidance_rearm_required_ = true;
+              clear_exact_visual_observation();
+              awaiting_visual_after_avoidance_ = true;
+              publish_state("nav2_avoid_gate_succeeded_wait_visual");
             } else {
               publish_state("goal_succeeded");
             }
@@ -2338,14 +4052,7 @@ private:
           case rclcpp_action::ResultCode::CANCELED:
             nav_retry_waiting_ = false;
             if (goal_kind == NavGoalKind::AVOID_GATE) {
-              if (visual_clear_takeover_requested) {
-                reset_avoidance_episode();
-                avoidance_rearm_required_ = true;
-                awaiting_visual_after_avoidance_ = false;
-                RCLCPP_INFO(
-                  get_logger(), "Nav2 avoidance canceled for visual clear takeover");
-                publish_state("nav2_avoid_canceled_for_visual_clear");
-              } else if (visual_reverse_takeover_pending_) {
+              if (visual_reverse_takeover_pending_) {
                 reset_avoidance_episode();
                 avoidance_rearm_required_ = true;
                 publish_state("nav2_avoid_canceled_for_visual_reverse");
@@ -2390,25 +4097,14 @@ private:
 
   void cancel_goal(const std::string & reason)
   {
-    if (cancel_sent_) {
-      return;
-    }
-
-    if (goal_handle_) {
-      nav_client_->async_cancel_goal(goal_handle_);
-      cancel_sent_ = true;
-      has_sent_goal_ = false;
-      publish_state("cancel_" + reason);
-    } else if (goal_active_) {
-      nav_client_->async_cancel_all_goals();
-      cancel_sent_ = true;
-      has_sent_goal_ = false;
-      publish_state("cancel_all_" + reason);
-    }
+    request_current_navigation_goal_cancel(reason);
   }
 
   void cancel_spin(const std::string & reason)
   {
+    if (spin_active_) {
+      spin_cancel_requested_sequence_ = spin_sequence_;
+    }
     if (spin_cancel_sent_) {
       return;
     }
@@ -2418,9 +4114,7 @@ private:
       spin_cancel_sent_ = true;
       publish_state("cancel_spin_" + reason);
     } else if (spin_active_) {
-      spin_client_->async_cancel_all_goals();
-      spin_cancel_sent_ = true;
-      publish_state("cancel_all_spin_" + reason);
+      publish_state("wait_spin_handle_to_cancel_" + reason);
     }
   }
 
@@ -2444,6 +4138,8 @@ private:
   std::string global_frame_;
   std::string base_frame_;
   std::string body_frame_id_;
+  std::string dual_presence_body_topic_;
+  std::string position_jump_event_topic_;
   std::string behavior_tree_;
   std::string last_state_;
 
@@ -2487,6 +4183,14 @@ private:
   double visual_clear_takeover_side_clearance_m_;
   double visual_clear_takeover_min_avoidance_s_;
   double visual_clear_takeover_body_max_age_s_;
+  double visual_reacquire_takeover_body_max_age_s_;
+  double visual_reacquire_takeover_min_frame_interval_s_;
+  double visual_reacquire_takeover_max_frame_interval_s_;
+  double nav_takeover_child_capture_slop_s_;
+  double nav_takeover_cancel_retry_s_;
+  double nav_takeover_status_quiet_s_;
+  double nav_takeover_cmd_quiet_s_;
+  double nav_takeover_child_discovery_s_;
   double visual_x_p_;
   double visual_x_d_;
   double visual_z_p_;
@@ -2522,12 +4226,39 @@ private:
   int right_avoidance_trigger_count_;
   int visual_reverse_takeover_count_;
   int visual_clear_takeover_confirm_frames_;
+  int visual_reacquire_takeover_confirm_frames_;
+  int visual_safety_release_confirm_frames_;
+  int visual_safety_min_finite_rays_per_sector_;
   int visual_clear_takeover_count_{0};
+  int visual_reacquire_takeover_count_{0};
+  int visual_safety_release_count_{0};
+  int dual_handoff_strict_confirm_count_{0};
   AvoidanceStage avoidance_stage_;
   NavGoalKind last_sent_goal_kind_;
+  VisualTakeoverPhase visual_takeover_phase_{VisualTakeoverPhase::NONE};
 
   bodyreader_msg::msg::Bodyposture latest_body_;
+  bodyreader_msg::msg::Bodyposture latest_dual_presence_body_;
+  bodyreader_msg::msg::Bodyposture active_visual_body_;
+  bodyreader_msg::msg::Bodyposture position_jump_recovery_candidate_;
+  std::map<int, bodyreader_msg::msg::BodyJumpEvent>
+    pending_position_jump_events_;
+  bool active_visual_body_is_dual_{false};
   bool has_body_;
+  bool position_jump_hold_active_;
+  bool position_jump_recovery_waiting_;
+  bool position_jump_source_reset_recovery_{false};
+  int strict_target_body_id_{0};
+  int position_jump_origin_body_id_{0};
+  int position_jump_expected_body_id_{0};
+  int position_jump_native_body_id_{0};
+  int position_jump_recovery_valid_count_{0};
+  int position_jump_recovery_body_id_{0};
+  double position_jump_trusted_depth_mm_{0.0};
+  double position_jump_observed_depth_mm_{0.0};
+  double position_jump_confirmed_depth_mm_{0.0};
+  uint8_t position_jump_phase_{0};
+  uint8_t position_jump_outcome_{0};
   bool has_last_person_map_;
   bool has_sent_goal_;
   bool goal_active_;
@@ -2547,16 +4278,47 @@ private:
   bool awaiting_visual_after_avoidance_;
   bool avoidance_rearm_required_;
   bool visual_reverse_takeover_pending_;
-  bool visual_clear_takeover_pending_{false};
+  bool avoidance_visual_loss_seen_{false};
+  bool dual_takeover_gate_open_{false};
+  bool dual_handoff_active_{false};
+  bool dual_handoff_reacquire_armed_{false};
+  bool dual_handoff_retired_by_strict_{false};
   bool has_avoidance_gate_goal_;
   bool avoidance_motion_logged_;
   bool has_calibration_reference_;
   bool motion_enabled_;
   bool motion_gate_stop_published_;
   uint64_t goal_sequence_;
+  uint64_t follow_session_epoch_{0};
   uint64_t spin_sequence_;
+  uint64_t position_jump_source_epoch_{0};
+  uint64_t position_jump_event_id_{0};
+  uint64_t position_jump_bound_goal_sequence_{0};
+  uint32_t position_jump_event_update_seq_{0};
+  uint64_t spin_cancel_requested_sequence_{0};
   uint64_t body_generation_{0};
-  uint64_t visual_clear_takeover_last_body_generation_{0};
+  int64_t exact_observation_accept_after_ns_{0};
+  uint64_t visual_reverse_takeover_last_body_generation_{0};
+  uint64_t visual_clear_takeover_last_scan_generation_{0};
+  uint64_t scan_generation_{0};
+  uint64_t visual_safety_release_last_scan_generation_{0};
+  uint64_t navigation_episode_sequence_{0};
+  uint64_t active_parent_goal_sequence_{0};
+  uint64_t parent_cancel_request_sequence_{0};
+  int visual_reacquire_body_id_{0};
+  bool parent_cancel_in_flight_{false};
+  bool parent_cancel_acknowledged_{false};
+  int64_t parent_cancel_last_request_ns_{0};
+  bool navigation_episode_tracking_{false};
+  bool navigation_parent_terminal_{false};
+  int64_t navigation_episode_start_ns_{0};
+  int64_t navigation_parent_terminal_ns_{0};
+  int64_t navigation_drain_start_ns_{0};
+  int64_t navigation_children_idle_since_ns_{0};
+  std::string navigation_parent_outcome_;
+  rclcpp::Time last_dual_presence_body_time_;
+  rclcpp::Time active_visual_body_time_;
+  rclcpp::Time position_jump_recovery_last_valid_time_;
 
   rclcpp::Time last_body_time_;
   rclcpp::Time invalid_body_since_;
@@ -2593,7 +4355,12 @@ private:
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   rclcpp_action::Client<NavigateToPose>::SharedPtr nav_client_;
   rclcpp_action::Client<Spin>::SharedPtr spin_client_;
+  std::vector<std::shared_ptr<NavigationActionTracker>> navigation_action_trackers_;
   rclcpp::Subscription<bodyreader_msg::msg::Bodyposture>::SharedPtr body_sub_;
+  rclcpp::Subscription<bodyreader_msg::msg::Bodyposture>::SharedPtr
+    dual_presence_body_sub_;
+  rclcpp::Subscription<bodyreader_msg::msg::BodyJumpEvent>::SharedPtr
+    position_jump_event_sub_;
   rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr mode_sub_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr motion_gate_service_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;

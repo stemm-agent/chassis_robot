@@ -579,7 +579,17 @@ class StemmNav2Manager(Node):
 
         map_path = os.path.expanduser(self.map_save_path)
         os.makedirs(os.path.dirname(map_path), exist_ok=True)
-        cmd = ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', map_path]
+        # Cartographer publishes /map with TRANSIENT_LOCAL durability.  The
+        # saver is launched on demand, so request the latched map explicitly
+        # instead of waiting for a future map update that may not arrive.
+        cmd = [
+            'ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', map_path,
+            '--ros-args',
+            '-p', 'map_subscribe_transient_local:=true',
+            '-p', 'save_map_timeout:=10.0',
+            '-p', 'free_thresh_default:=0.25',
+            '-p', 'occupied_thresh_default:=0.65',
+        ]
         self.get_logger().info(f'saving map to {map_path}')
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
@@ -1682,6 +1692,10 @@ class StemmNav2Manager(Node):
             self.get_logger().warn(
                 'no RRT processes found to kill; they may already be stopped')
 
+    def _before_launch_shutdown(self):
+        """Allow derived managers to persist terminal state before SIGINT."""
+        return
+
     def request_launch_shutdown(self, reason):
         if self.shutdown_started:
             return
@@ -1694,6 +1708,11 @@ class StemmNav2Manager(Node):
         self.mode = 'shutdown'
         self.navigation_state = 'shutdown_requested'
         self.last_error = ''
+        try:
+            self._before_launch_shutdown()
+        except Exception as exc:
+            self.get_logger().error(
+                f"failed to persist pre-shutdown state: {exc}")
 
         if os.environ.get('STEMM_AUTO_MAPPING_LAUNCH') == '1':
             parent_pid = os.getppid()

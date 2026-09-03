@@ -146,18 +146,12 @@ private:
 
         out.angular_velocity.z = msg.angular_velocity.z - gyro_z_bias_;
 
-        tf2::Quaternion raw_q(msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w);
-        double roll = 0.0;
-        double pitch = 0.0;
-
-        if (raw_q.length2() >= 1e-12) {
-            raw_q.normalize();
-            double raw_yaw = 0.0;
-            tf2::Matrix3x3(raw_q).getRPY(roll, pitch, raw_yaw);
-        }
-
+        // This topic is the planar attitude input for robot_localization. Keeping
+        // raw roll/pitch here lets imu0_relative form Q0^-1 * Qt before
+        // two_d_mode zeros those axes, leaking roll/pitch motion into yaw.
+        // /imu/data_raw remains unchanged for consumers that need full attitude.
         tf2::Quaternion corrected_q;
-        corrected_q.setRPY(roll, pitch, corrected_yaw_);
+        corrected_q.setRPY(0.0, 0.0, corrected_yaw_);
         corrected_q.normalize();
 
         out.orientation.x = corrected_q.x();

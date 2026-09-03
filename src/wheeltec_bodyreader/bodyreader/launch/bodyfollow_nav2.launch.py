@@ -12,6 +12,22 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
+        # The coordinator owns the public follow-control service.  This node is
+        # deliberately internal: it is the only publisher of the real /mode
+        # topic, but no external caller can bypass the motion-gate transaction.
+        Node(
+            package='bodyreader',
+            executable='bodyfollow_mode_controller',
+            name='bodyfollow_mode_controller',
+            output='screen',
+            parameters=[
+                {'service_name': '/bodyfollow/set_enabled'},
+                {'legacy_service_name': ''},
+                {'status_service_name': '/bodyfollow/get_mode_status'},
+                {'mode_topic': '/mode'},
+            ],
+        ),
+
         Node(
             package='bodyreader',
             executable='body_nav2_profile_guard',
@@ -30,9 +46,11 @@ def generate_launch_description():
                 {'amcl_node_name': '/amcl'},
                 {'wait_timeout_s': 6.0},
 
-                # MPPI follow profile: smaller sampling jumps and a faster
-                # controller tick for smoother UX, without reverse motion.
-                {'controller_frequency': 20.0},
+                # Keep the controller at the production Nav2 rate.  The clear
+                # path follower publishes visual commands directly, so a 20 Hz
+                # MPPI loop only doubles navigation work during obstacle
+                # takeover without improving the visual tracking cadence.
+                {'controller_frequency': 10.0},
                 {'controller_vx_min': 0.04},
                 {'controller_vx_max': 0.55},
                 {'controller_vx_std': 0.24},
@@ -76,9 +94,17 @@ def generate_launch_description():
             parameters=[
                 {'rgb_stream': True},
                 {'body_stream': True},
-                {'mode_gated_body_stream': False},
+                {'mode_gated_body_stream': True},
                 {'mode_required': 2},
-                {'max_processing_rate_hz': 20.0},
+                # Astra delivered about 10 useful visual frames per second in
+                # production.  Capping the RGB/body conversion at that rate
+                # avoids producing a second queue of frames that TensorRT
+                # cannot consume while preserving the summon observation rate.
+                {'max_processing_rate_hz': 10.0},
+                {'min_body_distance_mm': 600.0},
+                {'jump_rebase_confirm_frames': 3},
+                {'jump_rebase_consistency_mm': 150.0},
+                {'jump_rebase_max_interval_s': 0.30},
             ],
         ),
 
@@ -124,7 +150,7 @@ def generate_launch_description():
                     'respect_mode_topic': True,
                     'mode_required': 2,
                     'initial_mode': 1,
-                    'max_inference_fps': 15.0,
+                    'max_inference_fps': 10.0,
                     'max_annotated_fps': 8.0,
                     'annotated_only_if_subscribed': True,
                     'opencv_num_threads': 2,
@@ -166,26 +192,31 @@ def generate_launch_description():
             parameters=[
                 {
                     'bodylist_topic': '/bodylist',
-                    'bodyposture_topic': '/body_posture',
                     'features_topic': '/torso_trt_demo/features',
                     'lock_command_topic': '/torso_trt_demo/lock_command',
-                    'recoveryid_topic': '/recoveryid',
                     'state_topic': '/body_identity_state',
                     'validated_bodyposture_topic': '/body_posture_yolo_validated',
                     'image_width': 640.0,
                     'horizontal_fov_rad': 1.05,
                     'yolo_max_age_s': 0.25,
                     'body_max_age_s': 0.25,
+                    'body_yolo_max_skew_s': 0.15,
                     'initial_yolo_wait_s': 1.5,
-                    'recovery_publish_period_s': 0.45,
                     'lock_command_period_s': 0.8,
                     'match_max_angle_rad': 0.18,
                     'match_max_depth_diff_m': 0.85,
                     'match_accept_score': 1.45,
                     'reacquire_accept_score': 1.65,
                     'appearance_accept_score': 0.80,
-                    'bound_appearance_accept_score': 1.15,
+                    # The already locked YOLO track remains identity-authoritative.
+                    # Permit moderate illumination/pose variation without weakening
+                    # cross-track re-identification.
+                    'bound_appearance_accept_score': 1.30,
+                    # Keep the unbound skeleton/YOLO overlap margin at 8% in C++;
+                    # only the currently bound identity gets the wider margin.
+                    'bound_body_bbox_margin_ratio': 0.12,
                     'reacquire_candidate_margin': 0.18,
+                    'body_pair_candidate_margin': 0.12,
                     'initial_confirm_frames': 4,
                     'reacquire_confirm_frames': 4,
                     'require_yolo_for_initial_lock': True,
@@ -195,29 +226,14 @@ def generate_launch_description():
 
         Node(
             package='bodyreader',
-            executable='bodydata_process',
-            name='bodydata_process',
-            output='screen',
-            parameters=[
-                # The identity bridge owns automatic /recoveryid selection so
-                # bodydata_process never blindly switches to the first body.
-                {'require_akimbo_lock': False},
-                {'auto_lock_first_body': False},
-                {'initial_mode': 1},
-                {'open_switch': False},
-            ],
-            remappings=[
-                ('/cmd_vel', '/body_nav2/bodydata_process_cmd_vel_ignored'),
-                ('/mode', '/body_nav2/bodydata_process_mode_ignored'),
-            ],
-        ),
-
-        Node(
-            package='bodyreader',
             executable='body_nav2_follower',
             name='body_nav2_follower',
             output='screen',
             parameters=[
+                # A follower process restart must come back observation-only.
+                # The coordinator reopens this gate only after a current,
+                # identity-validated body has been confirmed.
+                {'motion_enabled': False},
                 {'nav_action_name': '/navigate_to_pose'},
                 {'behavior_tree':
                     '/home/wheeltec/wheeltec_ros2/src/wheeltec_bodyreader/bodyreader/behavior_trees/body_follow_fast_avoidance.xml'},
@@ -243,6 +259,7 @@ def generate_launch_description():
                 {'goal_position_tolerance_m': 0.25},
                 {'goal_yaw_tolerance_rad': 0.15},
                 {'lost_timeout_s': 1.5},
+                {'body_invalid_grace_s': 0.45},
                 {'tf_timeout_s': 0.20},
                 {'enable_retreat_goal': False},
                 {'max_retreat_goal_m': 0.8},
@@ -256,10 +273,10 @@ def generate_launch_description():
                 {'side_obstacle_min_angle_rad': 0.35},
                 {'side_obstacle_max_angle_rad': 1.57},
                 {'obstacle_slow_distance_m': 0.80},
-                {'obstacle_nav_distance_m': 0.50},
+                {'obstacle_nav_distance_m': 0.75},
                 {'obstacle_nav_release_distance_m': 0.80},
                 {'side_obstacle_nav_distance_m': 0.40},
-                {'side_obstacle_release_distance_m': 0.50},
+                {'side_obstacle_release_distance_m': 0.45},
                 {'visual_min_linear_scale': 0.45},
                 {'target_exemption_angle_rad': 0.20},
                 {'target_exemption_distance_margin_m': 0.12},
@@ -277,24 +294,34 @@ def generate_launch_description():
                 {'avoidance_gate_timeout_s': 5.0},
                 {'avoidance_anchor_blend_alpha': 0.20},
                 {'visual_clear_takeover_front_clearance_m': 0.80},
-                {'visual_clear_takeover_side_clearance_m': 0.50},
+                {'visual_clear_takeover_side_clearance_m': 0.45},
                 {'visual_clear_takeover_min_avoidance_s': 0.60},
                 {'visual_clear_takeover_body_max_age_s': 0.30},
-                {'visual_clear_takeover_confirm_frames': 3},
+                # Confirm physical clearance with two independent LaserScan
+                # messages, keeping takeover responsive without trusting one ray set.
+                {'visual_clear_takeover_confirm_frames': 2},
+                {'visual_safety_release_confirm_frames': 2},
+                {'visual_safety_min_finite_rays_per_sector': 1},
+                {'nav_takeover_child_capture_slop_s': 0.10},
+                {'nav_takeover_cancel_retry_s': 0.35},
+                {'nav_takeover_status_quiet_s': 0.30},
+                {'nav_takeover_cmd_quiet_s': 0.30},
+                {'nav_takeover_child_discovery_s': 1.20},
 
                 # Visual heading PD plus distance-proportional longitudinal speed.
                 {'visual_x_p': 0.5},
                 {'visual_x_d': 0.33},
-                {'visual_z_p': 1.8},
+                {'visual_z_p': 2.2},
                 {'visual_z_d': 0.30},
-                {'visual_filter_alpha': 0.55},
+                {'visual_filter_alpha': 0.62},
                 {'visual_angle_deadband': 0.015},
                 {'visual_distance_deadband_mm': 80.0},
                 {'visual_max_linear_mps': 0.75},
-                {'visual_max_angular_rps': 1.0},
+                {'visual_max_angular_rps': 1.15},
                 {'visual_linear_accel_limit': 0.90},
+                {'visual_reverse_accel_limit': 1.80},
                 {'visual_linear_decel_limit': 0.35},
-                {'visual_angular_accel_limit': 1.4},
+                {'visual_angular_accel_limit': 2.2},
                 {'visual_allow_reverse': True},
 
                 {'keep_last_goal_when_occluded': True},

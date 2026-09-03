@@ -236,7 +236,7 @@ int Command::node_kill(const char*  progress)
 		printf("popen failed,get_pid = %s",get_pid);
 		return -1;
 	}
-
+	
 	char pid[16] = {0};
 	fgets(pid,16,fp);
 	if (strlen(pid) == 0)
@@ -245,7 +245,7 @@ int Command::node_kill(const char*  progress)
 		return -1;
 	}
 	pclose(fp);
-
+	
 	char cmd[32] = "kill -9 ";
 	strcat(cmd,pid);
 	system(cmd);
@@ -258,7 +258,7 @@ int Command::node_kill(const char*  progress)
 void Command::play_audio_feedback_with_flag(const std::string& audio_file) {
     // 先重置状态，确保之前的完成标志被清除
     g_play_state::reset();
-
+    
     // 发布开始消息
     g_play_state::start();
 
@@ -269,9 +269,9 @@ void Command::play_audio_feedback_with_flag(const std::string& audio_file) {
 
     // 发布完成消息
     g_play_state::finish();
-
+    
     if (ret != 0) {
-        RCLCPP_ERROR(this->get_logger(), "播放音频失败: %s, 返回值: %d",
+        RCLCPP_ERROR(this->get_logger(), "播放音频失败: %s, 返回值: %d", 
                      full_path.c_str(), ret);
     }
 }
@@ -892,7 +892,7 @@ void Command::voice_words_Callback(std_msgs::msg::String::SharedPtr msg){
 	/***语音指令***/
 	string str1 = msg->data;    //取传入数据
 	string str2 = "小车前进";
-	string str3 = "小车后退";
+	string str3 = "小车后退"; 
 	string str4 = "小车左转";
 	string str5 = "小车右转";
 	string str6 = "小车停";
@@ -1163,9 +1163,9 @@ Command::Command(const std::string &node_name,
 	this->get_parameter("K_orientation_w",K_orientation_w);
 
 	/***唤醒标志位话题发布者创建***/
-	awake_flag_pub = this->create_publisher<std_msgs::msg::Int8>("awake_flag",10);
+	awake_flag_pub = this->create_publisher<std_msgs::msg::Int8>("awake_flag",10); 
 	/***雷达跟随标志位话题发布者创建***/
-	laser_follow_flag_pub = this->create_publisher<std_msgs::msg::Int8>("laser_follow_flag",10);
+	laser_follow_flag_pub = this->create_publisher<std_msgs::msg::Int8>("laser_follow_flag",10); 
 	/***反馈播报请求话题发布者创建***/
 	feedback_audio_pub = this->create_publisher<std_msgs::msg::String>("feedback_audio",10);
 	/***普通语音 I/J/K 目标导航状态发布者（非通用 Nav2 观测）***/
@@ -1254,7 +1254,7 @@ int main(int argc, char *argv[])
 {
 	rclcpp::init(argc,argv);
 	auto node = std::make_shared<Command>("command_recognition",rclcpp::NodeOptions());
-	rclcpp::spin(node);
+	rclcpp::spin(node);  
 	rclcpp::shutdown();
 	return 0;
 }

@@ -26,8 +26,10 @@
 #include <limits>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <key_handler.h>
 #include <rclcpp/rclcpp.hpp>
+#include "bodyreader_msg/msg/body_jump_event.hpp"
 #include "bodyreader_msg/msg/bodylist.hpp"
 #include "sensor_msgs/msg/image.hpp"
 #include "std_msgs/msg/empty.hpp"
@@ -36,6 +38,7 @@
 
 rclcpp::Publisher<bodyreader_msg::msg::Bodylist>::SharedPtr bodylist_Pub;
 rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr raw_body_count_Pub;
+rclcpp::Publisher<bodyreader_msg::msg::BodyJumpEvent>::SharedPtr position_jump_event_Pub;
 rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_Pub;
 
 namespace
@@ -66,12 +69,34 @@ std::atomic<bool> g_restart_body_stream_requested{false};
 std::unordered_map<int, int> g_valid_body_streaks;
 
 // ===== 骨架源头滤波: centerOfMass EMA 平滑 (Phase 1) =====
+struct BodyPosition
+{
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
 struct SmoothedBodyState
 {
     float center_x = 0.0f;
     float center_y = 0.0f;
     float center_z = 0.0f;
     int   last_seen_frame = -1;
+    int   persistent_body_id = -1;
+    std::vector<BodyPosition> jump_candidates;
+    int jump_last_frame = -1;
+    std::chrono::steady_clock::time_point jump_last_time{};
+    bool jump_hold_active = false;
+    int jump_last_observed_frame = -1;
+    int jump_release_confirm_count = 0;
+    uint64_t jump_event_id = 0;
+    uint32_t jump_event_update_seq = 0;
+    int jump_origin_persistent_body_id = -1;
+    float jump_trusted_depth_mm = 0.0f;
+    float jump_observed_depth_mm = 0.0f;
+    float jump_confirmed_depth_mm = 0.0f;
+    uint8_t jump_phase = 0;
+    uint8_t jump_outcome = 0;
 };
 float g_position_smoothing_alpha = 0.45f;    // EMA 系数, 越小越平滑
 int   g_smoothed_body_timeout_frames = 15;   // 连续消失多少帧后清除历史
@@ -96,6 +121,13 @@ int   g_next_persistent_body_id = 1000;       // 持久 id 从 1000 开始
 
 // ===== 骨架源头滤波: 单帧跳变钳制 (Phase 3) =====
 float g_max_jump_mm = 200.0f;                 // 单帧允许的最大位移(mm)
+
+int g_jump_rebase_confirm_frames = 3;
+float g_jump_rebase_consistency_mm = 150.0f;
+double g_jump_rebase_max_interval_s = 0.15;
+uint64_t g_position_jump_source_epoch = static_cast<uint64_t>(
+    std::chrono::steady_clock::now().time_since_epoch().count());
+uint64_t g_next_position_jump_event_id = 1;
 
 struct BodyFilterEvaluation
 {
@@ -132,6 +164,9 @@ struct BodyFilterDiagnostics
     uint64_t rejected_joints = 0;
     uint64_t rejected_core_joints = 0;
     uint64_t rejected_unstable = 0;
+    uint64_t rejected_jump_pending = 0;
+    uint64_t jump_candidate_resets = 0;
+    uint64_t jump_rebases = 0;
     BodyFilterEvaluation last_candidate;
     bool has_last_candidate = false;
     bool was_active = false;
@@ -140,6 +175,178 @@ struct BodyFilterDiagnostics
 };
 
 BodyFilterDiagnostics g_body_filter_diagnostics;
+
+float planar_distance_mm(
+    float first_x, float first_z, float second_x, float second_z)
+{
+    const float dx = first_x - second_x;
+    const float dz = first_z - second_z;
+    return std::sqrt(dx * dx + dz * dz);
+}
+
+float median_component(std::vector<float> values)
+{
+    std::sort(values.begin(), values.end());
+    const size_t middle = values.size() / 2;
+    if ((values.size() % 2U) != 0U)
+    {
+        return values[middle];
+    }
+    return 0.5f * (values[middle - 1] + values[middle]);
+}
+
+BodyPosition median_position(const std::vector<BodyPosition>& samples)
+{
+    std::vector<float> x_values;
+    std::vector<float> y_values;
+    std::vector<float> z_values;
+    x_values.reserve(samples.size());
+    y_values.reserve(samples.size());
+    z_values.reserve(samples.size());
+    for (const auto& sample : samples)
+    {
+        x_values.push_back(sample.x);
+        y_values.push_back(sample.y);
+        z_values.push_back(sample.z);
+    }
+    return BodyPosition{
+        median_component(std::move(x_values)),
+        median_component(std::move(y_values)),
+        median_component(std::move(z_values))};
+}
+
+void reset_jump_candidates(SmoothedBodyState& state)
+{
+    state.jump_candidates.clear();
+    state.jump_last_frame = -1;
+    state.jump_last_time = std::chrono::steady_clock::time_point{};
+}
+
+const char* body_jump_phase_name(uint8_t phase)
+{
+    using Event = bodyreader_msg::msg::BodyJumpEvent;
+    switch (phase)
+    {
+        case Event::PHASE_PENDING: return "PENDING";
+        case Event::PHASE_REBASED: return "REBASED";
+        case Event::PHASE_RECOVERING: return "RECOVERING";
+        case Event::PHASE_RELEASED: return "RELEASED";
+        case Event::PHASE_EXPIRED: return "EXPIRED";
+        case Event::PHASE_RESET: return "RESET";
+        default: return "UNKNOWN";
+    }
+}
+
+void publish_position_jump_event(
+    int native_body_id,
+    SmoothedBodyState& state,
+    uint8_t phase,
+    uint8_t outcome,
+    float observed_depth_mm,
+    float confirmed_depth_mm,
+    uint8_t good_count,
+    const char* reason)
+{
+    if (state.jump_event_id == 0)
+    {
+        return;
+    }
+
+    state.jump_phase = phase;
+    state.jump_outcome = outcome;
+    state.jump_observed_depth_mm = observed_depth_mm;
+    state.jump_confirmed_depth_mm = confirmed_depth_mm;
+    ++state.jump_event_update_seq;
+
+    bodyreader_msg::msg::BodyJumpEvent msg;
+    msg.source_epoch = g_position_jump_source_epoch;
+    msg.event_id = state.jump_event_id;
+    msg.update_seq = state.jump_event_update_seq;
+    msg.native_body_id = native_body_id;
+    msg.origin_persistent_body_id = state.jump_origin_persistent_body_id;
+    msg.current_persistent_body_id = state.persistent_body_id;
+    msg.trusted_depth_mm = state.jump_trusted_depth_mm;
+    msg.observed_depth_mm = observed_depth_mm;
+    msg.confirmed_depth_mm = confirmed_depth_mm;
+    msg.phase = phase;
+    msg.outcome = outcome;
+    msg.good_count = good_count;
+    if (position_jump_event_Pub)
+    {
+        position_jump_event_Pub->publish(msg);
+    }
+
+    RCLCPP_WARN(
+        rclcpp::get_logger("body_main"),
+        "BODY_JUMP_EVENT phase=%s reason=%s epoch=%llu event=%llu update=%u "
+        "native_id=%d origin_id=%d current_id=%d old_z=%.0f raw_z=%.0f "
+        "confirmed_z=%.0f good=%u",
+        body_jump_phase_name(phase), reason,
+        static_cast<unsigned long long>(msg.source_epoch),
+        static_cast<unsigned long long>(msg.event_id), msg.update_seq,
+        native_body_id, msg.origin_persistent_body_id,
+        msg.current_persistent_body_id, msg.trusted_depth_mm,
+        msg.observed_depth_mm, msg.confirmed_depth_mm,
+        static_cast<unsigned int>(msg.good_count));
+}
+
+void begin_or_update_position_jump(
+    int native_body_id,
+    SmoothedBodyState& state,
+    float observed_depth_mm,
+    const char* reason)
+{
+    using Event = bodyreader_msg::msg::BodyJumpEvent;
+    const bool start_new_event =
+        !state.jump_hold_active ||
+        state.jump_event_id == 0 ||
+        (state.jump_phase != 0 && state.jump_phase != Event::PHASE_PENDING);
+
+    if (start_new_event)
+    {
+        state.jump_event_id = g_next_position_jump_event_id++;
+        state.jump_event_update_seq = 0;
+        state.jump_origin_persistent_body_id = state.persistent_body_id;
+        state.jump_trusted_depth_mm = state.center_z;
+        state.jump_confirmed_depth_mm = 0.0f;
+        state.jump_outcome = Event::OUTCOME_NONE;
+    }
+
+    state.jump_hold_active = true;
+    state.jump_last_observed_frame = g_frame_counter;
+    state.jump_release_confirm_count = 0;
+    state.jump_observed_depth_mm = observed_depth_mm;
+    if (start_new_event)
+    {
+        publish_position_jump_event(
+            native_body_id, state, Event::PHASE_PENDING,
+            Event::OUTCOME_NONE, observed_depth_mm, 0.0f, 0, reason);
+    }
+}
+
+void publish_position_jump_source_reset(const char* reason)
+{
+    if (!position_jump_event_Pub)
+    {
+        return;
+    }
+    ++g_position_jump_source_epoch;
+    g_next_position_jump_event_id = 1;
+    bodyreader_msg::msg::BodyJumpEvent msg;
+    msg.source_epoch = g_position_jump_source_epoch;
+    msg.event_id = 0;
+    msg.update_seq = 1;
+    msg.native_body_id = -1;
+    msg.origin_persistent_body_id = -1;
+    msg.current_persistent_body_id = -1;
+    msg.phase = bodyreader_msg::msg::BodyJumpEvent::PHASE_RESET;
+    msg.outcome = bodyreader_msg::msg::BodyJumpEvent::OUTCOME_SOURCE_RESET;
+    position_jump_event_Pub->publish(msg);
+    RCLCPP_WARN(
+        rclcpp::get_logger("body_main"),
+        "BODY_JUMP_EVENT phase=RESET reason=%s epoch=%llu",
+        reason, static_cast<unsigned long long>(msg.source_epoch));
+}
 
 bool is_core_joint(int joint_index)
 {
@@ -243,7 +450,8 @@ void maybe_log_body_filter_diagnostics()
         RCLCPP_INFO(
             rclcpp::get_logger("body_main"),
             "BODY_FILTER %.1fs frames=%llu raw=%llu accepted=%llu "
-            "rejected[distance=%llu center=%llu joints=%llu core=%llu unstable=%llu]",
+            "rejected[distance=%llu center=%llu joints=%llu core=%llu unstable=%llu "
+            "jump_pending=%llu] jump[reset=%llu rebase=%llu]",
             elapsed_s,
             static_cast<unsigned long long>(d.frames),
             static_cast<unsigned long long>(d.raw_bodies),
@@ -252,7 +460,10 @@ void maybe_log_body_filter_diagnostics()
             static_cast<unsigned long long>(d.rejected_center),
             static_cast<unsigned long long>(d.rejected_joints),
             static_cast<unsigned long long>(d.rejected_core_joints),
-            static_cast<unsigned long long>(d.rejected_unstable));
+            static_cast<unsigned long long>(d.rejected_unstable),
+            static_cast<unsigned long long>(d.rejected_jump_pending),
+            static_cast<unsigned long long>(d.jump_candidate_resets),
+            static_cast<unsigned long long>(d.jump_rebases));
     }
     else if (d.has_last_candidate)
     {
@@ -260,7 +471,8 @@ void maybe_log_body_filter_diagnostics()
             rclcpp::get_logger("body_main"),
             "BODY_FILTER %.1fs frames=%llu raw=%llu accepted=%llu no_raw_frames=%llu "
             "list_errors=%llu rejected[distance=%llu center=%llu joints=%llu "
-            "core=%llu unstable=%llu] last[z=%.0fmm ratio=%.3f joints=%d core=%d] "
+            "core=%llu unstable=%llu jump_pending=%llu] jump[reset=%llu rebase=%llu] "
+            "last[z=%.0fmm ratio=%.3f joints=%d core=%d] "
             "limits[z=%.0f..%.0fmm ratio<=%.3f joints>=%d core>=%d stable>=%d]",
             elapsed_s,
             static_cast<unsigned long long>(d.frames),
@@ -273,6 +485,9 @@ void maybe_log_body_filter_diagnostics()
             static_cast<unsigned long long>(d.rejected_joints),
             static_cast<unsigned long long>(d.rejected_core_joints),
             static_cast<unsigned long long>(d.rejected_unstable),
+            static_cast<unsigned long long>(d.rejected_jump_pending),
+            static_cast<unsigned long long>(d.jump_candidate_resets),
+            static_cast<unsigned long long>(d.jump_rebases),
             d.last_candidate.center_z_mm,
             d.last_candidate.center_ratio,
             d.last_candidate.tracked_joint_count,
@@ -447,7 +662,56 @@ void output_bodies(astra_bodyframe_t bodyFrame)
         }
         if (!evaluation.accepted())
         {
+            auto previous = g_smoothed_bodies.find(body->id);
+            const bool finite_position =
+                std::isfinite(body->centerOfMass.x) &&
+                std::isfinite(body->centerOfMass.z);
+            const bool moved_from_previous =
+                previous != g_smoothed_bodies.end() && finite_position &&
+                std::fabs(
+                    body->centerOfMass.z - previous->second.center_z) >
+                    g_max_jump_mm;
+            if (moved_from_previous)
+            {
+                // Even a sample rejected by the distance/quality filter must
+                // invalidate a far-away old position when its raw center has
+                // clearly moved. It is not eligible for rebase until all
+                // normal body-quality gates pass again.
+                auto& state = previous->second;
+                begin_or_update_position_jump(
+                    body->id, state, body->centerOfMass.z,
+                    "quality_rejected_depth_step");
+                if (!state.jump_candidates.empty())
+                {
+                    reset_jump_candidates(state);
+                    ++g_body_filter_diagnostics.jump_candidate_resets;
+                }
+                ++g_body_filter_diagnostics.rejected_jump_pending;
+            }
+            else if (previous != g_smoothed_bodies.end() &&
+                previous->second.jump_hold_active)
+            {
+                // Release requires consecutive accepted frames; any rejected
+                // frame breaks that confirmation without reviving old data.
+                previous->second.jump_release_confirm_count = 0;
+            }
             continue;
+        }
+
+        // Latch a spatial jump before the ordinary stable-frame gate. If a
+        // quality rejection reset that gate, every recovery frame remains
+        // held until the old trajectory returns or the rebase is confirmed.
+        auto preexisting_state = g_smoothed_bodies.find(body->id);
+        if (preexisting_state != g_smoothed_bodies.end() &&
+            std::isfinite(body->centerOfMass.x) &&
+            std::isfinite(body->centerOfMass.z) &&
+            std::fabs(
+                body->centerOfMass.z - preexisting_state->second.center_z) >
+                g_max_jump_mm)
+        {
+            begin_or_update_position_jump(
+                body->id, preexisting_state->second, body->centerOfMass.z,
+                "accepted_depth_step_before_stability");
         }
 
         const int stable_frames = g_valid_body_streaks[body->id] + 1;
@@ -468,6 +732,10 @@ void output_bodies(astra_bodyframe_t bodyFrame)
         float smoothed_x = centerofmass->x;
         float smoothed_y = centerofmass->y;
         float smoothed_z = centerofmass->z;
+        bool jump_rebased = false;
+        int preferred_persistent_id = -1;
+        float rebase_old_x = 0.0f;
+        float rebase_old_z = 0.0f;
 
         auto smooth_it = g_smoothed_bodies.find(native_body_id);
         if (smooth_it == g_smoothed_bodies.end())
@@ -484,17 +752,140 @@ void output_bodies(astra_bodyframe_t bodyFrame)
         {
             // Phase 3: 单帧跳变钳制。仅当上一帧该 body 存在且跳变超过阈值时，
             // 跳过本次 EMA 更新，沿用上一帧平滑值（不丢弃 body）。
-            const float jump_dx = centerofmass->x - smooth_it->second.center_x;
             const float jump_dz = centerofmass->z - smooth_it->second.center_z;
-            const float jump_dist = std::sqrt(jump_dx * jump_dx + jump_dz * jump_dz);
+            const float jump_dist = std::fabs(jump_dz);
+            // A large step is withheld until several consecutive raw samples
+            // agree. Never republish the old center as if it were a fresh
+            // measurement; doing so can keep stale depth alive indefinitely.
             if (jump_dist > g_max_jump_mm)
             {
                 // 野值帧：保留上一帧平滑位置，仅刷新时间戳
-                smooth_it->second.last_seen_frame = g_frame_counter;
+                auto& state = smooth_it->second;
+                begin_or_update_position_jump(
+                    native_body_id, state, centerofmass->z,
+                    "stable_depth_step");
+                const auto now = std::chrono::steady_clock::now();
+                const BodyPosition raw_position{
+                    centerofmass->x, centerofmass->y, centerofmass->z};
+
+                bool continue_candidate = !state.jump_candidates.empty() &&
+                    g_frame_counter == state.jump_last_frame + 1;
+                if (continue_candidate)
+                {
+                    const double interval_s = std::chrono::duration<double>(
+                        now - state.jump_last_time).count();
+                    const BodyPosition reference = median_position(state.jump_candidates);
+                    continue_candidate = interval_s <= g_jump_rebase_max_interval_s &&
+                        planar_distance_mm(
+                            raw_position.x, raw_position.z,
+                            reference.x, reference.z) <=
+                        g_jump_rebase_consistency_mm;
+                }
+
+                if (!continue_candidate)
+                {
+                    if (!state.jump_candidates.empty())
+                    {
+                        ++g_body_filter_diagnostics.jump_candidate_resets;
+                    }
+                    reset_jump_candidates(state);
+                }
+
+                state.jump_candidates.push_back(raw_position);
+                state.jump_last_frame = g_frame_counter;
+                state.jump_last_time = now;
+
+                if (static_cast<int>(state.jump_candidates.size()) <
+                    g_jump_rebase_confirm_frames)
+                {
+                    // Never refresh or republish the old position while the
+                    // replacement position is still untrusted.
+                    ++g_body_filter_diagnostics.rejected_jump_pending;
+                    continue;
+                }
+
+                const BodyPosition rebased = median_position(state.jump_candidates);
+                rebase_old_x = state.center_x;
+                rebase_old_z = state.center_z;
+                const float old_angle = std::atan2(state.center_x, state.center_z);
+                const float new_angle = std::atan2(rebased.x, rebased.z);
+                constexpr float kRebasePi = 3.14159265358979323846f;
+                float rebase_angle_delta = std::fabs(new_angle - old_angle);
+                if (rebase_angle_delta > kRebasePi)
+                {
+                    rebase_angle_delta = 2.0f * kRebasePi - rebase_angle_delta;
+                }
+                if (rebase_angle_delta <= g_body_id_match_max_angle_rad)
+                {
+                    preferred_persistent_id = state.persistent_body_id;
+                }
+
+                state.center_x = rebased.x;
+                state.center_y = rebased.y;
+                state.center_z = rebased.z;
+                state.last_seen_frame = g_frame_counter;
+                reset_jump_candidates(state);
+                // Keep the hold asserted while the rebased position is
+                // published for two additional good frames. This flushes the
+                // downstream body/identity pipeline before the release edge.
+                state.jump_hold_active = true;
+                state.jump_last_observed_frame = g_frame_counter;
+                state.jump_release_confirm_count = 0;
+                state.jump_phase = bodyreader_msg::msg::BodyJumpEvent::PHASE_REBASED;
+                state.jump_outcome = bodyreader_msg::msg::BodyJumpEvent::OUTCOME_REBASED;
+                state.jump_observed_depth_mm = centerofmass->z;
+                state.jump_confirmed_depth_mm = rebased.z;
+                jump_rebased = true;
+                ++g_body_filter_diagnostics.jump_rebases;
             }
             else
             {
                 // EMA 更新
+                if (!smooth_it->second.jump_candidates.empty())
+                {
+                    reset_jump_candidates(smooth_it->second);
+                    ++g_body_filter_diagnostics.jump_candidate_resets;
+                }
+                if (smooth_it->second.jump_hold_active)
+                {
+                    auto& state = smooth_it->second;
+                    if (state.jump_phase !=
+                        bodyreader_msg::msg::BodyJumpEvent::PHASE_RECOVERING)
+                    {
+                        const uint8_t outcome =
+                            state.jump_outcome ==
+                            bodyreader_msg::msg::BodyJumpEvent::OUTCOME_REBASED ?
+                            bodyreader_msg::msg::BodyJumpEvent::OUTCOME_REBASED :
+                            bodyreader_msg::msg::BodyJumpEvent::OUTCOME_RETURNED_OLD;
+                        const float confirmed_depth =
+                            outcome == bodyreader_msg::msg::BodyJumpEvent::OUTCOME_REBASED ?
+                            state.jump_confirmed_depth_mm : state.center_z;
+                        publish_position_jump_event(
+                            native_body_id, state,
+                            bodyreader_msg::msg::BodyJumpEvent::PHASE_RECOVERING,
+                            outcome, centerofmass->z, confirmed_depth, 1,
+                            outcome == bodyreader_msg::msg::BodyJumpEvent::OUTCOME_REBASED ?
+                            "rebase_pipeline_flush" : "returned_to_trusted_depth");
+                    }
+                    smooth_it->second.jump_release_confirm_count = std::min(
+                        smooth_it->second.jump_release_confirm_count + 1, 3);
+                    if (smooth_it->second.jump_release_confirm_count >= 3)
+                    {
+                        publish_position_jump_event(
+                            native_body_id, state,
+                            bodyreader_msg::msg::BodyJumpEvent::PHASE_RELEASED,
+                            state.jump_outcome, centerofmass->z,
+                            state.jump_confirmed_depth_mm, 3,
+                            "two_flushed_frames_complete");
+                        smooth_it->second.jump_hold_active = false;
+                        smooth_it->second.jump_last_observed_frame = -1;
+                        smooth_it->second.jump_release_confirm_count = 0;
+                    }
+                }
+                else
+                {
+                    smooth_it->second.jump_release_confirm_count = 0;
+                }
                 smooth_it->second.center_x =
                     alpha * centerofmass->x + one_minus_alpha * smooth_it->second.center_x;
                 smooth_it->second.center_y =
@@ -517,6 +908,19 @@ void output_bodies(astra_bodyframe_t bodyFrame)
         constexpr float kPi = 3.14159265358979323846f;
         int matched_persistent_id = -1;
         float best_match_dist = g_body_id_match_max_dist_mm;
+
+        if (preferred_persistent_id > 0)
+        {
+            const auto preferred_track = g_body_tracks.find(preferred_persistent_id);
+            if (preferred_track != g_body_tracks.end() &&
+                preferred_track->second.matched_frame != g_frame_counter &&
+                g_frame_counter - preferred_track->second.last_frame <=
+                g_track_timeout_frames)
+            {
+                matched_persistent_id = preferred_persistent_id;
+                best_match_dist = -1.0f;
+            }
+        }
 
         for (const auto& track : g_body_tracks)
         {
@@ -571,6 +975,25 @@ void output_bodies(astra_bodyframe_t bodyFrame)
             rec.consecutive_frames = 1;
             g_body_tracks[final_bodyid] = rec;
         }
+        g_smoothed_bodies[native_body_id].persistent_body_id = final_bodyid;
+        if (jump_rebased)
+        {
+            auto& state = g_smoothed_bodies[native_body_id];
+            publish_position_jump_event(
+                native_body_id, state,
+                bodyreader_msg::msg::BodyJumpEvent::PHASE_REBASED,
+                bodyreader_msg::msg::BodyJumpEvent::OUTCOME_REBASED,
+                centerofmass->z, state.jump_confirmed_depth_mm, 0,
+                "three_consistent_samples");
+            RCLCPP_WARN(
+                rclcpp::get_logger("body_main"),
+                "BODY_JUMP_REBASE native_id=%d persistent_id=%d preserved=%s "
+                "old_xz=(%.0f,%.0f) new_xz=(%.0f,%.0f) samples=%d",
+                native_body_id, final_bodyid,
+                final_bodyid == preferred_persistent_id ? "true" : "false",
+                rebase_old_x, rebase_old_z, current_x, current_z,
+                g_jump_rebase_confirm_frames);
+        }
         // ===== Phase 2 结束 =====
 
         // Pixels in the body mask with the same value as bodyId are
@@ -607,9 +1030,25 @@ void output_bodies(astra_bodyframe_t bodyFrame)
         for (auto it = g_smoothed_bodies.begin();
              it != g_smoothed_bodies.end(); )
         {
-            if (g_frame_counter - it->second.last_seen_frame >
+            const int last_relevant_frame = it->second.jump_hold_active ?
+                std::max(
+                    it->second.last_seen_frame,
+                    it->second.jump_last_observed_frame) :
+                it->second.last_seen_frame;
+            if (g_frame_counter - last_relevant_frame >
                 g_smoothed_body_timeout_frames)
             {
+                if (it->second.jump_hold_active && it->second.jump_event_id != 0)
+                {
+                    publish_position_jump_event(
+                        it->first, it->second,
+                        bodyreader_msg::msg::BodyJumpEvent::PHASE_EXPIRED,
+                        bodyreader_msg::msg::BodyJumpEvent::OUTCOME_TIMED_OUT,
+                        it->second.jump_observed_depth_mm,
+                        it->second.jump_confirmed_depth_mm, 0,
+                        "source_state_timeout");
+                }
+                g_valid_body_streaks.erase(it->first);
                 it = g_smoothed_bodies.erase(it);
             }
             else
@@ -678,6 +1117,9 @@ int main(int argc, char* argv[])
     node->declare_parameter<double>("body_id_match_max_angle_rad", 0.35);
     node->declare_parameter<int>("track_timeout_frames", 10);
     node->declare_parameter<double>("max_jump_mm", 200.0);
+    node->declare_parameter<int>("jump_rebase_confirm_frames", 3);
+    node->declare_parameter<double>("jump_rebase_consistency_mm", 150.0);
+    node->declare_parameter<double>("jump_rebase_max_interval_s", 0.15);
     node->get_parameter("rgb_stream", rgb_stream);
     node->get_parameter("body_stream", body_stream);
     node->get_parameter("mode_gated_body_stream", mode_gated_body_stream);
@@ -702,12 +1144,16 @@ int main(int argc, char* argv[])
     double body_id_match_max_dist_mm = g_body_id_match_max_dist_mm;
     double body_id_match_max_angle_rad = g_body_id_match_max_angle_rad;
     double max_jump_mm = g_max_jump_mm;
+    double jump_rebase_consistency_mm = g_jump_rebase_consistency_mm;
     node->get_parameter("position_smoothing_alpha", position_smoothing_alpha);
     node->get_parameter("smoothed_body_timeout_frames", g_smoothed_body_timeout_frames);
     node->get_parameter("body_id_match_max_dist_mm", body_id_match_max_dist_mm);
     node->get_parameter("body_id_match_max_angle_rad", body_id_match_max_angle_rad);
     node->get_parameter("track_timeout_frames", g_track_timeout_frames);
     node->get_parameter("max_jump_mm", max_jump_mm);
+    node->get_parameter("jump_rebase_confirm_frames", g_jump_rebase_confirm_frames);
+    node->get_parameter("jump_rebase_consistency_mm", jump_rebase_consistency_mm);
+    node->get_parameter("jump_rebase_max_interval_s", g_jump_rebase_max_interval_s);
 
     g_min_body_distance_mm = static_cast<float>(min_body_distance_mm);
     g_max_body_distance_mm = static_cast<float>(max_body_distance_mm);
@@ -718,8 +1164,20 @@ int main(int argc, char* argv[])
     g_body_id_match_max_dist_mm = static_cast<float>(body_id_match_max_dist_mm);
     g_body_id_match_max_angle_rad = static_cast<float>(body_id_match_max_angle_rad);
     g_max_jump_mm = static_cast<float>(max_jump_mm);
+    g_jump_rebase_consistency_mm = static_cast<float>(jump_rebase_consistency_mm);
     g_smoothed_body_timeout_frames = std::max(1, g_smoothed_body_timeout_frames);
     g_track_timeout_frames = std::max(1, g_track_timeout_frames);
+    g_jump_rebase_confirm_frames = std::max(2, g_jump_rebase_confirm_frames);
+    g_jump_rebase_consistency_mm = std::max(10.0f, g_jump_rebase_consistency_mm);
+    g_jump_rebase_max_interval_s = std::max(0.02, g_jump_rebase_max_interval_s);
+
+    RCLCPP_INFO(
+        node->get_logger(),
+        "BODY_FILTER_CONFIG distance=%.0f..%.0fmm depth_jump=%.0fmm "
+        "rebase_frames=%d consistency=%.0fmm max_interval=%.3fs",
+        g_min_body_distance_mm, g_max_body_distance_mm, g_max_jump_mm,
+        g_jump_rebase_confirm_frames, g_jump_rebase_consistency_mm,
+        g_jump_rebase_max_interval_s);
 
     rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr mode_sub;
     rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr body_stream_restart_sub;
@@ -728,7 +1186,7 @@ int main(int argc, char* argv[])
         std::max(0.5, g_body_filter_diagnostics_period_s);
     mode_sub = node->create_subscription<std_msgs::msg::Int8>(
         "/mode",
-        rclcpp::QoS(1).best_effort(),
+        rclcpp::QoS(1).reliable().transient_local(),
         [](const std_msgs::msg::Int8::SharedPtr msg)
         {
             g_current_mode.store(msg->data, std::memory_order_relaxed);
@@ -770,6 +1228,9 @@ int main(int argc, char* argv[])
             node->create_publisher<bodyreader_msg::msg::Bodylist>("/bodylist", 1);
         raw_body_count_Pub = node->create_publisher<std_msgs::msg::Int8>(
             "/body_main/raw_body_count", rclcpp::QoS(1).best_effort());
+        // Position-jump filtering remains local to body_main.  The follower
+        // now consumes only exact YOLO-identity observations, so exporting
+        // skeleton-ID jump events would recreate an unsafe identity sideband.
         if (!mode_gated_body_stream)
         {
             body_stream_running =
@@ -805,6 +1266,7 @@ int main(int argc, char* argv[])
             g_valid_body_streaks.clear();
             g_smoothed_bodies.clear();
             g_body_tracks.clear();
+            publish_position_jump_source_reset("body_stream_watchdog_restart");
             bodyreader_msg::msg::Bodylist empty_bodylist;
             empty_bodylist.count = 0;
             bodylist_Pub->publish(empty_bodylist);
@@ -828,6 +1290,7 @@ int main(int argc, char* argv[])
                     g_valid_body_streaks.clear();
                     g_smoothed_bodies.clear();
                     g_body_tracks.clear();
+                    publish_position_jump_source_reset("body_stream_mode_start");
                     body_stream_running =
                         astra_stream_start(bodyStream) == ASTRA_STATUS_SUCCESS;
                 }
@@ -838,6 +1301,7 @@ int main(int argc, char* argv[])
                     g_valid_body_streaks.clear();
                     g_smoothed_bodies.clear();
                     g_body_tracks.clear();
+                    publish_position_jump_source_reset("body_stream_mode_stop");
 
                     bodyreader_msg::msg::Bodylist empty_bodylist;
                     empty_bodylist.count = 0;

@@ -142,6 +142,8 @@ def test_hung_feature_is_bounded_and_mic_remains_active(tmp_path):
     assert calls.index('recharge_stop') < calls.index(
         'stop wheeltec-recharge-manager.service')
     assert calls.count('kill device-reporter.service') == 1
+    first_kill = calls.index('kill device-reporter.service')
+    assert all(calls.index(f'stop {unit}') < first_kill for unit in UNITS)
     assert all(
         (state_dir / unit).read_text(encoding='utf-8').strip() == 'inactive'
         for unit in UNITS

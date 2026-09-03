@@ -56,6 +56,15 @@ TRAJECTORY_BUILDER_2D.motion_filter.max_time_seconds = 0.5
 TRAJECTORY_BUILDER_2D.motion_filter.max_distance_meters = 0.08
 TRAJECTORY_BUILDER_2D.motion_filter.max_angle_radians = math.rad(1.0)
 TRAJECTORY_BUILDER_2D.submaps.num_range_data = 90
+
+-- Preserve evidence for fixed obstacles while still allowing later free-space
+-- observations to clear genuinely moved obstacles.  The upstream default
+-- (0.55 / 0.49) clears a hit after roughly five free-space observations.
+local probability_grid_range_data_inserter =
+    TRAJECTORY_BUILDER_2D.submaps.range_data_inserter
+        .probability_grid_range_data_inserter
+probability_grid_range_data_inserter.hit_probability = 0.60
+probability_grid_range_data_inserter.miss_probability = 0.495
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.ceres_solver_options.max_num_iterations = 10
 TRAJECTORY_BUILDER_2D.ceres_scan_matcher.ceres_solver_options.num_threads = 1
 

@@ -129,6 +129,7 @@ ament_target_dependencies(collision_guard rclcpp sensor_msgs geometry_msgs nav_m
 # === Nav2 action bridge for body following ===
 add_executable(body_nav2_follower src/body_nav2_follower.cpp)
 ament_target_dependencies(body_nav2_follower
+  action_msgs
   rclcpp
   rclcpp_action
   bodyreader_msg

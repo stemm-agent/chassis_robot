@@ -25,6 +25,7 @@ find_package(rosidl_default_generators REQUIRED)
 # find_package(<dependency> REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Body.msg"
+  "msg/BodyJumpEvent.msg"
   "msg/Bodylist.msg"
   "msg/Bodyposture.msg"
   "msg/Joint.msg"
@@ -40,4 +41,3 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 ament_export_dependencies(rosidl_default_runtime)
 
 ament_package()
-

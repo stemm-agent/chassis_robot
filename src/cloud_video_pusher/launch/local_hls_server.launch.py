@@ -22,7 +22,7 @@ def generate_launch_description():
     auto_start = LaunchConfiguration('auto_start')
 
     return LaunchDescription([
-        DeclareLaunchArgument('image_topic', default_value='/camera/color/image_raw'),
+        DeclareLaunchArgument('image_topic', default_value='/image_raw'),
         DeclareLaunchArgument('bind_address', default_value='0.0.0.0'),
         DeclareLaunchArgument('public_host', default_value=''),
         DeclareLaunchArgument('http_port', default_value='18080'),
