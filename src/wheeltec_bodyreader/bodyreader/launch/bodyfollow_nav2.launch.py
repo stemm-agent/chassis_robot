@@ -398,8 +398,11 @@ def generate_launch_description():
                 {'side_obstacle_nav_distance_m': 0.40},
                 {'side_obstacle_release_distance_m': 0.45},
                 {'visual_min_linear_scale': 0.45},
-                {'target_exemption_angle_rad': 0.35},
+                {'target_exemption_angle_rad': 0.20},   # 2026-10-06: 0.35 -> 0.20 收窄豁免扇区（防真实障碍被误豁免）
                 {'target_exemption_distance_margin_m': 0.30},
+                {'target_exemption_outer_margin_m': 0.25},   # 2026-10-06: 外侧（比人远）放宽
+                {'target_exemption_inner_margin_m': 0.10},   # 2026-10-06: 内侧（比人近）=真实障碍，收紧
+                {'human_retreat_stall_settle_s': 2.0},   # 2026-10-06: 堵转改累计判据（治后退不灵敏）
                 # 2026-10-06: 目标豁免标定与门控（相机位姿变化后可在现场改这里或用 param set）
                 {'body_nav2_depth_camera_behind_lidar_m': 0.13},
                 {'body_nav2_person_map_depth_scale': 1.03},

@@ -251,6 +251,12 @@ public:
     target_exemption_angle_rad_ = declare_parameter<double>("target_exemption_angle_rad", 0.20);
     target_exemption_distance_margin_m_ =
       declare_parameter<double>("target_exemption_distance_margin_m", 0.12);
+    // 2026-10-06: 豁免窗口改"不对称"。外侧允许较大宽容度（激光看腿比相机看躯干更近），
+    // 内侧必须收紧——人与车之间的真实障碍物就在内侧，绝不能被当成人的腿豁免掉。
+    target_exemption_outer_margin_m_ =
+      declare_parameter<double>("target_exemption_outer_margin_m", 0.25);
+    target_exemption_inner_margin_m_ =
+      declare_parameter<double>("target_exemption_inner_margin_m", 0.10);
     // 2026-10-06: 相机->激光平面换算标定（原为 #define，相机位姿变化后需可调）
     body_nav2_depth_camera_behind_lidar_m_ = declare_parameter<double>(
         "body_nav2_depth_camera_behind_lidar_m", 0.13);
@@ -328,6 +334,10 @@ public:
       follow_distance_m_, hold_distance_band_m_, human_retreat_trigger_extra_m_);
     human_retreat_stall_s_ = std::max(
       0.0, declare_parameter<double>("human_retreat_stall_s", 0.5));
+    // 2026-10-06: 断续加速下"0.5s 窗口位移"会反复误判堵转（实测 blocked 37 次 vs start 15 次）。
+    // 改为累计判据：后退中累加指挥时长，仅在累计 >= settle 且期间最大位移 < progress 时判堵转。
+    human_retreat_stall_settle_s_ = std::max(
+      0.0, declare_parameter<double>("human_retreat_stall_settle_s", 2.0));
     // 2026-10-06: 从静止起步的后退需要宽限，否则起步延迟会被误判为堵转。
     human_retreat_stall_grace_s_ = std::max(
         0.0, declare_parameter<double>("human_retreat_stall_grace_s", 1.5));
@@ -1549,8 +1559,15 @@ private:
         // 2026-10-06: 原上限被硬编码为 0.12。人的“腿（激光平面）”比“质心（相机高度）”
         // 通常近 0.1-0.3m，0.12 使近距离豁免必然失败、人被当障碍绕行。
         // 现在按参数值生效，仅保留 0.35 的防误触发上限。
-        const double distance_margin = clamp_value(
-          target_exemption_distance_margin_m_, 0.0, 0.35);
+        // 2026-10-06: 不对称豁免窗口。外侧放宽以吸收"腿比躯干近"的几何差；
+        // 内侧收紧，保证人或车之间的真实障碍物不会被误豁免（实测该问题导致直冲障碍物）。
+        const double outer_margin = clamp_value(
+          std::max(target_exemption_distance_margin_m_,
+                   target_exemption_outer_margin_m_), 0.0, 0.35);
+        const double inner_margin = clamp_value(
+          target_exemption_inner_margin_m_, 0.0, outer_margin);
+        const double distance_margin =
+          (target_range_error >= 0.0) ? outer_margin : inner_margin;
         const bool outside_safety_zone =
           static_cast<double>(range) > obstacle_slow_distance_m_;
         const bool is_target =
@@ -5178,8 +5195,16 @@ private:
       // 2026-10-06: 记下本段后退的起点，用于起步宽限期。
       human_retreat_grace_until_ = now +
         rclcpp::Duration::from_seconds(human_retreat_stall_grace_s_);
+      // 2026-10-06: 累计判据的状态初始化。
+      human_retreat_cmd_accum_s_ = 0.0;
+      human_retreat_last_watch_time_ = now;
       return false;
     }
+    if (human_retreat_last_watch_time_.nanoseconds() != 0) {
+      human_retreat_cmd_accum_s_ +=
+        std::max(0.0, (now - human_retreat_last_watch_time_).seconds());
+    }
+    human_retreat_last_watch_time_ = now;
     if (!have_pose || !human_retreat_have_pose_) {
       return false;
     }
@@ -5189,6 +5214,7 @@ private:
     if (moved >= human_retreat_stall_progress_m_) {
       human_retreat_last_pose_ = pose;
       human_retreat_cmd_since_ = now;
+      human_retreat_cmd_accum_s_ = 0.0;   // 有真实位移：重新累计
       return false;
     }
     // 2026-10-06: 起步宽限期。从静止开始后退时，底盘响应与反向加速本身就要
@@ -5202,11 +5228,13 @@ private:
       human_retreat_cmd_since_ = now;
       return false;
     }
-    if (human_retreat_stall_s_ > 0.0 &&
-      (now - human_retreat_cmd_since_).seconds() >= human_retreat_stall_s_)
-    {
+    const double stall_window_s = std::max(
+      human_retreat_stall_s_, human_retreat_stall_settle_s_);
+    if (stall_window_s > 0.0 && human_retreat_cmd_accum_s_ >= stall_window_s) {
       avoid_diag_human_retreat_blocked_ += 1;
       human_retreat_cmd_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      human_retreat_cmd_accum_s_ = 0.0;
+      human_retreat_last_watch_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       // 下一段后退重新获得起步宽限。
       human_retreat_grace_until_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       return true;
@@ -5537,6 +5565,8 @@ private:
   double visual_min_linear_scale_;
   double target_exemption_angle_rad_;
   double target_exemption_distance_margin_m_;
+  double target_exemption_outer_margin_m_{0.25};
+  double target_exemption_inner_margin_m_{0.10};
   // 2026-10-06: 由编译期宏改为可调参数（相机位姿变化后可在现场重新标定）
   double body_nav2_depth_camera_behind_lidar_m_;
   double body_nav2_person_map_depth_scale_;
@@ -5584,6 +5614,9 @@ private:
   double human_retreat_stall_s_{0.5};
   double human_retreat_stall_grace_s_{1.5};
   double human_retreat_stall_progress_m_{0.01};
+  double human_retreat_stall_settle_s_{2.0};
+  double human_retreat_cmd_accum_s_{0.0};
+  rclcpp::Time human_retreat_last_watch_time_;
   int avoid_diag_human_retreats_{0};
   int avoid_diag_human_retreat_blocked_{0};
   rclcpp::Time human_retreat_cmd_since_;
