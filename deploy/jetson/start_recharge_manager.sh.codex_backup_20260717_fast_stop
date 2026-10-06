@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+WORKSPACE_ROOT=${WORKSPACE_ROOT:-/home/wheeltec/wheeltec_ros2}
+START_DELAY=${RECHARGE_MANAGER_START_DELAY:-5}
+
+source /opt/ros/humble/setup.bash
+source "${WORKSPACE_ROOT}/install/setup.bash"
+cd "${WORKSPACE_ROOT}"
+
+if [ "${START_DELAY}" != "0" ]; then
+  sleep "${START_DELAY}"
+fi
+
+exec ros2 run auto_recharge_ros2 recharge_manager

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+IFACE=${1:-}
+ACTION=${2:-}
+TARGET_IFACE=${TARGET_IFACE:-wlp4s0}
+
+if [ "$IFACE" != "$TARGET_IFACE" ]; then
+  exit 0
+fi
+
+case "$ACTION" in
+  up|dhcp4-change|connectivity-change)
+    systemctl start demo-control-network-refresh.service >/dev/null 2>&1 || true
+    ;;
+  *)
+    ;;
+esac
+
+exit 0

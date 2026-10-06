@@ -1,0 +1,18 @@
+[Unit]
+Description=Jetson MQTT Launch Bridge Service
+After=network.target
+
+[Service]
+Type=simple
+User=hnh
+WorkingDirectory=/opt/demo-control
+Environment=APP_ROOT=/opt/demo-control
+Environment=MQTT_BROKER_HOST=127.0.0.1
+Environment=MQTT_BROKER_PORT=1883
+Environment=MQTT_DEVICE_ID=robot-001
+ExecStart=/opt/demo-control/deploy/nuc/start_launch_mqtt_bridge.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

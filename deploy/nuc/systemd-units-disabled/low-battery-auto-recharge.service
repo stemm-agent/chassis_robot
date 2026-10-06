@@ -1,0 +1,18 @@
+[Unit]
+Description=ROS2 Low Battery Auto Recharge Monitor
+Wants=network-online.target wheeltec-robot.service wheeltec-recharge-manager.service wheeltec-mic.service
+After=network-online.target wheeltec-robot.service wheeltec-recharge-manager.service wheeltec-mic.service
+
+[Service]
+Type=simple
+User=hnh
+WorkingDirectory=/home/hnh/wheeltec_ros2
+Environment=ROS_DOMAIN_ID=0
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/hnh/wheeltec_ros2/install/setup.bash && exec ros2 run auto_recharge_ros2 low_battery_auto_recharge --ros-args -p low_voltage_threshold:=22.2'
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

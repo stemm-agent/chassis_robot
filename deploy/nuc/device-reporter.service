@@ -1,0 +1,22 @@
+[Unit]
+Description=Jetson Device IP Reporter Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=hnh
+WorkingDirectory=/opt/demo-control
+Environment=APP_ROOT=/opt/demo-control
+Environment=MQTT_DEVICE_ID=robot-001
+Environment=DEVICE_REPORT_URL=https://stemm.hnh666.com/api/device/report
+Environment=DEVICE_REPORT_CHECK_INTERVAL=5
+Environment=DEVICE_REPORT_HEARTBEAT_INTERVAL=60
+Environment=DEVICE_REPORT_HTTP_TIMEOUT=5
+Environment=DEVICE_REPORT_INCLUDE_WAITING_STATE=true
+ExecStart=/opt/demo-control/deploy/nuc/start_device_reporter.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

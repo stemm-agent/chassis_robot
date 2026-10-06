@@ -1,0 +1,18 @@
+[Unit]
+Description=Wheeltec Robot Base Bringup
+After=network.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/opt/demo-control
+Environment=APP_ROOT=/opt/demo-control
+Environment=ROBOT_INIT_DELAY=2
+ExecStart=/opt/demo-control/deploy/jetson/start_wheeltec_robot.sh
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

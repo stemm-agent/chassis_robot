@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>机器人控制最小 Demo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="app">
+    <section class="panel">
+      <h1>机器人控制最小 Demo</h1>
+      <p class="subtitle">模拟 uni-app 小程序页面，验证按钮、命令和状态回传。</p>
+
+      <div class="status-card">
+        <span class="label">设备 ID</span>
+        <strong id="deviceId">robot-001</strong>
+        <span class="label">当前状态</span>
+        <strong id="status">idle</strong>
+        <span class="label">当前任务</span>
+        <strong id="taskId">-</strong>
+        <span class="label">移动方向</span>
+        <strong id="movement">-</strong>
+        <span class="label">控制模式</span>
+        <strong id="controlMode">-</strong>
+        <span class="label">MQTT 连接</span>
+        <strong id="mqttConnected">-</strong>
+        <span class="label">Jetson 在线</span>
+        <strong id="jetsonOnline">-</strong>
+        <span class="label">Launch 状态</span>
+        <strong id="launchStatus">-</strong>
+        <span class="label">当前任务名</span>
+        <strong id="currentTask">-</strong>
+        <span class="label">任务类型</span>
+        <strong id="currentTaskType">-</strong>
+        <span class="label">最近错误</span>
+        <strong id="lastError">-</strong>
+      </div>
+
+      <div class="actions">
+        <button id="startButton" class="primary">开始导航</button>
+        <button id="stopButton" class="danger">停止导航</button>
+      </div>
+
+      <div class="actions mqtt-actions">
+        <button id="startLaunchButton" class="primary">启动 Launch</button>
+        <button id="stopLaunchButton" class="ghost">停止 Launch</button>
+      </div>
+
+      <div class="actions mqtt-actions">
+        <button id="startNodeButton" class="primary">开启节点按钮</button>
+        <button id="stopNodeButton" class="ghost">关闭节点按钮</button>
+      </div>
+
+      <div class="movement-panel">
+        <p class="movement-title">手动移动控制（按住移动，松开停止）</p>
+        <div class="movement-grid">
+          <div></div>
+          <button id="forwardButton" class="secondary">前进</button>
+          <div></div>
+          <button id="leftButton" class="secondary">左转</button>
+          <button id="stopManualButton" class="danger">停止</button>
+          <button id="rightButton" class="secondary">右转</button>
+          <div></div>
+          <button id="backwardButton" class="secondary">后退</button>
+          <div></div>
+        </div>
+      </div>
+
+      <p id="hint" class="hint">等待操作...</p>
+    </section>
+
+    <section class="panel logs">
+      <div class="logs-header">
+        <h2>状态日志</h2>
+        <button id="clearLogButton" class="ghost">清空日志</button>
+      </div>
+      <ul id="logList"></ul>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

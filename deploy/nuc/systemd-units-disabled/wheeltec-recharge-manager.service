@@ -1,0 +1,25 @@
+[Unit]
+Description=Wheeltec Persistent Recharge Manager
+Wants=network.target wheeltec-robot.service
+After=network.target wheeltec-robot.service
+ConditionPathExists=/home/hnh/wheeltec_ros2/install/setup.bash
+
+[Service]
+Type=simple
+User=hnh
+Group=hnh
+Environment=HOME=/home/hnh
+Environment=WORKSPACE_ROOT=/home/hnh/wheeltec_ros2
+Environment=RECHARGE_MANAGER_START_DELAY=5
+Environment=ROS_DOMAIN_ID=0
+Environment=PYTHONUNBUFFERED=1
+WorkingDirectory=/home/hnh/wheeltec_ros2
+ExecStart=/opt/demo-control/deploy/nuc/start_recharge_manager.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

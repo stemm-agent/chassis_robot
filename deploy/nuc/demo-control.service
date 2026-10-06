@@ -1,0 +1,21 @@
+[Unit]
+Description=Demo Control Web Service
+After=network.target
+Requires=robot-agent.service launch-mqtt-bridge.service stemm-cartographer-map-service.service
+After=robot-agent.service launch-mqtt-bridge.service stemm-cartographer-map-service.service
+
+[Service]
+Type=simple
+User=hnh
+WorkingDirectory=/opt/demo-control
+Environment=APP_ROOT=/opt/demo-control
+Environment=APP_HOST=0.0.0.0
+Environment=APP_PORT=3000
+Environment=JETSON_AGENT_URL=http://127.0.0.1:8001
+Environment=MAP_SERVICE_URL=http://127.0.0.1:8093
+ExecStart=/opt/demo-control/deploy/nuc/start_demo_control.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

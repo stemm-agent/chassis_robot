@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh demo-control services after Wi-Fi client network is ready
+After=NetworkManager.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/demo-control/deploy/jetson/restart_services_after_wifi.sh

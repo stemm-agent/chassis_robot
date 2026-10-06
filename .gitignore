@@ -1,0 +1,18 @@
+# 虚拟环境与运行产物
+.venv/
+node_modules/
+*.log
+logs/
+data/
+uploads/
+__pycache__/
+*.pyc
+# 手工备份（保留磁盘，不入库）
+*.bak
+*.bak.*
+*.bak-*
+*.bak_*
+*.codex-backup-*
+*.failed-adopt-attempt-*
+*.orig
+*.before
