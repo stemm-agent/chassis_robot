@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the STEMM mapping leftover killer every 15 s
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=15s
+AccuracySec=3s
+Unit=stemm-mapping-leftover-killer.service
+
+[Install]
+WantedBy=timers.target

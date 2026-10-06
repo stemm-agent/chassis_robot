@@ -1,0 +1,8 @@
+[Unit]
+Description=STEMM mapping leftover killer (no live session => no mapping processes)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/stemm-mapping-leftover-killer
+Nice=5
