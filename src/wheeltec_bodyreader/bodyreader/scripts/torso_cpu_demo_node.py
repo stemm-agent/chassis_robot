@@ -229,6 +229,26 @@ class TorsoCpuDemoNode(Node):
         self.depth_roi_width_ratio = min(
             1.0, max(0.05, float(self._param("depth_roi_width_ratio", 0.30)))
         )
+        # 2026-10-06 (B): widen the sampling region slightly and use a near-mode
+        # statistic instead of a plain median, so a box that overlaps background
+        # no longer reports the wall behind the person.
+        self.depth_roi_width_scale = min(
+            4.0, max(1.0, float(self._param("depth_roi_width_scale", 1.4)))
+        )
+        self.depth_roi_height_scale = min(
+            4.0, max(1.0, float(self._param("depth_roi_height_scale", 1.4)))
+        )
+        self.depth_mode_tolerance_m = max(
+            0.05, float(self._param("depth_mode_tolerance_m", 0.50))
+        )
+        self.depth_mode_lower_pct = min(
+            49.0, max(0.0, float(self._param("depth_mode_lower_pct", 20.0)))
+        )
+        self.depth_mode_min_pixels = max(
+            1, int(self._param("depth_mode_min_pixels", 20))
+        )
+        self._diag_depth_stat = "n/a"
+        self._diag_depth_cluster_px = 0
         self.depth_roi_height_ratio = min(
             1.0, max(0.05, float(self._param("depth_roi_height_ratio", 0.25)))
         )
@@ -937,8 +957,10 @@ class TorsoCpuDemoNode(Node):
         x1, y1, x2, y2 = (float(value) for value in track.box)
         center_x = (x1 + x2) * 0.5
         center_y = (y1 + y2) * 0.5
-        roi_width = max(3.0, (x2 - x1) * self.depth_roi_width_ratio)
-        roi_height = max(3.0, (y2 - y1) * self.depth_roi_height_ratio)
+        roi_width = max(3.0, (x2 - x1) * self.depth_roi_width_ratio
+                        * self.depth_roi_width_scale)
+        roi_height = max(3.0, (y2 - y1) * self.depth_roi_height_ratio
+                         * self.depth_roi_height_scale)
         dx1 = max(0, int(round((center_x - roi_width * 0.5) * scale_x)))
         dx2 = min(depth_width, int(round((center_x + roi_width * 0.5) * scale_x)))
         dy1 = max(0, int(round((center_y - roi_height * 0.5) * scale_y)))
@@ -961,7 +983,20 @@ class TorsoCpuDemoNode(Node):
         if valid.size < 5:
             self._diag_reason_current = "roi_few_valid_px"
             return None
+        # 2026-10-06 (B): prefer the nearest consistent surface (the person) over
+        # the plain median, which can be dragged onto the background behind them.
         forward_m = float(np.median(valid))
+        self._diag_depth_stat = "median"
+        self._diag_depth_cluster_px = 0
+        try:
+            seed = float(np.percentile(valid, self.depth_mode_lower_pct))
+            window = valid[np.abs(valid - seed) <= self.depth_mode_tolerance_m]
+            if window.size >= self.depth_mode_min_pixels:
+                forward_m = float(np.mean(window))
+                self._diag_depth_stat = "mode"
+                self._diag_depth_cluster_px = int(window.size)
+        except Exception:
+            pass
 
         k = camera_info.k
         if len(k) != 9 or k[0] <= 1.0e-6 or k[4] <= 1.0e-6:
@@ -1083,6 +1118,8 @@ class TorsoCpuDemoNode(Node):
                 "depth_age_ms": self._diag_depth_age_ms,
                 "depth_skew_ms": self._diag_depth_skew_ms,
                 "roi_valid_px": self._diag_roi_valid_px,
+                "depth_stat": self._diag_depth_stat,
+                "depth_cluster_px": self._diag_depth_cluster_px,
                 "lock_memory_track": self._last_locked_track_id,
                 "unlocked_s": (
                     round(time.monotonic() - self._unlocked_since, 1)

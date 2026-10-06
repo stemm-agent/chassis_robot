@@ -280,6 +280,11 @@ def generate_launch_description():
                 'max_detections': 12,
                 'min_box_area_px': 600.0,
                 'min_box_area_ratio': 0.0015,   # 2026-10-06: 最小框面积改为画面比例（≈460px@640x480）
+                'depth_roi_width_scale': 1.4,   # 2026-10-06 (B): 深度采样区放大
+                'depth_roi_height_scale': 1.4,
+                'depth_mode_lower_pct': 20.0,   # 2026-10-06 (B): 近邻主簇种子分位
+                'depth_mode_tolerance_m': 0.50,
+                'depth_mode_min_pixels': 20,
                 'lock_min_hits': 3,   # 2026-10-06: 4 -> 3（实测每轮只积累 2-3 次命中）
                 'track_max_missed': 30,   # 2026-10-06: 12 -> 30（轨迹保留约 3s）
                 'track_iou_threshold': 0.10,   # 2026-10-06: 0.20 -> 0.10（移动时也能续轨）
