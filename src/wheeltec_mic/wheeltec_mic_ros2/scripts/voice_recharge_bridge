@@ -322,6 +322,11 @@ class VoiceRechargeBridge(Node):
         # ==== 2026-09-15 (A): persist the dock/undock anchor so a bridge or mic restart
         # no longer destroys navigation (the anchor used to live only in memory).
         self.declare_parameter('anchor_restore_enabled', True)
+        # 2026-10-06: 播种时若内存无锚点观测，按需从磁盘重读锚点。
+        # 背景：_load_anchor() 只在进程启动时调用一次；进程重启后若当时文件无效，
+        # 内存锚点永远为空，导致脱桩后仍报 'no completed undock observed this session'。
+        self.declare_parameter('seed_anchor_reload_enabled', True)
+        self.declare_parameter('seed_anchor_reload_min_interval_sec', 5.0)
         self.declare_parameter('anchor_state_path', os.path.expanduser(
             '~/.local/state/stemm/localization_anchor.json'))
         self.declare_parameter('anchor_max_age_s', 43200.0)
@@ -486,6 +491,11 @@ class VoiceRechargeBridge(Node):
         self.recharge_start_client = self.create_client(
             Trigger, self.recharge_start_service
         )
+        self.seed_anchor_reload_enabled = bool(
+            self.get_parameter('seed_anchor_reload_enabled').value)
+        self.seed_anchor_reload_min_interval_sec = max(
+            0.0, float(self.get_parameter(
+                'seed_anchor_reload_min_interval_sec').value))
         self.recharge_stop_client = self.create_client(
             Trigger, self.recharge_stop_service
         )
@@ -1033,6 +1043,28 @@ class VoiceRechargeBridge(Node):
             value += 2.0 * math.pi
         return value
 
+    def _reload_anchor_on_demand(self):
+        """按需从磁盘重读锚点（带最小间隔防抖）。成功返回 True。"""
+        if not getattr(self, 'seed_anchor_reload_enabled', True):
+            return False
+        if not getattr(self, 'anchor_restore_enabled', True):
+            return False
+        now = time.monotonic()
+        last = getattr(self, '_seed_anchor_reload_last_at', 0.0)
+        if now - last < getattr(self, 'seed_anchor_reload_min_interval_sec', 5.0):
+            return False
+        self._seed_anchor_reload_last_at = now
+        try:
+            self._load_anchor()
+        except Exception as exc:                      # never let bookkeeping kill the bridge
+            self.get_logger().warn('On-demand anchor reload failed: %s' % exc)
+            return False
+        if self._odom_at_recharge_point is not None or self._odom_at_dock is not None:
+            self.get_logger().warn(
+                'Re-loaded the saved localization anchor on demand; seeding from disk.')
+            return True
+        return False
+
     def _compute_seed_pose(self):
         """返回 (x, y, yaw, sigma_xy, sigma_yaw, source)；不可信时 x 为 None。
 
@@ -1077,8 +1109,33 @@ class VoiceRechargeBridge(Node):
             byaw = ryaw
             source = ('dock contact %.3fm behind the recharge point' % travel)
         else:
-            return (None, None, None, None, None,
-                    'no dock contact and no completed undock observed this session')
+            # 2026-10-06 (B 修复): 内存里没有锚点观测时，按需从磁盘重读一次。
+            # 只读一次不够——_load_anchor() 仅在进程启动时调用；进程重启后若当时
+            # 文件无效/为空，之后再脱桩也不会进入内存，于是播种被永久拒绝。
+            if self._reload_anchor_on_demand():
+                if self._odom_at_recharge_point is not None:
+                    ax, ay, ayaw = self._odom_at_recharge_point
+                    bx, by, byaw = self.recharge_point
+                    source = 'recharge point (map origin, restored from disk)'
+                elif self._odom_at_dock is not None:
+                    travel = (self._undock_last_distance_m
+                              if self._undock_last_distance_m >= self.undock_min_travel_m
+                              else self.dock_offset_distance_m)
+                    rx, ry, ryaw = self.recharge_point
+                    ax, ay, ayaw = self._odom_at_dock
+                    bx = rx - math.cos(ryaw) * travel
+                    by = ry - math.sin(ryaw) * travel
+                    byaw = ryaw
+                    source = ('dock contact %.3fm behind the recharge point '
+                              '(restored from disk)' % travel)
+                else:
+                    return (None, None, None, None, None,
+                            'saved anchor on disk has no usable pose; '
+                            'dock the robot (charging contact) or complete an undock')
+            else:
+                return (None, None, None, None, None,
+                        'no dock contact and no completed undock observed this session, '
+                        'and no usable saved anchor on disk')
         mx, my = self._odom[0] - ax, self._odom[1] - ay
         myaw = self._wrap_angle(self._odom[2] - ayaw)
         dist = math.hypot(mx, my)
