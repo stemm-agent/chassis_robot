@@ -210,6 +210,12 @@ public:
     lost_timeout_s_ = declare_parameter<double>("lost_timeout_s", 1.0);
     body_invalid_grace_s_ =
       std::max(0.0, declare_parameter<double>("body_invalid_grace_s", 0.45));
+    // 2026-10-06: reject implausible depth jumps (either direction).  The detector's
+    // per-box ROI median can latch onto background behind the person, which turned a
+    // 1.5 m target into 3-5 m and drove /cmd_vel to its 0.8 m/s ceiling (实测前冲).
+    max_depth_jump_mm_ = declare_parameter<double>("max_depth_jump_mm", 800.0);
+    depth_jump_confirm_samples_ = std::max(
+      1, static_cast<int>(declare_parameter<int>("depth_jump_confirm_samples", 3)));
     tf_timeout_s_ = declare_parameter<double>("tf_timeout_s", 0.20);
     // B1 diagnostics only (observation): publishes /body_nav2_avoid_diag.
     // Never changes control decisions; can be disabled with avoid_diag_enabled=false.
@@ -718,15 +724,71 @@ private:
     return true;
   }
 
+  // 2026-10-06: symmetrical depth-jump guard.
+  // Returns true when the sample's depth may be used; false means "reject this
+  // sample and keep the previous valid depth" (the existing body_invalid_grace
+  // window already holds the last body for a short while).
+  bool depth_sample_is_plausible(double depth_mm)
+  {
+    if (!(max_depth_jump_mm_ > 0.0)) {
+      return true;
+    }
+    if (!(last_accepted_body_depth_mm_ > 0.0)) {
+      // First usable sample establishes the reference depth.
+      last_accepted_body_depth_mm_ = depth_mm;
+      depth_jump_candidate_mm_ = 0.0;
+      depth_jump_candidate_count_ = 0;
+      return true;
+    }
+    const double delta = std::fabs(depth_mm - last_accepted_body_depth_mm_);
+    if (delta <= max_depth_jump_mm_) {
+      last_accepted_body_depth_mm_ = depth_mm;
+      depth_jump_candidate_mm_ = 0.0;
+      depth_jump_candidate_count_ = 0;
+      return true;
+    }
+    // Implausible jump: only accept it once consecutive samples agree, so a real
+    // fast approach is still honoured while a single-frame ROI slip is rejected.
+    if (depth_jump_candidate_count_ > 0 &&
+        std::fabs(depth_mm - depth_jump_candidate_mm_) <= max_depth_jump_mm_ * 0.5)
+    {
+      ++depth_jump_candidate_count_;
+    } else {
+      depth_jump_candidate_mm_ = depth_mm;
+      depth_jump_candidate_count_ = 1;
+    }
+    if (depth_jump_candidate_count_ >= depth_jump_confirm_samples_) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Depth jump confirmed after %d samples: %.0fmm -> %.0fmm; accepting new depth",
+        depth_jump_candidate_count_, last_accepted_body_depth_mm_, depth_mm);
+      last_accepted_body_depth_mm_ = depth_mm;
+      depth_jump_candidate_mm_ = 0.0;
+      depth_jump_candidate_count_ = 0;
+      return true;
+    }
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Rejected implausible body depth %.0fmm (last accepted %.0fmm, jump %.0fmm > %.0fmm); "
+      "holding the previous target depth",
+      depth_mm, last_accepted_body_depth_mm_, delta, max_depth_jump_mm_);
+    return false;
+  }
+
   void body_callback(const bodyreader_msg::msg::Bodyposture::SharedPtr msg)
   {
     const auto now = this->now();
     const bool valid_lock = msg->lock_status == 2;
-    const bool valid_depth =
+    bool valid_depth =
       std::isfinite(msg->centerofmass_x) &&
       std::isfinite(msg->centerofmass_y) &&
       std::isfinite(msg->centerofmass_z) &&
       msg->centerofmass_z > 100.0f;
+    // 2026-10-06: a depth that jumps implausibly is treated exactly like an invalid
+    // depth, so the follower keeps the last accepted target instead of chasing it.
+    if (valid_depth && !depth_sample_is_plausible(msg->centerofmass_z)) {
+      valid_depth = false;
+    }
     bool position_jump_recovery_completed = false;
     bool position_jump_danger_cancel = false;
 
@@ -5446,6 +5508,11 @@ private:
   double goal_yaw_tolerance_rad_;
   double lost_timeout_s_;
   double body_invalid_grace_s_;
+  double max_depth_jump_mm_{800.0};
+  int depth_jump_confirm_samples_{3};
+  double last_accepted_body_depth_mm_{0.0};
+  double depth_jump_candidate_mm_{0.0};
+  int depth_jump_candidate_count_{0};
   double tf_timeout_s_;
   double max_retreat_goal_m_;
   double target_memory_timeout_s_;
