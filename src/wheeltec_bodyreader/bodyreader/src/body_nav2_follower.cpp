@@ -224,6 +224,11 @@ public:
       std::max(0.1, declare_parameter<double>("avoid_diag_period_s", 0.1));
     max_retreat_goal_m_ = declare_parameter<double>("max_retreat_goal_m", 0.8);
     target_memory_timeout_s_ = declare_parameter<double>("target_memory_timeout_s", 8.0);
+    // 2026-10-06: 正面绕障目标在"通畅人位缓存"缺失/过期时，回退到实时人体位姿。
+    // 实测：缓存只在"完全没障碍"的分支里记录，先遇障碍再触发避障时从未建立，
+    // 导致 nav2_avoid_goal_not_ready_stop（152 次）只有停车、没有绕障。
+    avoidance_live_person_max_age_s_ = declare_parameter<double>(
+      "avoidance_live_person_max_age_s", 3.0);
     reacquire_timeout_s_ = declare_parameter<double>("reacquire_timeout_s", 18.0);
     nav2_retry_backoff_s_ = declare_parameter<double>("nav2_retry_backoff_s", 1.5);
     reacquire_spin_min_yaw_rad_ = declare_parameter<double>("reacquire_spin_min_yaw_rad", 0.35);
@@ -2007,14 +2012,36 @@ private:
       const bool has_recent_clear_person =
         has_last_clear_person_pose_ &&
         (now - last_clear_person_time_).seconds() <= target_memory_timeout_s_;
-      if (!has_recent_clear_person) {
+      // 2026-10-06: 缓存只会在"完全没障碍"的分支里写入，先遇障碍再触发避障时
+      // 从未建立（实测 152 次 nav2_avoid_wait_clear_person_pose / goal_not_ready_stop）。
+      // 这里回退到实时人体位姿，并要求它足够新。
+      const bool live_person_fresh =
+        has_last_person_map_ &&
+        last_person_map_time_.nanoseconds() != 0 &&
+        avoidance_live_person_max_age_s_ > 0.0 &&
+        (now - last_person_map_time_).seconds() <= avoidance_live_person_max_age_s_;
+      if (!has_recent_clear_person && !live_person_fresh) {
         publish_state("nav2_avoid_wait_clear_person_pose");
         return false;
       }
 
-      target_x = last_clear_person_pose_.pose.position.x;
-      target_y = last_clear_person_pose_.pose.position.y;
-      source = "visual_person_history";
+      if (has_recent_clear_person) {
+        target_x = last_clear_person_pose_.pose.position.x;
+        target_y = last_clear_person_pose_.pose.position.y;
+        source = "visual_person_history";
+      } else {
+        target_x = last_person_map_pose_.pose.position.x;
+        target_y = last_person_map_pose_.pose.position.y;
+        source = "visual_person_live_fallback";
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "Avoidance goal used the live person pose (age %.2fs); the remembered "
+          "clear-path pose was missing or stale (has=%d age=%.1fs)",
+          (now - last_person_map_time_).seconds(),
+          has_last_clear_person_pose_ ? 1 : 0,
+          has_last_clear_person_pose_ ?
+            (now - last_clear_person_time_).seconds() : -1.0);
+      }
       if (!extend_goal_from_obstacle(obstacle_x, obstacle_y, target_x, target_y)) {
         publish_state("nav2_avoid_invalid_clear_person_pose");
         return false;
@@ -5562,6 +5589,7 @@ private:
   double tf_timeout_s_;
   double max_retreat_goal_m_;
   double target_memory_timeout_s_;
+  double avoidance_live_person_max_age_s_{3.0};
   double reacquire_timeout_s_;
   double nav2_retry_backoff_s_;
   double reacquire_spin_min_yaw_rad_;

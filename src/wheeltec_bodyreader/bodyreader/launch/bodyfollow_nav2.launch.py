@@ -478,6 +478,7 @@ def generate_launch_description():
 
                 {'keep_last_goal_when_occluded': True},
                 {'target_memory_timeout_s': 12.0},
+                {'avoidance_live_person_max_age_s': 3.0},   # 2026-10-06: 正面绕障目标可回退到实时人位（<=0 关闭）
                 {'reacquire_yaw_goal': False},
                 {'reacquire_timeout_s': 18.0},
                 {'nav2_retry_backoff_s': 1.5},
