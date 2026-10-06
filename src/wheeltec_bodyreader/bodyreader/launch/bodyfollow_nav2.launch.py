@@ -383,14 +383,20 @@ def generate_launch_description():
                 # moves. Slow clearance and release keep their original values, so the
                 # takeover must stay at or below the release distance (0.80) or the
                 # gate would release as soon as it engaged.
-                {'obstacle_slow_distance_m': 0.80},
                 {'obstacle_nav_distance_m': 0.80},
                 {'obstacle_nav_release_distance_m': 0.80},
                 {'side_obstacle_nav_distance_m': 0.40},
                 {'side_obstacle_release_distance_m': 0.45},
                 {'visual_min_linear_scale': 0.45},
-                {'target_exemption_angle_rad': 0.20},
-                {'target_exemption_distance_margin_m': 0.12},
+                {'target_exemption_angle_rad': 0.35},
+                {'target_exemption_distance_margin_m': 0.30},
+                # 2026-10-06: 目标豁免标定与门控（相机位姿变化后可在现场改这里或用 param set）
+                {'body_nav2_depth_camera_behind_lidar_m': 0.13},
+                {'body_nav2_person_map_depth_scale': 1.03},
+                {'body_nav2_target_half_width_m': 0.22},
+                {'obstacle_slow_distance_m': 0.55},
+                # 2026-10-06: 盲区下限 0.60 -> 0.45（A 步验证：人在 0.6m 内也能触发受控后退）
+                {'human_retreat_min_valid_m': 0.45},
                 {'enable_avoidance_side_goal': True},
                 {'avoidance_lateral_offset_m': 0.72},
                 {'avoidance_forward_margin_m': 0.55},

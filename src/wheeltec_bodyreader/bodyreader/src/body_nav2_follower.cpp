@@ -245,6 +245,13 @@ public:
     target_exemption_angle_rad_ = declare_parameter<double>("target_exemption_angle_rad", 0.20);
     target_exemption_distance_margin_m_ =
       declare_parameter<double>("target_exemption_distance_margin_m", 0.12);
+    // 2026-10-06: 相机->激光平面换算标定（原为 #define，相机位姿变化后需可调）
+    body_nav2_depth_camera_behind_lidar_m_ = declare_parameter<double>(
+        "body_nav2_depth_camera_behind_lidar_m", 0.13);
+    body_nav2_person_map_depth_scale_ = declare_parameter<double>(
+        "body_nav2_person_map_depth_scale", 1.03);
+    body_nav2_target_half_width_m_ = declare_parameter<double>(
+        "body_nav2_target_half_width_m", 0.22);
     avoidance_forward_margin_m_ = declare_parameter<double>("avoidance_forward_margin_m", 0.35);
     avoidance_min_forward_step_m_ =
       declare_parameter<double>("avoidance_min_forward_step_m", 0.45);
@@ -1432,15 +1439,15 @@ private:
 
     if (person_exemption) {
       const double camera_forward =
-        active_visual_body_.centerofmass_z * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
+        active_visual_body_.centerofmass_z * 0.001 * body_nav2_person_map_depth_scale_;
       const double camera_lateral =
-        active_visual_body_.centerofmass_x * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
-      const double laser_forward = camera_forward - BODY_NAV2_DEPTH_CAMERA_BEHIND_LIDAR_M;
+        active_visual_body_.centerofmass_x * 0.001 * body_nav2_person_map_depth_scale_;
+      const double laser_forward = camera_forward - body_nav2_depth_camera_behind_lidar_m_;
       person_angle = std::atan2(camera_lateral, laser_forward);
       person_distance = std::hypot(laser_forward, camera_lateral);
       const double max_person_angle = std::max(0.06, target_exemption_angle_rad_);
       person_angle_tolerance = clamp_value(
-        std::atan2(BODY_NAV2_TARGET_HALF_WIDTH_M, std::max(0.1, person_distance)),
+        std::atan2(body_nav2_target_half_width_m_, std::max(0.1, person_distance)),
         0.06, max_person_angle);
     }
 
@@ -1474,8 +1481,11 @@ private:
 
       if (finite_valid) {
         const double target_range_error = static_cast<double>(range) - person_distance;
+        // 2026-10-06: 原上限被硬编码为 0.12。人的“腿（激光平面）”比“质心（相机高度）”
+        // 通常近 0.1-0.3m，0.12 使近距离豁免必然失败、人被当障碍绕行。
+        // 现在按参数值生效，仅保留 0.35 的防误触发上限。
         const double distance_margin = clamp_value(
-          target_exemption_distance_margin_m_, 0.0, 0.12);
+          target_exemption_distance_margin_m_, 0.0, 0.35);
         const bool outside_safety_zone =
           static_cast<double>(range) > obstacle_slow_distance_m_;
         const bool is_target =
@@ -4786,9 +4796,9 @@ private:
   bool person_in_base(double & x, double & y, double & z)
   {
     const double camera_forward =
-      active_visual_body_.centerofmass_z * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
+      active_visual_body_.centerofmass_z * 0.001 * body_nav2_person_map_depth_scale_;
     const double camera_left =
-      active_visual_body_.centerofmass_x * 0.001 * BODY_NAV2_PERSON_MAP_DEPTH_SCALE;
+      active_visual_body_.centerofmass_x * 0.001 * body_nav2_person_map_depth_scale_;
     const double camera_up = active_visual_body_.centerofmass_y * 0.001;
 
     if (!body_frame_id_.empty()) {
@@ -4818,7 +4828,7 @@ private:
     const double c = std::cos(camera_yaw_offset_rad_);
     const double s = std::sin(camera_yaw_offset_rad_);
     x = camera_offset_x_m_ + BODY_NAV2_LIDAR_FORWARD_OF_BASE_M -
-      BODY_NAV2_DEPTH_CAMERA_BEHIND_LIDAR_M +
+      body_nav2_depth_camera_behind_lidar_m_ +
       c * camera_forward - s * camera_left;
     y = camera_offset_y_m_ + s * camera_forward + c * camera_left;
     z = camera_offset_z_m_ + camera_up;
@@ -5441,6 +5451,10 @@ private:
   double visual_min_linear_scale_;
   double target_exemption_angle_rad_;
   double target_exemption_distance_margin_m_;
+  // 2026-10-06: 由编译期宏改为可调参数（相机位姿变化后可在现场重新标定）
+  double body_nav2_depth_camera_behind_lidar_m_;
+  double body_nav2_person_map_depth_scale_;
+  double body_nav2_target_half_width_m_;
   double avoidance_forward_margin_m_;
   double avoidance_min_forward_step_m_;
   double avoidance_max_forward_step_m_;
