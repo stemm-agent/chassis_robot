@@ -275,13 +275,13 @@ def generate_launch_description():
                 'initial_mode': 1,
                 'max_inference_hz': 15.0,   # 2026-10-06: 10 -> 15（提高检测密度，稳住轨迹）
                 'onnx_intra_op_threads': 6,   # 2026-10-06: 4 -> 6（CPU 有余量）
-                'confidence_threshold': 0.50,
+                'confidence_threshold': 0.40,   # 2026-10-06: 0.50 -> 0.40（实测更连续）
                 'nms_iou_threshold': 0.45,
                 'max_detections': 12,
                 'min_box_area_px': 600.0,
                 'min_box_area_ratio': 0.0015,   # 2026-10-06: 最小框面积改为画面比例（≈460px@640x480）
-                'lock_min_hits': 4,
-                'track_max_missed': 12,
+                'lock_min_hits': 3,   # 2026-10-06: 4 -> 3（实测每轮只积累 2-3 次命中）
+                'track_max_missed': 30,   # 2026-10-06: 12 -> 30（轨迹保留约 3s）
                 'auto_lock_center': True,
                 'detections_topic': '/torso_trt_demo/detections',
                 'features_topic': '/torso_trt_demo/features',
@@ -361,7 +361,8 @@ def generate_launch_description():
                 {'camera_yaw_offset_rad': 0.0},
 
                 {'follow_distance_m': 1.5},
-                {'hold_distance_band_m': 0.12},
+                {'hold_distance_band_m': 0.30},   # 2026-10-06: 0.12 -> 0.30 压掉逐帧状态抖动
+                {'human_retreat_trigger_extra_m': 0.68},   # 2026-10-06: 0.50 -> 0.68 补偿 hold band，后退阈值仍为 1.88m,
                 {'min_goal_distance_m': 0.15},
                 {'goal_update_period_s': 0.8},
                 {'goal_position_tolerance_m': 0.25},
@@ -443,9 +444,9 @@ def generate_launch_description():
                 {'visual_x_p': 0.5},
                 {'visual_x_d': 0.33},
                 {'visual_z_p': 2.2},
-                {'visual_z_d': 0.30},
-                {'visual_filter_alpha': 0.62},
-                {'visual_angle_deadband': 0.015},
+                {'visual_z_d': 0.60},   # 2026-10-06: 0.30 -> 0.60 阻尼翻倍，治过冲（越过人体中心）,
+                {'visual_filter_alpha': 0.75},   # 2026-10-06: 0.62 -> 0.75 滤波时间常数 107ms -> 67ms,
+                {'visual_angle_deadband': 0.008},   # 2026-10-06: 0.015 -> 0.008（1.55m 处 23mm -> 12mm 才响应）,
                 {'visual_distance_deadband_mm': 80.0},
                 # 2026-09-28: forward follow ceiling raised by request; reverse stays at
                 # its previous value (forward*1.00 == 0.75) so the reverse/retreat path
