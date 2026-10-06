@@ -401,7 +401,6 @@ def generate_launch_description():
                 {'target_exemption_angle_rad': 0.35},   # 回滚到 14:30 较稳定版本
                 {'target_exemption_distance_margin_m': 0.30},   # 回滚到 14:30 较稳定版本
                 {'target_exemption_outer_margin_m': 0.30},   # 回滚到 14:30（外侧）
-                {'target_exemption_outer_margin_ceiling': 0.30},   # 硬顶与之一致
                 {'target_exemption_inner_margin_m': 0.12},   # 内侧收紧（比外侧严，护住人与车之间的真实障碍）
                 {'human_retreat_stall_settle_s': 2.0},   # 2026-10-06: 堵转改累计判据（治后退不灵敏）
                 # 2026-10-06: 目标豁免标定与门控（相机位姿变化后可在现场改这里或用 param set）
@@ -478,7 +477,6 @@ def generate_launch_description():
 
                 {'keep_last_goal_when_occluded': True},
                 {'target_memory_timeout_s': 12.0},
-                {'avoidance_live_person_max_age_s': 3.0},   # 2026-10-06: 正面绕障目标可回退到实时人位（<=0 关闭）
                 {'reacquire_yaw_goal': False},
                 {'reacquire_timeout_s': 18.0},
                 {'nav2_retry_backoff_s': 1.5},
