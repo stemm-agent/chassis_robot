@@ -322,6 +322,9 @@ public:
       follow_distance_m_, hold_distance_band_m_, human_retreat_trigger_extra_m_);
     human_retreat_stall_s_ = std::max(
       0.0, declare_parameter<double>("human_retreat_stall_s", 0.5));
+    // 2026-10-06: 从静止起步的后退需要宽限，否则起步延迟会被误判为堵转。
+    human_retreat_stall_grace_s_ = std::max(
+        0.0, declare_parameter<double>("human_retreat_stall_grace_s", 1.5));
     human_retreat_stall_progress_m_ = std::max(
       0.0, declare_parameter<double>("human_retreat_stall_progress_m", 0.01));
     front_violation_observe_m_ = std::max(
@@ -5110,6 +5113,9 @@ private:
       human_retreat_cmd_since_ = now;
       human_retreat_last_pose_ = pose;
       human_retreat_have_pose_ = have_pose;
+      // 2026-10-06: 记下本段后退的起点，用于起步宽限期。
+      human_retreat_grace_until_ = now +
+        rclcpp::Duration::from_seconds(human_retreat_stall_grace_s_);
       return false;
     }
     if (!have_pose || !human_retreat_have_pose_) {
@@ -5123,11 +5129,24 @@ private:
       human_retreat_cmd_since_ = now;
       return false;
     }
+    // 2026-10-06: 起步宽限期。从静止开始后退时，底盘响应与反向加速本身就要
+    // 数百毫秒；原来的 0.5s 判定会在负速度真正生效前就判“堵转”并转为停止，
+    // 导致后退永远起不来（实测状态在 reverse_follow/blocked_stop 间抖动）。
+    // 宽限期内不做堵转判定，并把参考点持续推进，宽限结束后恢复原保护。
+    if (human_retreat_stall_grace_s_ > 0.0 &&
+      now.seconds() < human_retreat_grace_until_.seconds())
+    {
+      human_retreat_last_pose_ = pose;
+      human_retreat_cmd_since_ = now;
+      return false;
+    }
     if (human_retreat_stall_s_ > 0.0 &&
       (now - human_retreat_cmd_since_).seconds() >= human_retreat_stall_s_)
     {
       avoid_diag_human_retreat_blocked_ += 1;
       human_retreat_cmd_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      // 下一段后退重新获得起步宽限。
+      human_retreat_grace_until_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       return true;
     }
     return false;
@@ -5496,10 +5515,12 @@ private:
   // N1: human-approach retreat (reuses the existing open-space reverse-follow controller).
   bool human_retreat_priority_enabled_{true};
   double human_retreat_stall_s_{0.5};
+  double human_retreat_stall_grace_s_{1.5};
   double human_retreat_stall_progress_m_{0.01};
   int avoid_diag_human_retreats_{0};
   int avoid_diag_human_retreat_blocked_{0};
   rclcpp::Time human_retreat_cmd_since_;
+  rclcpp::Time human_retreat_grace_until_;
   geometry_msgs::msg::PoseStamped human_retreat_last_pose_;
   bool human_retreat_have_pose_{false};
   // ---- P1' state ----

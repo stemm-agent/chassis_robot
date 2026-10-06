@@ -83,14 +83,75 @@ def _find_stale_navigation_processes():
             f'Cannot inspect /proc to confirm Nav2 cleanup: {exc}') from exc
 
     current_pid = os.getpid()
+    # 2026-10-06: exclude ourselves AND our ancestors.  `ros2 launch x.launch.py`
+    # runs as two processes (outer `ros2 launch` spawns an inner python that
+    # executes the launch file); judging inside the inner process used to see the
+    # outer one as a concurrent wheeltec_nav2 launch and refuse to start forever.
+    self_exclude = _guard_ancestor_pids(current_pid)
+    self_pgid = _guard_process_group(current_pid)
     stale = []
     for proc_dir in proc_dirs:
-        if not proc_dir.name.isdigit() or int(proc_dir.name) == current_pid:
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid in self_exclude:
             continue
         role = _classify_navigation_process(_read_process_argv(proc_dir))
-        if role is not None:
-            stale.append((int(proc_dir.name), role))
+        if role is None:
+            continue
+        # Same process group as this launch's own tree: part of us, not a leftover.
+        if (self_exclude is not None and self_pgid is not None
+                and _guard_process_group(pid) == self_pgid):
+            continue
+        stale.append((pid, role))
     return sorted(stale)
+
+
+def _guard_ancestor_pids(pid):
+    """pid plus every ancestor along the PPID chain."""
+    if os.environ.get('STEMM_NAV2_GUARD_SELF_EXCLUDE', '1') == '0':
+        return {pid}
+    chain = {pid}
+    current = pid
+    for _ in range(64):
+        try:
+            with open(f'/proc/{current}/stat', 'r', encoding='utf-8') as handle:
+                raw = handle.read()
+        except OSError:
+            break
+        end = raw.rfind(')')
+        if end < 0:
+            break
+        fields = raw[end + 1:].split()
+        if len(fields) < 2:
+            break
+        try:
+            parent = int(fields[1])
+        except ValueError:
+            break
+        if parent <= 1 or parent in chain:
+            break
+        chain.add(parent)
+        current = parent
+    return chain
+
+
+def _guard_process_group(pid):
+    try:
+        with open(f'/proc/{pid}/stat', 'r', encoding='utf-8') as handle:
+            raw = handle.read()
+    except OSError:
+        return None
+    end = raw.rfind(')')
+    if end < 0:
+        return None
+    fields = raw[end + 1:].split()
+    if len(fields) < 3:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
 
 
 def _nav2_lock_path():
