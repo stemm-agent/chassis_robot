@@ -2,6 +2,7 @@ import errno
 import fcntl
 import os
 import stat
+import time
 import yaml
 from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
@@ -98,6 +99,115 @@ def _nav2_lock_path():
     return Path('/tmp') / f'wheeltec_nav2-{os.getuid()}.launch.lock'
 
 
+_NAV2_ZOMBIE_STATE_PATH = None
+
+
+def _nav2_zombie_state_path():
+    global _NAV2_ZOMBIE_STATE_PATH
+    if _NAV2_ZOMBIE_STATE_PATH is None:
+        _NAV2_ZOMBIE_STATE_PATH = Path('/tmp') / (
+            f'wheeltec_nav2-{os.getuid()}.zombie-watch')
+    return _NAV2_ZOMBIE_STATE_PATH
+
+
+def _read_zombie_watch():
+    try:
+        raw = _nav2_zombie_state_path().read_text(encoding='ascii').strip()
+        pid_text, at_text = raw.split(',', 1)
+        return int(pid_text), float(at_text)
+    except Exception:
+        return None, 0.0
+
+
+def _write_zombie_watch(pid):
+    try:
+        _nav2_zombie_state_path().write_text(
+            f'{pid},{time.time()}', encoding='ascii')
+    except OSError:
+        pass
+
+
+def _clear_zombie_watch():
+    try:
+        _nav2_zombie_state_path().unlink()
+    except OSError:
+        pass
+
+
+def _wrapper_has_live_container(pid):
+    """True if the launch wrapper has at least one live component_container child."""
+    try:
+        with open(f'/proc/{pid}/task/{pid}/children', 'r', encoding='ascii') as handle:
+            children = handle.read().split()
+    except OSError:
+        return False
+    for child in children:
+        argv = _read_process_argv(Path('/proc') / child)
+        if argv and os.path.basename(argv[0]).startswith('component_container'):
+            return True
+    return False
+
+
+def _reclaim_zombie_launch_wrapper(lock_path):
+    """2026-10-06: reclaim a launch wrapper that holds the singleton but owns no
+    live navigation container.
+
+    Real incident: containers were killed while `ros2 launch wheeltec_nav2 ...`
+    survived.  The wrapper kept the flock and the bridge kept reusing its (empty)
+    entry, so no fresh Nav2 could ever start until an operator killed the wrapper
+    and removed the lock by hand.  Two consecutive container-free observations
+    are required, so a launch that is merely still bringing its containers up is
+    never touched.  Set STEMM_NAV2_ZOMBIE_RECLAIM=0 to disable.
+    """
+    if os.environ.get('STEMM_NAV2_ZOMBIE_RECLAIM', '1') == '0':
+        return
+    try:
+        holder_text = lock_path.read_text(encoding='ascii').strip()
+        holder = int(holder_text)
+    except Exception:
+        return
+    if holder <= 0 or holder == os.getpid():
+        return
+    if not (str(lock_path).startswith('/tmp/') and lock_path.is_file()):
+        return
+    role = _classify_navigation_process(_read_process_argv(Path('/proc') / str(holder)))
+    if role is None:
+        # Not a navigation launch wrapper: leave it to the flock check.
+        return
+    if _wrapper_has_live_container(holder):
+        _clear_zombie_watch()
+        return
+    watch_pid, watch_at = _read_zombie_watch()
+    now = time.time()
+    if watch_pid != holder or (now - watch_at) < 5.0:
+        # First container-free sighting: record it and retry shortly.  A launch
+        # that is still starting its containers will have them by the next pass.
+        _write_zombie_watch(holder)
+        raise RuntimeError(
+            'Nav2 launch wrapper PID %d holds the singleton but owns no live '
+            'component_container; treating it as a zombie and retrying in %.0fs'
+            % (holder, 5.0))
+    try:
+        os.kill(holder, 9)
+    except OSError as exc:
+        raise RuntimeError(
+            f'Cannot reap zombie Nav2 launch wrapper PID {holder}: {exc}') from exc
+    deadline = now + 5.0
+    while time.time() < deadline:
+        if not Path(f'/proc/{holder}').exists():
+            break
+        time.sleep(0.1)
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+    _clear_zombie_watch()
+    print(
+        f'[nav2-guard] Reclaimed zombie Nav2 launch wrapper PID {holder} '
+        f'(held the singleton with no live container); starting fresh.',
+        flush=True)
+
+
 def _claim_nav2_launch_singleton():
     """Claim the launch singleton and fail closed if cleanup is incomplete."""
     global _NAV2_SINGLETON_FD, _NAV2_SINGLETON_PATH
@@ -121,6 +231,10 @@ def _claim_nav2_launch_singleton():
             raise RuntimeError(
                 f'Unsafe Nav2 singleton lock ownership/type: {lock_path}')
 
+        # 2026-10-06: a wrapper that outlived its containers must not keep the
+        # singleton (and the bridge's reuse path) forever.
+        _reclaim_zombie_launch_wrapper(lock_path)
+
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             locked = True
@@ -136,6 +250,7 @@ def _claim_nav2_launch_singleton():
 
         os.ftruncate(fd, 0)
         os.write(fd, f'{os.getpid()}\n'.encode('ascii'))
+        _clear_zombie_watch()
 
         stale = _find_stale_navigation_processes()
         if stale:
