@@ -3290,6 +3290,92 @@ def navigation_process_entry_active(entry: dict) -> bool:
     return not stopped or bool(inspection_error)
 
 
+NAVIGATION_ZOMBIE_LOCK_PATH = '/tmp/wheeltec_nav2-%d.launch.lock'
+
+
+def _nav2_container_children(pid: int) -> list:
+    """PIDs of live component_container processes owned by this launch wrapper."""
+    found = []
+    try:
+        with open('/proc/%d/task/%d/children' % (pid, pid), 'r', encoding='ascii') as handle:
+            direct = handle.read().split()
+    except OSError:
+        direct = []
+    for child in direct:
+        try:
+            with open('/proc/%s/cmdline' % child, 'rb') as handle:
+                argv0 = handle.read().split(b'\0', 1)[0].decode('utf-8', 'replace')
+        except OSError:
+            continue
+        if os.path.basename(argv0).startswith('component_container'):
+            found.append(int(child))
+    return found
+
+
+def live_wrapper_container(pid: int) -> bool:
+    """True when the navigation launch wrapper still owns a live container."""
+    return bool(_nav2_container_children(pid))
+
+
+def clean_orphaned_navigation_lock(pid: int) -> str:
+    """Remove the singleton lock only when it still names a dead wrapper pid.
+
+    Real shape (2026-10-06): the launch wrapper exited but
+    /tmp/wheeltec_nav2-<uid>.launch.lock still contained its pid, so a later
+    start had to be rescued by hand.  Deleting a lock that names a *live*
+    process would be unsafe, hence the liveness re-check here.
+    """
+    if _process_is_alive(pid):
+        return 'wrapper still alive; lock kept'
+    lock_path = NAVIGATION_ZOMBIE_LOCK_PATH % os.getuid()
+    try:
+        with open(lock_path, 'r', encoding='ascii') as handle:
+            holder = int(handle.read(64).strip())
+    except Exception as exc:
+        return 'no usable singleton lock (%s)' % exc
+    if holder != pid:
+        return 'singleton holder is %s, not %s' % (holder, pid)
+    try:
+        os.unlink(lock_path)
+    except OSError as exc:
+        return 'unlink failed: %s' % exc
+    return 'removed orphaned lock naming dead pid %s' % pid
+
+
+def reap_containerless_navigation_wrapper(pid: int) -> str:
+    """Reclaim a wrapper that outlived its containers, then free the singleton.
+
+    Only the process that actually owns the wheeltec_nav2 singleton lock is
+    signalled, so an unrelated launcher can never be killed from here.
+    """
+    if os.environ.get('STEMM_NAV2_ZOMBIE_RECLAIM', '1') == '0':
+        return 'reclaim disabled by STEMM_NAV2_ZOMBIE_RECLAIM'
+    if not _process_is_alive(pid):
+        return 'wrapper already gone'
+    lock_path = NAVIGATION_ZOMBIE_LOCK_PATH % os.getuid()
+    try:
+        with open(lock_path, 'r', encoding='ascii') as handle:
+            holder = int(handle.read(64).strip())
+    except Exception as exc:
+        return 'no usable singleton lock (%s)' % exc
+    if holder != pid:
+        return 'singleton holder is %s, not %s' % (holder, pid)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as exc:
+        return 'kill failed: %s' % exc
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not _process_is_alive(pid):
+            break
+        time.sleep(0.1)
+    try:
+        os.unlink(lock_path)
+    except OSError:
+        pass
+    return 'reclaimed wrapper pid %s' % pid
+
+
 def stop_navigation_process_entry(
     entry: dict,
     *,
@@ -3552,11 +3638,44 @@ def start_launch(client: mqtt.Client, payload: dict) -> None:
     reused_navigation_starting_ack_published = False
     with state_lock:
         existing_entry = launch_processes.get(target_key)
-        existing_entry_active = bool(existing_entry) and (
-            navigation_process_entry_active(existing_entry)
-            if is_navigation_launch
-            else existing_entry['process'].poll() is None
-        )
+        if is_navigation_launch:
+            # 2026-10-06: the launch root alone is not proof of life.  A wrapper
+            # that outlived its containers used to look "active" here, so every
+            # start_launch was answered with reused=True and no fresh Nav2 could
+            # ever come up.  Treat container-less wrappers as dead and reclaim.
+            existing_entry_active = bool(existing_entry) and (
+                navigation_process_entry_active(existing_entry)
+                and live_wrapper_container(existing_entry['process'].pid)
+            )
+            wrapper_exited = (
+                bool(existing_entry) and existing_entry['process'].poll() is not None
+            )
+            if bool(existing_entry) and not existing_entry_active and (
+                    existing_entry['process'].poll() is None or wrapper_exited):
+                # 2026-10-06: two shapes of the same fault.
+                #   (a) wrapper still alive, owns no container -> reap it.
+                #   (b) wrapper already exited but the singleton lock still names
+                #       it -> drop the orphaned lock.
+                if wrapper_exited:
+                    reap_message = clean_orphaned_navigation_lock(
+                        existing_entry['process'].pid)
+                else:
+                    reap_message = reap_containerless_navigation_wrapper(
+                        existing_entry['process'].pid)
+                print(
+                    '[bridge] Navigation launch wrapper pid %s owns no live '
+                    'container (%s); starting a fresh Nav2 launch instead of '
+                    'reusing it.' % (existing_entry['process'].pid, reap_message),
+                    flush=True)
+                try:
+                    launch_processes.pop(target_key, None)
+                except Exception:
+                    pass
+                existing_entry = None
+        else:
+            existing_entry_active = bool(existing_entry) and (
+                existing_entry['process'].poll() is None
+            )
         if existing_entry_active:
             if is_navigation_launch:
                 navigation_terminal_failure = (
