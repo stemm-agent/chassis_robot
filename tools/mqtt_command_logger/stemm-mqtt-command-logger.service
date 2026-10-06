@@ -1,0 +1,10 @@
+[Unit]
+Description=STEMM MQTT command logger (read-only audit of who sends launch commands)
+After=mosquitto.service
+Wants=mosquitto.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/stemm-mqtt-command-logger
+Restart=always
+RestartSec=3
