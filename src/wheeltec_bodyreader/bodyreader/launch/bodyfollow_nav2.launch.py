@@ -362,7 +362,7 @@ def generate_launch_description():
 
                 {'follow_distance_m': 1.5},
                 {'hold_distance_band_m': 0.30},   # 2026-10-06: 0.12 -> 0.30 压掉逐帧状态抖动
-                {'human_retreat_trigger_extra_m': 0.68},   # 2026-10-06: 0.50 -> 0.68 补偿 hold band，后退阈值仍为 1.88m,
+                {'human_retreat_trigger_extra_m': 0.68},   # 2026-10-06: 0.50 -> 0.68 补偿 hold band，后退阈值仍为 1.88m
                 {'min_goal_distance_m': 0.15},
                 {'goal_update_period_s': 0.8},
                 {'goal_position_tolerance_m': 0.25},
@@ -444,9 +444,9 @@ def generate_launch_description():
                 {'visual_x_p': 0.5},
                 {'visual_x_d': 0.33},
                 {'visual_z_p': 2.2},
-                {'visual_z_d': 0.60},   # 2026-10-06: 0.30 -> 0.60 阻尼翻倍，治过冲（越过人体中心）,
-                {'visual_filter_alpha': 0.75},   # 2026-10-06: 0.62 -> 0.75 滤波时间常数 107ms -> 67ms,
-                {'visual_angle_deadband': 0.008},   # 2026-10-06: 0.015 -> 0.008（1.55m 处 23mm -> 12mm 才响应）,
+                {'visual_z_d': 0.60},   # 2026-10-06: 0.30 -> 0.60 阻尼翻倍，治过冲（越过人体中心）
+                {'visual_filter_alpha': 0.75},   # 2026-10-06: 0.62 -> 0.75 滤波时间常数 107ms -> 67ms
+                {'visual_angle_deadband': 0.008},   # 2026-10-06: 0.015 -> 0.008（1.55m 处 23mm -> 12mm 才响应）
                 {'visual_distance_deadband_mm': 80.0},
                 # 2026-09-28: forward follow ceiling raised by request; reverse stays at
                 # its previous value (forward*1.00 == 0.75) so the reverse/retreat path
