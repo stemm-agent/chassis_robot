@@ -282,6 +282,8 @@ def generate_launch_description():
                 'min_box_area_ratio': 0.0015,   # 2026-10-06: 最小框面积改为画面比例（≈460px@640x480）
                 'lock_min_hits': 3,   # 2026-10-06: 4 -> 3（实测每轮只积累 2-3 次命中）
                 'track_max_missed': 30,   # 2026-10-06: 12 -> 30（轨迹保留约 3s）
+                'track_iou_threshold': 0.10,   # 2026-10-06: 0.20 -> 0.10（移动时也能续轨）
+                'track_center_threshold': 0.20,   # 2026-10-06: 0.12 -> 0.20（容忍更大位移）
                 'auto_lock_center': True,
                 'detections_topic': '/torso_trt_demo/detections',
                 'features_topic': '/torso_trt_demo/features',
@@ -363,6 +365,7 @@ def generate_launch_description():
                 {'follow_distance_m': 1.5},
                 {'hold_distance_band_m': 0.30},   # 2026-10-06: 0.12 -> 0.30 压掉逐帧状态抖动
                 {'human_retreat_trigger_extra_m': 0.68},   # 2026-10-06: 0.50 -> 0.68 补偿 hold band，后退阈值仍为 1.88m
+                {'human_retreat_exit_hysteresis_m': 0.50},   # 2026-10-06: 0.20 -> 0.50（退到 2.38m 才停）
                 {'min_goal_distance_m': 0.15},
                 {'goal_update_period_s': 0.8},
                 {'goal_position_tolerance_m': 0.25},
