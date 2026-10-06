@@ -4068,21 +4068,33 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
 
         candidates.sort()
 
+        reject = {'bounds': 0, 'unknown_or_cost': 0, 'recent_failed': 0,
+                  'clearance': 0, 'path_blocked': 0, 'ok': 0}
+
         def acceptable(mx, my, x, y):
-            """Same safety standard as before: known-free, clearance, path ratio."""
+            """Same safety standard as before: known-free, clearance, path ratio.
+
+            2026-10-06: 仅增加否决原因计数（reject），判定结果与原先完全一致。
+            """
             if mx < 0 or my < 0 or mx >= info.width or my >= info.height:
+                reject['bounds'] += 1
                 return False
             value = self.last_map.data[my * info.width + mx]
             if value < 0 or value >= 30:
+                reject['unknown_or_cost'] += 1
                 return False
             if self.goal_recently_failed(x, y):
+                reject['recent_failed'] += 1
                 return False
             if not self._fallback_cell_has_clearance(mx, my):
+                reject['clearance'] += 1
                 return False
             if (current_x is not None
                     and self.path_blocked_ratio(
                         current_x, current_y, x, y) >= 0.10):
+                reject['path_blocked'] += 1
                 return False
+            reject['ok'] += 1
             return True
 
         # 2026-10-06 (改动 1): 优先沿“前沿样本 -> 小车”连线向已知侧退让，
@@ -4121,6 +4133,20 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                     break
 
         if selected is None:
+            # 2026-10-06 诊断：把各判据的否决计数带出来，便于定位瓶颈。
+            self.get_logger().warn(
+                'projection_reject_stats: total=%d unknown_or_cost=%d '
+                'clearance=%d path_blocked=%d recent_failed=%d bounds=%d '
+                'candidates=%d radius=%.2f goal_clearance=%.2f '
+                'robot_known=%s'
+                % (reject['unknown_or_cost'] + reject['clearance']
+                   + reject['path_blocked'] + reject['recent_failed']
+                   + reject['bounds'],
+                   reject['unknown_or_cost'], reject['clearance'],
+                   reject['path_blocked'], reject['recent_failed'],
+                   reject['bounds'], len(candidates),
+                   self.rrt_projection_radius_m, self.goal_clearance,
+                   'yes' if current_x is not None else 'no'))
             return (
                 None,
                 False,
