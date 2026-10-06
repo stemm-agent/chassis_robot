@@ -273,9 +273,9 @@ def generate_launch_description():
                 'mode_topic': '/mode',
                 'required_mode': 2,
                 'initial_mode': 1,
-                'max_inference_hz': 15.0,   # 2026-10-06: 10 -> 15（提高检测密度，稳住轨迹）
-                'onnx_intra_op_threads': 6,   # 2026-10-06: 4 -> 6（CPU 有余量）
-                'confidence_threshold': 0.40,   # 2026-10-06: 0.50 -> 0.40（实测更连续）
+                'max_inference_hz': 10.0,   # 回滚到 14:30
+                'onnx_intra_op_threads': 4,   # 回退到 14:30   # 2026-10-06: 4 -> 6（CPU 有余量）
+                'confidence_threshold': 0.50,   # 回滚到 14:30
                 'nms_iou_threshold': 0.45,
                 'max_detections': 12,
                 'min_box_area_px': 600.0,
@@ -285,8 +285,8 @@ def generate_launch_description():
                 'depth_mode_lower_pct': 20.0,   # 2026-10-06 (B): 近邻主簇种子分位
                 'depth_mode_tolerance_m': 0.50,
                 'depth_mode_min_pixels': 20,
-                'lock_min_hits': 3,   # 2026-10-06: 4 -> 3（实测每轮只积累 2-3 次命中）
-                'track_max_missed': 30,   # 2026-10-06: 12 -> 30（轨迹保留约 3s）
+                'lock_min_hits': 4,   # 回滚到 14:30
+                'track_max_missed': 12,   # 回退到 14:30   # 2026-10-06: 12 -> 30（轨迹保留约 3s）
                 'track_iou_threshold': 0.10,   # 2026-10-06: 0.20 -> 0.10（移动时也能续轨）
                 'track_center_threshold': 0.20,   # 2026-10-06: 0.12 -> 0.20（容忍更大位移）
                 'auto_lock_center': True,
@@ -368,9 +368,9 @@ def generate_launch_description():
                 {'camera_yaw_offset_rad': 0.0},
 
                 {'follow_distance_m': 1.5},
-                {'hold_distance_band_m': 0.30},   # 2026-10-06: 0.12 -> 0.30 压掉逐帧状态抖动
-                {'human_retreat_trigger_extra_m': 0.68},   # 2026-10-06: 0.50 -> 0.68 补偿 hold band，后退阈值仍为 1.88m
-                {'human_retreat_exit_hysteresis_m': 0.50},   # 2026-10-06: 0.20 -> 0.50（退到 2.38m 才停）
+                {'hold_distance_band_m': 0.12},   # 回滚到 14:30 较稳定版本
+                {'human_retreat_trigger_extra_m': 0.50},   # 回滚到 14:30（后退阈值 1.88m）
+                {'human_retreat_exit_hysteresis_m': 0.20},   # 回滚到 14:30
                 {'min_goal_distance_m': 0.15},
                 {'goal_update_period_s': 0.8},
                 {'goal_position_tolerance_m': 0.25},
@@ -398,18 +398,19 @@ def generate_launch_description():
                 {'side_obstacle_nav_distance_m': 0.40},
                 {'side_obstacle_release_distance_m': 0.45},
                 {'visual_min_linear_scale': 0.45},
-                {'target_exemption_angle_rad': 0.20},   # 2026-10-06: 0.35 -> 0.20 收窄豁免扇区（防真实障碍被误豁免）
-                {'target_exemption_distance_margin_m': 0.30},
-                {'target_exemption_outer_margin_m': 0.25},   # 2026-10-06: 外侧（比人远）放宽
-                {'target_exemption_inner_margin_m': 0.10},   # 2026-10-06: 内侧（比人近）=真实障碍，收紧
+                {'target_exemption_angle_rad': 0.35},   # 回滚到 14:30 较稳定版本
+                {'target_exemption_distance_margin_m': 0.30},   # 回滚到 14:30 较稳定版本
+                {'target_exemption_outer_margin_m': 0.30},   # 回滚到 14:30（外侧）
+                {'target_exemption_outer_margin_ceiling': 0.30},   # 硬顶与之一致
+                {'target_exemption_inner_margin_m': 0.12},   # 内侧收紧（比外侧严，护住人与车之间的真实障碍）
                 {'human_retreat_stall_settle_s': 2.0},   # 2026-10-06: 堵转改累计判据（治后退不灵敏）
                 # 2026-10-06: 目标豁免标定与门控（相机位姿变化后可在现场改这里或用 param set）
                 {'body_nav2_depth_camera_behind_lidar_m': 0.13},
                 {'body_nav2_person_map_depth_scale': 1.03},
                 {'body_nav2_target_half_width_m': 0.22},
-                {'obstacle_slow_distance_m': 0.55},
+                {'obstacle_slow_distance_m': 0.55},   # 回滚到 14:30 较稳定版本
                 # 2026-10-06: 盲区下限 0.60 -> 0.45（A 步验证：人在 0.6m 内也能触发受控后退）
-                {'human_retreat_min_valid_m': 0.45},
+                {'human_retreat_min_valid_m': 0.45},   # 与 14:30 一致,
                 {'enable_avoidance_side_goal': True},
                 {'avoidance_lateral_offset_m': 0.72},
                 {'avoidance_forward_margin_m': 0.55},
@@ -455,9 +456,9 @@ def generate_launch_description():
                 {'visual_x_p': 0.5},
                 {'visual_x_d': 0.33},
                 {'visual_z_p': 2.2},
-                {'visual_z_d': 0.60},   # 2026-10-06: 0.30 -> 0.60 阻尼翻倍，治过冲（越过人体中心）
-                {'visual_filter_alpha': 0.75},   # 2026-10-06: 0.62 -> 0.75 滤波时间常数 107ms -> 67ms
-                {'visual_angle_deadband': 0.008},   # 2026-10-06: 0.015 -> 0.008（1.55m 处 23mm -> 12mm 才响应）
+                {'visual_z_d': 0.30},   # 回滚到 14:30 较稳定版本   # 2026-10-06: 0.30 -> 0.60 阻尼翻倍，治过冲（越过人体中心）
+                {'visual_filter_alpha': 0.62},   # 回滚到 14:30   # 2026-10-06: 0.62 -> 0.75 滤波时间常数 107ms -> 67ms
+                {'visual_angle_deadband': 0.015},   # 回滚到 14:30   # 2026-10-06: 0.015 -> 0.008（1.55m 处 23mm -> 12mm 才响应）
                 {'visual_distance_deadband_mm': 80.0},
                 # 2026-09-28: forward follow ceiling raised by request; reverse stays at
                 # its previous value (forward*1.00 == 0.75) so the reverse/retreat path

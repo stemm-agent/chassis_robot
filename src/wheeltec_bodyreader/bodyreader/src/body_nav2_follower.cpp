@@ -257,6 +257,10 @@ public:
       declare_parameter<double>("target_exemption_outer_margin_m", 0.25);
     target_exemption_inner_margin_m_ =
       declare_parameter<double>("target_exemption_inner_margin_m", 0.10);
+    // 2026-10-06: 与 9/28 稳定版对齐——稳定版对豁免窗口硬钳 0.12。这里保留可调，
+    // 但默认硬顶同样是 0.12，且裁剪时会告警，避免再次被放大到"把真实障碍豁免掉"。
+    target_exemption_outer_margin_ceiling_ = std::max(
+      0.0, declare_parameter<double>("target_exemption_outer_margin_ceiling", 0.12));
     // 2026-10-06: 相机->激光平面换算标定（原为 #define，相机位姿变化后需可调）
     body_nav2_depth_camera_behind_lidar_m_ = declare_parameter<double>(
         "body_nav2_depth_camera_behind_lidar_m", 0.13);
@@ -1561,9 +1565,23 @@ private:
         // 现在按参数值生效，仅保留 0.35 的防误触发上限。
         // 2026-10-06: 不对称豁免窗口。外侧放宽以吸收"腿比躯干近"的几何差；
         // 内侧收紧，保证人或车之间的真实障碍物不会被误豁免（实测该问题导致直冲障碍物）。
+        const double outer_requested = std::max(
+          target_exemption_distance_margin_m_, target_exemption_outer_margin_m_);
         const double outer_margin = clamp_value(
-          std::max(target_exemption_distance_margin_m_,
-                   target_exemption_outer_margin_m_), 0.0, 0.35);
+          outer_requested, 0.0, target_exemption_outer_margin_ceiling_);
+        // 注意：scan_obstacles() 是 const 成员，不能用 RCLCPP_WARN_THROTTLE(*get_clock())。
+        // 用成员时间戳自行节流，保持函数 const 属性。
+        if (outer_requested > target_exemption_outer_margin_ceiling_ + 1e-6) {
+          const double now_s = rclcpp::Clock().now().seconds();
+          if (now_s - exemption_clamp_warn_time_ >= 2.0) {
+            exemption_clamp_warn_time_ = now_s;
+            RCLCPP_WARN(
+              get_logger(),
+              "Target exemption outer margin clamped: requested %.3fm -> %.3fm "
+              "(ceiling=%.3fm)",
+              outer_requested, outer_margin, target_exemption_outer_margin_ceiling_);
+          }
+        }
         const double inner_margin = clamp_value(
           target_exemption_inner_margin_m_, 0.0, outer_margin);
         const double distance_margin =
@@ -5567,6 +5585,8 @@ private:
   double target_exemption_distance_margin_m_;
   double target_exemption_outer_margin_m_{0.25};
   double target_exemption_inner_margin_m_{0.10};
+  double target_exemption_outer_margin_ceiling_{0.12};
+  mutable double exemption_clamp_warn_time_{0.0};
   // 2026-10-06: 由编译期宏改为可调参数（相机位姿变化后可在现场重新标定）
   double body_nav2_depth_camera_behind_lidar_m_;
   double body_nav2_person_map_depth_scale_;
