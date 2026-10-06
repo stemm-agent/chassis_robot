@@ -217,10 +217,15 @@ def generate_launch_description():
             # R1 (2026-09-29): bounded reverse before giving up on a boxed-in return-home
             'return_home_retreat_enabled': True,
             'return_home_retreat_speed_mps': 0.15,
-            'return_home_retreat_max_distance_m': 0.60,
-            'return_home_retreat_max_sec': 3.0,
+            # 2026-10-06: 0.60 -> 0.90。返航失败常见形态是起点被近处障碍夹住
+            # （planner: no valid path found），0.60m 有时不足以让出通道。
+            'return_home_retreat_max_distance_m': 0.90,
+            # 2026-10-06: 3.0 -> 5.0，配合 0.90m（限速仍为 0.15m/s）。
+            'return_home_retreat_max_sec': 5.0,
             'return_home_retreat_rear_margin_m': 0.25,
             'return_home_retreat_settle_sec': 0.4,
+            # 2026-10-06: 返航因 Nav2 失败而重试时，是否先做一次受控后退。
+            'return_home_failure_retreat_enabled': True,
             # R1b (2026-09-29): escape a blocked-clearance deadlock (front too close to
             # resume, and no backup/spin available) with one bounded reverse.
             'blocked_retreat_after_sec': 2.0,

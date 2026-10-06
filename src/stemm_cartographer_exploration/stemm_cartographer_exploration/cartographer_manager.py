@@ -134,6 +134,10 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.declare_parameter('blocked_retreat_after_sec', 2.0)   # R1e: 2 s of no progress is enough
         self.declare_parameter('blocked_retreat_min_interval_sec', 8.0)   # R1e
         self.declare_parameter('blocked_retreat_max_per_session', 12)
+        # 2026-10-06: 返航因 Nav2 规划/控制失败而重试时，是否先做一次受控后退。
+        # 原 R1 后退只在“起点太靠近占用格”时触发；实测返航失败常见形态是
+        # planner 报 no valid path found（起点被近处障碍夹住），此时也需要后退让出通道。
+        self.declare_parameter('return_home_failure_retreat_enabled', True)
         # A/B (2026-09-29)
         self.declare_parameter('frontier_pullback_m', 1.0)
         self.declare_parameter('approach_probe_m', 1.2)   # R1e
@@ -1085,8 +1089,38 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         return False, self.last_error
 
     def _schedule_return_home_retry(self, reason):
+        """2026-10-06: 返航失败重试前先清代价地图并做一次受控后退。
+
+        原实现只是把失败转给父类的重试链；本轮实测表明：当起点被近处障碍夹住时，
+        父类重试仍会在同一位置规划失败（planner -> no valid path found），
+        于是 3 次预算耗尽、返航失败。这里复用既有 R1 有界后退（自带后方净空校验、
+        限速 0.15m/s、距离与时长双上限），每次重试最多一次，让下一次规划有通道。
+        """
+        if bool(self.get_parameter('return_home_failure_retreat_enabled').value):
+            self._safe_call(
+                'return-home failure retreat',
+                self._retreat_before_return_home_retry,
+                None,
+            )
         self._reset_return_home_xy_completion()
         return super()._schedule_return_home_retry(reason)
+
+    def _retreat_before_return_home_retry(self):
+        """清一次 global costmap，然后做一次有界后退，给下一次返航让出通道。"""
+        self._request_costmap_clears()
+        # 给代价地图重建留出时间，避免在膨胀层尚未就绪时立刻重规划。
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+        # 每次返航尝试允许一次后退（R1 的 per-attempt 闩锁按尝试复位）。
+        self._retreat_used_for_attempt = False
+        status, moved = self._retreat_from_occupied_cells()
+        self.get_logger().warn(
+            'return-home retry pre-retreat: status=%s moved=%.2fm '
+            '(front=%.2fm)'
+            % (status, moved,
+               -1.0 if self.front_min_range is None else float(self.front_min_range)))
+        return status, moved
 
     def _publish_frozen_return_tf(self):
         """Keep Cartographer's final map->odom transform fresh for Nav2."""

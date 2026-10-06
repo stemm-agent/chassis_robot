@@ -56,3 +56,9 @@
 __pycache__/
 *.swp
 *~
+
+# 手工备份文件（保留在磁盘但不入库）
+*.bak-rhretreat-*
+*.bak-mapguard-*
+*.bak-diag-*
+*.bak-backoff-*
