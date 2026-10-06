@@ -251,12 +251,6 @@ public:
     target_exemption_angle_rad_ = declare_parameter<double>("target_exemption_angle_rad", 0.20);
     target_exemption_distance_margin_m_ =
       declare_parameter<double>("target_exemption_distance_margin_m", 0.12);
-    // 2026-10-06: 豁免窗口改"不对称"。外侧允许较大宽容度（激光看腿比相机看躯干更近），
-    // 内侧必须收紧——人与车之间的真实障碍物就在内侧，绝不能被当成人的腿豁免掉。
-    target_exemption_outer_margin_m_ =
-      declare_parameter<double>("target_exemption_outer_margin_m", 0.25);
-    target_exemption_inner_margin_m_ =
-      declare_parameter<double>("target_exemption_inner_margin_m", 0.10);
     // 2026-10-06: 相机->激光平面换算标定（原为 #define，相机位姿变化后需可调）
     body_nav2_depth_camera_behind_lidar_m_ = declare_parameter<double>(
         "body_nav2_depth_camera_behind_lidar_m", 0.13);
@@ -1559,15 +1553,8 @@ private:
         // 2026-10-06: 原上限被硬编码为 0.12。人的“腿（激光平面）”比“质心（相机高度）”
         // 通常近 0.1-0.3m，0.12 使近距离豁免必然失败、人被当障碍绕行。
         // 现在按参数值生效，仅保留 0.35 的防误触发上限。
-        // 2026-10-06: 不对称豁免窗口。外侧放宽以吸收"腿比躯干近"的几何差；
-        // 内侧收紧，保证人或车之间的真实障碍物不会被误豁免（实测该问题导致直冲障碍物）。
-        const double outer_margin = clamp_value(
-          std::max(target_exemption_distance_margin_m_,
-                   target_exemption_outer_margin_m_), 0.0, 0.35);
-        const double inner_margin = clamp_value(
-          target_exemption_inner_margin_m_, 0.0, outer_margin);
-        const double distance_margin =
-          (target_range_error >= 0.0) ? outer_margin : inner_margin;
+        const double distance_margin = clamp_value(
+          target_exemption_distance_margin_m_, 0.0, 0.12);
         const bool outside_safety_zone =
           static_cast<double>(range) > obstacle_slow_distance_m_;
         const bool is_target =
@@ -5565,8 +5552,6 @@ private:
   double visual_min_linear_scale_;
   double target_exemption_angle_rad_;
   double target_exemption_distance_margin_m_;
-  double target_exemption_outer_margin_m_{0.25};
-  double target_exemption_inner_margin_m_{0.10};
   // 2026-10-06: 由编译期宏改为可调参数（相机位姿变化后可在现场重新标定）
   double body_nav2_depth_camera_behind_lidar_m_;
   double body_nav2_person_map_depth_scale_;

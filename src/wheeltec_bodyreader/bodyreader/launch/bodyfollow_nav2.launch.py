@@ -400,8 +400,6 @@ def generate_launch_description():
                 {'visual_min_linear_scale': 0.45},
                 {'target_exemption_angle_rad': 0.35},   # 回滚到 14:30 较稳定版本
                 {'target_exemption_distance_margin_m': 0.30},   # 回滚到 14:30 较稳定版本
-                {'target_exemption_outer_margin_m': 0.30},   # 回滚到 14:30（外侧）
-                {'target_exemption_inner_margin_m': 0.12},   # 内侧收紧（比外侧严，护住人与车之间的真实障碍）
                 {'human_retreat_stall_settle_s': 2.0},   # 2026-10-06: 堵转改累计判据（治后退不灵敏）
                 # 2026-10-06: 目标豁免标定与门控（相机位姿变化后可在现场改这里或用 param set）
                 {'body_nav2_depth_camera_behind_lidar_m': 0.13},
