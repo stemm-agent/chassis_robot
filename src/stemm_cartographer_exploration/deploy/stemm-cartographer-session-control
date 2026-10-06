@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+UNIT=stemm-cartographer-session.service
+
+case "${1:-}" in
+  start)
+    if systemctl is-active --quiet "${UNIT}"; then
+      echo "Cartographer session is already active."
+      exit 0
+    fi
+    exec systemctl start "${UNIT}"
+    ;;
+  *)
+    echo "usage: $0 start" >&2
+    exit 64
+    ;;
+esac

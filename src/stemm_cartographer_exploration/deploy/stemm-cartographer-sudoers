@@ -1,0 +1,5 @@
+# Fixed-command privilege for the STEMM Cartographer session wrapper.
+# Install as /etc/sudoers.d/stemm-cartographer-service-guard, mode 0440.
+wheeltec ALL=(root) NOPASSWD: /usr/local/sbin/stemm-cartographer-service-guard stop
+wheeltec ALL=(root) NOPASSWD: /usr/local/sbin/stemm-cartographer-service-guard restart
+wheeltec ALL=(root) NOPASSWD: /usr/local/sbin/stemm-cartographer-session-control start

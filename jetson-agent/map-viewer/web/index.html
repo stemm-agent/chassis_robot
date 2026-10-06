@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>地图查看</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="page">
+    <section class="map-shell">
+      <div class="map-frame">
+        <p id="placeholder" class="placeholder">正在等待 Jetson 返回地图...</p>
+        <img id="mapImage" class="map-image" alt="最新地图" hidden>
+      </div>
+      <div class="map-footer">
+        <span id="updatedAt">更新时间：-</span>
+      </div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

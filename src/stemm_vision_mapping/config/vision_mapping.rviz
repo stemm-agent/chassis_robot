@@ -1,0 +1,234 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /地图 OccupancyGrid1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Alpha: 0.5
+      Cell Size: 1
+      Color: 160; 160; 164
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Plane: XY
+      Plane Cell Count: 100
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 0.6
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Update Interval: 0
+    - Class: rviz_default_plugins/Map
+      Name: 地图 OccupancyGrid (/map)
+      Enabled: true
+      Alpha: 0.45
+      Color Scheme: map
+      Draw Behind: true
+      Topic:
+        Value: /map
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Update Topic:
+        Value: /map_updates
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Use Timestamp: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 实时彩色点云（仅当前帧）
+      Enabled: true
+      Topic:
+        Value: /vision/live_cloud
+        Depth: 2
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.01
+      Color Transformer: RGB8
+      Position Transformer: XYZ
+      Queue Size: 2
+      Decay Time: 0.2
+    - Class: rviz_default_plugins/PointCloud2
+      Name: ★累积固化彩色地图 /vision/live_cloud（Decay 极大 = 不删）
+      Enabled: true
+      Topic:
+        Value: /vision/live_cloud
+        Depth: 2
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.012
+      Color Transformer: RGB8
+      Position Transformer: XYZ
+      Queue Size: 2
+      Decay Time: 100000
+    - Class: rviz_default_plugins/LaserScan
+      Name: 激光 /scan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Color: 255; 60; 60
+      Color Transformer: FlatColor
+      Size (m): 0.03
+      Style: Points
+      Decay Time: 0
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 3D 地图 /cloud_map
+      Enabled: true
+      Topic:
+        Value: /cloud_map
+        Depth: 3
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.02
+      Color Transformer: RGB8
+      Axis: Z
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 3
+        Min Value: -1
+        Value: false
+      Position Transformer: XYZ
+      Queue Size: 10
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 障碍点云 /cloud_obstacles
+      Enabled: true
+      Topic:
+        Value: /cloud_obstacles
+        Depth: 3
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Points
+      Size (Pixels): 3
+      Size (m): 0.03
+      Color Transformer: FlatColor
+      Color: 255; 170; 0
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 地面点云 /cloud_ground
+      Enabled: false
+      Topic:
+        Value: /cloud_ground
+        Depth: 3
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.02
+      Color Transformer: FlatColor
+      Color: 0; 200; 120
+    - Class: rviz_default_plugins/PointCloud2
+      Name: 雷达点云 /x10/lslidar_point_cloud
+      Enabled: false
+      Topic:
+        Value: /x10/lslidar_point_cloud
+        Depth: 3
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.02
+      Color Transformer: FlatColor
+      Color: 120; 170; 255
+    - Class: rviz_default_plugins/RobotModel
+      Name: 机器人模型
+      Enabled: true
+      Description Source: Topic
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Alpha: 0.6
+      Visual Enabled: true
+      Collision Enabled: false
+    - Class: rviz_default_plugins/Image
+      Name: 相机彩色图像 /camera/color/image_raw
+      Enabled: true
+      Topic:
+        Value: /camera/color/image_raw
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Max Value: 1
+      Min Value: 0
+      Normalize Range: true
+    - Class: rviz_default_plugins/Image
+      Name: 相机深度图像 /camera/depth/image_raw
+      Enabled: true
+      Topic:
+        Value: /camera/depth/image_raw
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Max Value: 6
+      Min Value: 0.4
+      Normalize Range: true
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: 3D 视角
+      Distance: 12
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 0.9
+      Yaw: 3.14
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1500
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false

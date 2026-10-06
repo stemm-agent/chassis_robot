@@ -1,0 +1,20 @@
+[Unit]
+Description=Standalone Jetson Map Viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/map-viewer
+ExecStart=/opt/map-viewer/start_map_viewer.sh
+Restart=always
+RestartSec=5
+Environment=MAP_VIEWER_HOST=0.0.0.0
+Environment=MAP_VIEWER_PORT=8091
+Environment=MAP_VIEWER_COMMAND_URL=http://127.0.0.1:3000/api/command
+Environment=MAP_VIEWER_MAP_FILE=/home/wheeltec/wheeltec_ros2/src/wheeltec_robot_nav2/map/stemm_map.pgm
+Environment=MAP_VIEWER_INTERVAL=5
+Environment=MAP_VIEWER_DEVICE_ID=robot-001
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+imu_processor:
+  ros__parameters:
+    input_topic: /imu/data_raw
+    output_topic: /imu/data_bias_compensated
+    compatibility_topic: /imu/data_filtered
+    odom_topic: /odom
+    linear_velocity_threshold: 0.03
+    angular_velocity_threshold: 0.03
+    gyro_z_static_threshold: 0.03
+    bias_alpha: 0.01
+    startup_bias_samples: 200
+    enable_runtime_bias_update: true
+    use_odom_for_static_detection: true

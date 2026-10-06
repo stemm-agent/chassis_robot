@@ -1,0 +1,41 @@
+<?xml version='1.0' encoding='utf-8'?>
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="3" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="0.05" name="RateControllerComputePathToPose">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <Fallback name="ComputePathIfNeeded">
+              <ReactiveSequence name="UseCurrentPathIfValid">
+                <Inverter>
+                  <GlobalUpdatedGoal />
+                </Inverter>
+                <IsPathValid path="{path}" />
+              </ReactiveSequence>
+              <Sequence name="ClearGlobalCostmapBeforePlanning">
+                <ClearEntireCostmap name="ClearGlobalCostmap-BeforePlanning" service_name="global_costmap/clear_entirely_global_costmap" />
+                <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" />
+              </Sequence>
+            </Fallback>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap" />
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath" />
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap" />
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated />
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap" />
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap" />
+          </Sequence>
+          <Wait wait_duration="0.5" />
+          <Wait wait_duration="0.5" />
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

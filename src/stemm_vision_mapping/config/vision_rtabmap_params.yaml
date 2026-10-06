@@ -1,0 +1,79 @@
+# STEMM 视觉融合建图参数（RTAB-Map / RGB-D + 2D 激光 + 轮式里程计）
+#
+# 设计要点（相对厂商 wheeltec_slam_rtab.launch.py 的差异）：
+#   1) frame_id 用 base_footprint（与全车 TF/里程计主干一致），不用 camera_link；
+#   2) 显式指定 map_frame_id=map、odom_frame_id=odom_combined，保证与 EKF 的 TF 链接得上；
+#   3) publish_tf=true：建图模式下 rtabmap 是 map→odom_combined 的唯一发布者（AMCL 未运行）；
+#   4) 不启动 rgbd_odometry：轮式里程计(/odom_combined)作为运动骨架，视觉仅做特征/回环纠正；
+#   5) approx_sync 容差按实测帧率放宽（彩色 8–26 Hz 浮动、深度 ~12 Hz）；
+#   6) database_path 由 launch 参数注入，默认落在 ~/.local/share/stemm/vision_maps/。
+
+rgbd_sync:
+  ros__parameters:
+    approx_sync: true
+    approx_sync_max_interval: 0.12
+    queue_size: 10
+    qos: 2                     # 2 = Best Effort（对 Reliable 发布者也兼容，避免静默收不到数据）
+    use_sim_time: false
+
+rtabmap:
+  ros__parameters:
+    # --- 坐标系 ---
+    frame_id: base_footprint
+    map_frame_id: map
+    odom_frame_id: odom_combined
+    publish_tf: true
+
+    # --- 输入 ---
+    subscribe_rgbd: true
+    subscribe_scan: true
+    subscribe_scan_cloud: false
+    use_action_for_goal: false
+    approx_sync: true
+    wait_for_transform: 3.0        # 实测 RGB-D 流水线延迟可达 ~2.8s（日志 delay=2.845s），低于此值会出现转换中止
+    qos: 2
+    use_sim_time: false
+
+    # --- 配准/闭环 ---
+    'Reg/Strategy': '1'                     # 1 = ICP
+    'Reg/Force3DoF': 'true'                 # 强制平面 3DoF（轮式底盘）
+    'RGBD/NeighborLinkRefining': 'false'
+    'RGBD/LinearUpdate': '0.10'      # 每 10 cm 一个关键帧；实测静止停放时数据库仍会增长，若需更省可放宽到 0.15
+    'RGBD/AngularUpdate': '0.10'
+    'RGBD/CreateOccupancyGrid': 'true'
+    'Icp/PointToPlaneMinComplexity': '0.04'
+
+    # --- 内存/地图 ---
+    'Mem/IncrementalMemory': 'true'         # SLAM 模式（定位模式留给下一轮）
+    'Mem/NotLinkedNodesKept': 'false'
+    'Rtabmap/DetectionRate': '1.0'
+    'Rtabmap/StartNewMapOnLoopClosure': 'false'
+
+    # --- 栅格（产 2D 占据图给 Nav2 用）---
+    # 栅格来源：0=仅激光  1=仅深度  2=两者
+    # 注意：订阅了 /scan 时 rtabmap 会**自动**把该项设为 0（其日志会写明），
+    #       也就是默认情况下 /map 只由激光生成（这是 rtabmap 的设计，不是故障）。
+    # 实测（静止 45s，同场景）：Sensor=0 → occupied 265 / free 6021；
+    #                            Sensor=2 → occupied  41 / free 1263（360° 空地填充被削弱，不利导航）
+    # 因此 2D 导航地图保留激光来源；视觉贡献走 3D 点云/回环/导航代价地图层。
+    # 需要深度进 2D 图时把下面这行改成 '1' 或 '2'，并务必实车跑一圈评估。
+    'Grid/Sensor': '0'
+    'Grid/3D': 'true'
+    'Grid/CellSize': '0.05'
+    'Grid/RangeMin': '0.25'                 # 滤掉打在车体自身的点
+    'Grid/RangeMax': '6.0'
+    'Grid/RayTracing': 'true'
+    'Grid/DepthDecimation': '2'        # 深度抽稀倍数（默认 4）：越小 → 深度点参与栅格越多
+    'Grid/NoiseFilteringRadius': '0.05'  # 深度噪点滤波（米），0=关闭
+    'Grid/NoiseFilteringMinNeighbors': '5'
+    'Grid/NormalsSegmentation': 'true'   # 用深度法线区分可通行地面与障碍
+    'Grid/MaxGroundHeight': '0.10'
+    'Grid/MaxObstacleHeight': '1.80'
+    'Grid/RangeMax': '6.0'
+
+    # --- 优化器 ---
+    'Optimizer/GravitySigma': '0'           # 已按 2D 处理，禁用 IMU 重力约束
+
+    # --- 视觉特征（算力闸门）---
+    'Kp/MaxFeatures': '400'
+    'Vis/MaxFeatures': '500'

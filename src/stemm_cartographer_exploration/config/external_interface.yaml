@@ -1,0 +1,19 @@
+package: stemm_cartographer_exploration
+session_launch: stemm_cartographer_session.launch.py
+inner_launch: stemm_cartographer_auto_mapping.launch.py
+map_basename: /home/hnh/.local/share/stemm/maps/stemm_cartographer_map
+services:
+  start_mapping: /stemm_cartographer/start_mapping
+  save_map: /stemm_cartographer/save_map
+  stop_navigation: /stemm_cartographer/stop_navigation
+  cancel_mapping: /stemm_cartographer/cancel_mapping
+  set_mapping_done: /stemm_cartographer/set_mapping_done
+  save_state: /stemm_cartographer/save_state
+mqtt:
+  command_topic: robot/robot-001/cartographer/launch/command
+  status_topic: robot/robot-001/cartographer/launch/status
+  heartbeat_topic: robot/robot-001/cartographer/heartbeat
+  error_topic: robot/robot-001/cartographer/error
+map_http:
+  host: 127.0.0.1
+  port: 8093

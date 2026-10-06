@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+NODE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON_BIN=${STEMM_PERCEPTION_PYTHON:-${HOME}/.venvs/stemm-perception/bin/python}
+if [ ! -x "$PYTHON_BIN" ]; then
+  echo "[ERROR] CPU perception Python is unavailable: $PYTHON_BIN" >&2
+  echo "[ERROR] Run /opt/demo-control/deploy/nuc/setup_perception_venv.sh first." >&2
+  exit 1
+fi
+exec "$PYTHON_BIN" "$NODE_DIR/torso_cpu_demo_node.py" "$@"

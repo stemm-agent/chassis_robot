@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>stemm_vision_mapping</name>
+  <version>0.1.0</version>
+  <description>
+    STEMM 视觉融合建图（RTAB-Map：RGB-D + 2D 激光 + 轮式里程计），命令行手动运行。
+    不启动任何传感器 bringup（雷达/相机由常驻 systemd 服务提供），
+    不改动生产 Cartographer / Nav2 / App 链路。
+  </description>
+  <maintainer email="hnh@stemm.local">hnh</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>rtabmap</exec_depend>
+  <exec_depend>rtabmap_slam</exec_depend>
+  <exec_depend>rtabmap_sync</exec_depend>
+  <exec_depend>rtabmap_msgs</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

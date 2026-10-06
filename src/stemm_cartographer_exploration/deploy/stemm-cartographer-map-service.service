@@ -1,0 +1,23 @@
+[Unit]
+Description=STEMM Cartographer Map HTTP Service
+After=network.target wheeltec-robot.service
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/opt/demo-control
+Environment=APP_ROOT=/opt/demo-control
+Environment=MAP_SERVICE_HOST=127.0.0.1
+Environment=MAP_SERVICE_PORT=8093
+Environment=ROBOT_DEVICE_ID=robot-001
+Environment=MAP_FILE_PATH=/home/wheeltec/wheeltec_ros2/src/wheeltec_robot_nav2/map/stemm_cartographer_map.pgm
+Environment=MAP_METADATA_PATH=/home/wheeltec/wheeltec_ros2/src/wheeltec_robot_nav2/map/stemm_cartographer_map.yaml
+Environment=MAP_SERVICE_PATH=/stemm_cartographer/save_map
+Environment=MAP_WAIT_TIMEOUT=30
+Environment=MAP_FILE_WAIT_TIMEOUT=5
+ExecStart=/opt/demo-control/deploy/jetson/start_map_service.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

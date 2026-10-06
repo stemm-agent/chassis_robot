@@ -1,0 +1,21 @@
+[Unit]
+Description=Robot Agent HTTP Service
+After=network.target
+
+[Service]
+Type=simple
+User=wheeltec
+WorkingDirectory=/opt/demo-control
+Environment=APP_ROOT=/opt/demo-control
+Environment=ROBOT_AGENT_PORT=8001
+Environment=ROBOT_DEVICE_ID=robot-001
+Environment=CMD_VEL_TOPIC=/cmd_vel
+Environment=MANUAL_LINEAR_SPEED=0.1
+Environment=MANUAL_ANGULAR_SPEED=0.5
+Environment=AUTO_STOP_TIMEOUT=5.0
+ExecStart=/opt/demo-control/deploy/jetson/start_robot_agent.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

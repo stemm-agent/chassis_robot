@@ -1,0 +1,286 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Local costmap1
+      Splitter Ratio: 0.5
+    Tree Height: 700
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Expanded:
+      - /2D Pose Estimate1
+      - /Publish Point1
+    Name: Tool Properties
+    Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Alpha: 0.4
+      Cell Size: 1
+      Color: 160; 160; 164
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Plane: XY
+      Plane Cell Count: 50
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/Map
+      Name: Fused map /map
+      Enabled: true
+      Alpha: 0.55
+      Color Scheme: map
+      Draw Behind: true
+      Topic:
+        Value: /map
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Update Topic:
+        Value: /map_updates
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Use Timestamp: false
+    - Class: rviz_default_plugins/Map
+      Name: Global costmap /global_costmap/costmap
+      Enabled: true
+      Alpha: 0.35
+      Color Scheme: costmap
+      Draw Behind: false
+      Topic:
+        Value: /global_costmap/costmap
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Update Topic:
+        Value: /global_costmap/costmap_updates
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Use Timestamp: false
+    - Class: rviz_default_plugins/Map
+      Name: Local costmap /local_costmap/costmap
+      Enabled: true
+      Alpha: 0.7
+      Color Scheme: costmap
+      Draw Behind: false
+      Topic:
+        Value: /local_costmap/costmap
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Update Topic:
+        Value: /local_costmap/costmap_updates
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Use Timestamp: false
+    - Class: rviz_default_plugins/Path
+      Name: Global plan /plan
+      Enabled: true
+      Alpha: 1
+      Buffer Length: 1
+      Color: 255; 0; 0
+      Head Diameter: 0.02
+      Head Length: 0.02
+      Length: 0.3
+      Line Style: Lines
+      Line Width: 0.03
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Radius: 0.03
+      Shaft Diameter: 0.005
+      Shaft Length: 0.02
+      Topic:
+        Value: /plan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+    - Class: rviz_default_plugins/Path
+      Name: Local plan /local_plan
+      Enabled: true
+      Alpha: 1
+      Buffer Length: 1
+      Color: 0; 170; 255
+      Head Diameter: 0.02
+      Head Length: 0.02
+      Length: 0.3
+      Line Style: Lines
+      Line Width: 0.03
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Pose Color: 255; 85; 255
+      Pose Style: None
+      Radius: 0.03
+      Shaft Diameter: 0.005
+      Shaft Length: 0.02
+      Topic:
+        Value: /local_plan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+    - Class: rviz_default_plugins/Polygon
+      Name: Local footprint /local_costmap/published_footprint
+      Enabled: true
+      Alpha: 1
+      Color: 255; 255; 0
+      Topic:
+        Value: /local_costmap/published_footprint
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+    - Class: rviz_default_plugins/Polygon
+      Name: Global footprint /global_costmap/published_footprint
+      Enabled: true
+      Alpha: 1
+      Color: 0; 255; 120
+      Topic:
+        Value: /global_costmap/published_footprint
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Vision cloud /vision/live_cloud (RGB)
+      Enabled: true
+      Topic:
+        Value: /vision/live_cloud
+        Depth: 2
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.01
+      Color Transformer: RGB8
+      Position Transformer: XYZ
+      Queue Size: 2
+      Decay Time: 0.2
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Vision low band 0.05-0.35m /vision/low_cloud
+      Enabled: true
+      Topic:
+        Value: /vision/low_cloud
+        Depth: 2
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Spheres
+      Size (Pixels): 3
+      Size (m): 0.03
+      Color Transformer: FlatColor
+      Color: 255; 255; 0
+      Position Transformer: XYZ
+      Queue Size: 2
+      Decay Time: 0
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Vision voxels 5cm /vision/voxel_cloud
+      Enabled: false
+      Topic:
+        Value: /vision/voxel_cloud
+        Depth: 2
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+        History Policy: Keep Last
+      Style: Boxes
+      Size (Pixels): 3
+      Size (m): 0.05
+      Color Transformer: FlatColor
+      Color: 255; 120; 0
+      Position Transformer: XYZ
+      Queue Size: 2
+      Decay Time: 0
+    - Class: rviz_default_plugins/Map
+      Name: Vision obstacle grid /vision/obstacle_grid
+      Enabled: true
+      Alpha: 0.85
+      Color Scheme: map
+      Draw Behind: false
+      Topic:
+        Value: /vision/obstacle_grid
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Update Topic:
+        Value: /vision/obstacle_grid_updates
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+      Use Timestamp: false
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Value: /initialpose
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+    - Class: rviz_default_plugins/PublishPoint
+      Single click: true
+      Topic:
+        Value: /clicked_point
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        History Policy: Keep Last
+    # Nav2 goal tool: uncomment after installing ros-humble-nav2-rviz-plugins
+    #- Class: nav2_rviz_plugins/GoalTool
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Orbit
+      Distance: 8
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 1
+      Yaw: 3.14
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1500
+  Displays:
+    collapsed: false
+  Views:
+    collapsed: false

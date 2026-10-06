@@ -1,0 +1,27 @@
+local_rrt:
+  ros__parameters:
+    map_topic: /stemm_cartographer/rrt_map
+    map_service: /stemm_cartographer/rrt_dynamic_map
+
+global_rrt:
+  ros__parameters:
+    map_topic: /stemm_cartographer/rrt_map
+    map_service: /stemm_cartographer/rrt_dynamic_map
+
+filter:
+  ros__parameters:
+    map_topic: /stemm_cartographer/rrt_map
+    costmap_clearing_threshold: 70
+    info_radius: 1.4
+    goals_topic: /detected_frontiers
+    global_costmap_topic: /global_costmap/costmap
+    global_costmap_service: /global_costmap/get_costmap
+
+assigner:
+  ros__parameters:
+    map_topic: /stemm_cartographer/rrt_map
+    info_radius: 1.4
+    info_multiplier: 7.0
+    hysteresis_radius: 3.2
+    hysteresis_gain: 1.2
+    frontiers_topic: /filtered_goal_points
