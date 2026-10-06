@@ -273,12 +273,13 @@ def generate_launch_description():
                 'mode_topic': '/mode',
                 'required_mode': 2,
                 'initial_mode': 1,
-                'max_inference_hz': 10.0,
-                'onnx_intra_op_threads': 4,
+                'max_inference_hz': 15.0,   # 2026-10-06: 10 -> 15（提高检测密度，稳住轨迹）
+                'onnx_intra_op_threads': 6,   # 2026-10-06: 4 -> 6（CPU 有余量）
                 'confidence_threshold': 0.50,
                 'nms_iou_threshold': 0.45,
                 'max_detections': 12,
                 'min_box_area_px': 600.0,
+                'min_box_area_ratio': 0.0015,   # 2026-10-06: 最小框面积改为画面比例（≈460px@640x480）
                 'lock_min_hits': 4,
                 'track_max_missed': 12,
                 'auto_lock_center': True,

@@ -146,13 +146,24 @@ class TorsoCpuDemoNode(Node):
 
         self.required_mode = int(self._param("required_mode", 2))
         self.current_mode = int(self._param("initial_mode", 0))
-        # The operational hard cap is 10 Hz even if a larger parameter is supplied.
+        # 2026-10-06: the operational cap is now a parameter.  Detection density is
+        # what keeps a track alive: at 10 Hz the tracker only accumulated 2-3 hits
+        # per attempt, so the lock fell back to the relaxed path almost every time
+        # ("识别不稳定").  Default raised to 15 Hz; override with
+        # max_inference_hz_limit, or set it back to 10 to restore the old cap.
         requested_hz = float(self._param("max_inference_hz", 10.0))
-        self.max_inference_hz = max(0.1, min(10.0, requested_hz))
+        hz_limit = max(1.0, float(self._param("max_inference_hz_limit", 15.0)))
+        self.max_inference_hz = max(0.1, min(hz_limit, requested_hz))
         self.confidence_threshold = float(self._param("confidence_threshold", 0.45))
         self.nms_iou_threshold = float(self._param("nms_iou_threshold", 0.45))
         self.max_detections = max(1, int(self._param("max_detections", 20)))
-        self.min_box_area_px = max(1.0, float(self._param("min_box_area_px", 600.0)))
+        # 2026-10-06: keep an absolute floor for compatibility, but prefer a ratio of
+        # the frame so a distant or partly occluded torso is not dropped outright
+        # (a dropped box breaks the track and resets its hit count).
+        self.min_box_area_px = max(0.0, float(self._param("min_box_area_px", 600.0)))
+        self.min_box_area_ratio = max(
+            0.0, float(self._param("min_box_area_ratio", 0.0015))
+        )
         self.track_iou_threshold = float(self._param("track_iou_threshold", 0.20))
         self.track_center_threshold = float(
             self._param("track_center_threshold", 0.12)
@@ -588,12 +599,18 @@ class TorsoCpuDemoNode(Node):
         boxes[:, 3] = (xywh[:, 1] + 0.5 * xywh[:, 3] - pad_y) / scale
         boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0.0, float(image_width - 1))
         boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0.0, float(image_height - 1))
+        area_threshold = self.min_box_area_px
+        if self.min_box_area_ratio > 0.0:
+            area_threshold = max(
+                area_threshold,
+                self.min_box_area_ratio * float(image_width) * float(image_height),
+            )
         valid = (
             (boxes[:, 2] > boxes[:, 0])
             & (boxes[:, 3] > boxes[:, 1])
             & (
                 (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-                >= self.min_box_area_px
+                >= area_threshold
             )
         )
         boxes = boxes[valid]
