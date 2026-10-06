@@ -79,6 +79,11 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             'exploration_pose_stall_goal_tolerance_m', 0.30)
         self.declare_parameter('rrt_fallback_wait_sec', 0.0)
         self.declare_parameter('rrt_projection_radius_m', 1.0)
+        # 2026-10-06: 沿“前沿->小车”方向退让时的步长（米）。
+        # 原实现只在以样本为心、半径 rrt_projection_radius_m 的圆内找已知空闲格，
+        # 前沿样本位于“已探索/未知”交界，圆内多为未知格或被净空盘否掉，
+        # 于是频繁报 no safe known-free projection 并退化为已知区域保守探索。
+        self.declare_parameter('rrt_projection_backoff_step_m', 0.10)
         self.declare_parameter('clear_costmaps_on_stall', True)
         self.declare_parameter(
             'exploration_behavior_tree',
@@ -191,6 +196,10 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.rrt_projection_radius_m = max(
             self.goal_clearance,
             float(self.get_parameter('rrt_projection_radius_m').value),
+        )
+        self.rrt_projection_backoff_step_m = max(
+            self.last_map_resolution_floor(),
+            float(self.get_parameter('rrt_projection_backoff_step_m').value),
         )
         self.clear_costmaps_on_stall = bool(
             self.get_parameter('clear_costmaps_on_stall').value)
@@ -3989,6 +3998,16 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 'stalled exploration goal cancel acknowledged, but controlled '
                 f'recovery did not start; state={self.navigation_state}')
 
+    def last_map_resolution_floor(self):
+        """当前地图分辨率（无地图时退化为 0.05m，仅用于步长下限）。"""
+        try:
+            resolution = float(self.last_map.info.resolution)
+        except Exception:
+            return 0.05
+        if resolution <= 0.0:
+            return 0.05
+        return resolution
+
     def _project_rrt_frontier_goal(self, goal_pose):
         """Project an RRT boundary sample onto a safe known-free map cell."""
         if self.last_map is None:
@@ -4048,18 +4067,58 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 ))
 
         candidates.sort()
-        selected = None
-        for _distance, _unknown_score, x, y, mx, my in candidates:
+
+        def acceptable(mx, my, x, y):
+            """Same safety standard as before: known-free, clearance, path ratio."""
+            if mx < 0 or my < 0 or mx >= info.width or my >= info.height:
+                return False
+            value = self.last_map.data[my * info.width + mx]
+            if value < 0 or value >= 30:
+                return False
             if self.goal_recently_failed(x, y):
-                continue
+                return False
             if not self._fallback_cell_has_clearance(mx, my):
-                continue
+                return False
             if (current_x is not None
                     and self.path_blocked_ratio(
                         current_x, current_y, x, y) >= 0.10):
-                continue
-            selected = (x, y)
-            break
+                return False
+            return True
+
+        # 2026-10-06 (改动 1): 优先沿“前沿样本 -> 小车”连线向已知侧退让，
+        # 取第一个满足安全标准的格。这样既能贴上可达前沿，又不会像把半径
+        # 放大到 2.0m 那样“投进已知空间深处”。
+        selected = None
+        backoff_max = self.rrt_projection_radius_m
+        backoff_min = min(self.rrt_projection_backoff_step_m * 4.0, backoff_max)
+        if current_x is not None:
+            direction_x = current_x - target_x
+            direction_y = current_y - target_y
+            norm = math.hypot(direction_x, direction_y)
+        else:
+            norm = 0.0
+        if current_x is not None and norm > resolution:
+            ux = direction_x / norm
+            uy = direction_y / norm
+            step = self.rrt_projection_backoff_step_m
+            outer = min(backoff_max, norm)
+            distance = min(backoff_min, outer)
+            while distance <= outer + step * 0.5:
+                px = target_x + ux * distance
+                py = target_y + uy * distance
+                mx = int((px - origin.x) / resolution)
+                my = int((py - origin.y) / resolution)
+                if acceptable(mx, my, px, py):
+                    selected = (px, py)
+                    break
+                distance += step
+
+        # 兜底：保留原有“圆内最近已知空闲格”搜索，不降低修复前的既有能力。
+        if selected is None:
+            for _distance, _unknown_score, x, y, mx, my in candidates:
+                if acceptable(mx, my, x, y):
+                    selected = (x, y)
+                    break
 
         if selected is None:
             return (
@@ -4070,9 +4129,10 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             )
         x, y = selected
         projected = math.hypot(x - target_x, y - target_y) > resolution * 0.51
-        if projected:
-            yaw = math.atan2(target_y - y, target_x - x)
-        elif current_x is not None:
+        # 2026-10-06 (改动 1): 目标朝向统一取“朝目标点方向”，避免旧口径
+        # （projected 时朝前沿、否则朝候选点）在相邻两次投影间给出相差 180°
+        # 的 yaw，导致控制器原地来回对转而表现为高频自转。
+        if current_x is not None:
             yaw = math.atan2(y - current_y, x - current_x)
         else:
             yaw = self.pose_yaw(goal_pose)
