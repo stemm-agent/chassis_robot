@@ -159,6 +159,10 @@ def generate_launch_description():
             parameters=[configured_params, {'autostart': autostart}],
             arguments=['--ros-args', '--log-level', log_level],
             remappings=remappings,
+            # 2026-10-06: 屏蔽 SIGINT/SIGTERM，避免停止时在容器析构阶段崩溃
+            # （librclcpp+0x433d0 虚调用打空）。只留 SIGKILL 可终止，
+            # 停止仍由 launch 包装/桥的 SIGKILL 阶梯完成。设 NAV_SIGNAL_GUARD=0 关闭。
+            additional_env={'LD_PRELOAD': '/usr/local/lib/nav_signal_guard/nav_signal_guard.so'},
             output='screen'),
 
         Node(
@@ -169,6 +173,10 @@ def generate_launch_description():
             parameters=[configured_params, {'autostart': navigation_autostart}],
             arguments=['--ros-args', '--log-level', log_level],
             remappings=remappings,
+            # 2026-10-06: 屏蔽 SIGINT/SIGTERM，避免停止时在容器析构阶段崩溃
+            # （librclcpp+0x433d0 虚调用打空）。只留 SIGKILL 可终止，
+            # 停止仍由 launch 包装/桥的 SIGKILL 阶梯完成。设 NAV_SIGNAL_GUARD=0 关闭。
+            additional_env={'LD_PRELOAD': '/usr/local/lib/nav_signal_guard/nav_signal_guard.so'},
             output='screen'),
 
         LogInfo(
