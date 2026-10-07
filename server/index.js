@@ -2800,7 +2800,13 @@ const server = http.createServer(async (req, res) => {
     // 让前端立刻收敛，绝不挂住。
     let recoverBody = {};
     try {
-      recoverBody = (await readBody(req, RECOVER_BODY_TIMEOUT_MS)) || {};
+      const rawRecoverBody = (await readBody(req, RECOVER_BODY_TIMEOUT_MS)) || '';
+      // 2026-10-07: readBody 返回的是【字符串】。之前直接把它当作 jsonBody 传入，
+      // 而 requestUrl 会对 jsonBody 再做一次 JSON.stringify，于是发给 agent 的
+      // 是一个"被引号包起来的字符串"而不是对象 → FastAPI 返回 422 →
+      // 加上原先没有超时，请求就永久挂住（现场 30s 无响应）。
+      recoverBody = rawRecoverBody ? JSON.parse(rawRecoverBody) : {};
+      if (!recoverBody || typeof recoverBody !== 'object') recoverBody = {};
     } catch (error) {
       recoverBody = {};
     }
