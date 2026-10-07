@@ -215,7 +215,11 @@ def generate_launch_description():
             'return_home_tf_stable_sec': 1.5,
             'return_home_max_retries': 3,
             # R1 (2026-09-29): bounded reverse before giving up on a boxed-in return-home
-            'return_home_retreat_enabled': True,
+            # 2026-10-07 现场决定：雷达因安装角度看不到后方，倒车等于盲倒，已在返航中撞障。
+            # 暂时彻底关停该倒车恢复（唯一的反向速度发布点在
+            # cartographer_manager._retreat_from_occupied_cells，其两道门都读本开关：
+            # 行 589 的 R1b 清障后退 与 行 961 的主倒车；返航失败重试路径亦经同一函数）。
+            'return_home_retreat_enabled': False,
             'return_home_retreat_speed_mps': 0.15,
             # 2026-10-06: 0.60 -> 0.90。返航失败常见形态是起点被近处障碍夹住
             # （planner: no valid path found），0.60m 有时不足以让出通道。
