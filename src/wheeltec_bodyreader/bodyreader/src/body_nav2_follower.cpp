@@ -339,6 +339,19 @@ public:
       0.0, declare_parameter<double>("human_retreat_stall_progress_m", 0.01));
     front_violation_observe_m_ = std::max(
       0.0, declare_parameter<double>("front_violation_observe_m", 0.35));
+    // 2026-10-06: obstacle avoidance must win over the visual direct controller even
+    // when the person sits inside the retreat zone (the retreat branch below used to run
+    // first and cancel/reset the avoidance episode on every tick, so the avoidance gate
+    // never reached its 3-tick confirmation and the visual PD kept driving forward into
+    // an obstacle that the laser had already measured).
+    // true  = while any obstacle is inside the avoidance trigger band the retreat branch
+    //         is skipped for that tick and the normal avoidance chain decides.
+    // false = original behaviour (retreat absolutely first).
+    avoidance_priority_over_retreat_ =
+      declare_parameter<bool>("avoidance_priority_over_retreat", true);
+    // false = use the avoidance ENTER distance, true = use the RELEASE distance.
+    avoidance_priority_use_release_band_ =
+      declare_parameter<bool>("avoidance_priority_use_release_band", false);
     // ---- P1' (Fix 1-4) ----
     takeover_drain_timeout_s_ = std::max(
       0.0, declare_parameter<double>("takeover_drain_timeout_s", 1.5));
@@ -3267,9 +3280,28 @@ private:
     // cancel-pending and navigation-drain used to return before the retreat was ever
     // considered, so the robot stood still with a person 0.89 m away for up to 4 s.
     // The retreat itself reuses the existing open-space reverse-follow controller unchanged.
+    // 2026-10-06: one laser evaluation per tick, BEFORE the retreat branch, so an
+    // obstacle inside the avoidance trigger band can take the tick away from the visual
+    // direct controller.  Diagnostics only -- it commands nothing by itself.
+    bool obstacle_blocks_retreat = false;
+    if (avoidance_priority_over_retreat_) {
+      const double priority_front_m = avoidance_priority_use_release_band_ ?
+        obstacle_nav_release_distance_m_ : obstacle_nav_distance_m_;
+      if (scan_recent(now)) {
+        const ObstacleScan priority_obstacles = scan_obstacles(true);
+        obstacle_blocks_retreat =
+          (std::isfinite(priority_obstacles.front.distance) &&
+          priority_obstacles.front.distance <= priority_front_m) ||
+          (std::isfinite(priority_obstacles.left.distance) &&
+          priority_obstacles.left.distance <= side_obstacle_nav_distance_m_) ||
+          (std::isfinite(priority_obstacles.right.distance) &&
+          priority_obstacles.right.distance <= side_obstacle_nav_distance_m_);
+      }
+    }
+
     if (human_retreat_priority_enabled_ && mode_ == 2 && motion_enabled_ &&
       visual_allow_reverse_ && has_body_ && invalid_body_since_.nanoseconds() == 0 &&
-      last_body_time_.nanoseconds() != 0)
+      last_body_time_.nanoseconds() != 0 && !obstacle_blocks_retreat)
     {
       const double retreat_person_m = latest_body_.centerofmass_z * 0.001;
       // Live-tunable extra distance (ros2 param set ... human_retreat_trigger_extra_m).
@@ -3364,7 +3396,9 @@ private:
         }
         visual_takeover_phase_ = VisualTakeoverPhase::NONE;
         awaiting_visual_after_avoidance_ = false;
-        reset_avoidance_episode();
+        if (!obstacle_blocks_retreat) {
+          reset_avoidance_episode();
+        }
         avoidance_rearm_required_ = false;
         active_visual_body_ = latest_body_;
         active_visual_body_time_ = last_body_time_;
@@ -5592,6 +5626,8 @@ private:
   bool avoid_diag_prev_episode_active_{false};
   // P2': observation only -- how often the visual path drives with something very close ahead.
   double front_violation_observe_m_{0.35};
+  bool avoidance_priority_over_retreat_{true};
+  bool avoidance_priority_use_release_band_{false};
   int avoid_diag_front_violation_{0};
   bool avoid_diag_front_violation_now_{false};
   // N1: human-approach retreat (reuses the existing open-space reverse-follow controller).
