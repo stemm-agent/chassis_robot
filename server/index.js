@@ -11,6 +11,9 @@ const PORT = Number(process.env.PORT || '3000');
 const HOST = process.env.HOST || '0.0.0.0';
 const WEB_ROOT = path.join(__dirname, '..', 'web');
 const JETSON_AGENT_URL = process.env.JETSON_AGENT_URL || '';
+// 2026-10-07: 建图恢复转发的超时保护（见 /api/feature/mapping/recover 路由）
+const RECOVER_BODY_TIMEOUT_MS = 5000;
+const RECOVER_PROXY_TIMEOUT_MS = 8000;
 const MANUAL_LINEAR_SPEED = Number(process.env.MANUAL_LINEAR_SPEED || '0.1');
 const MANUAL_ANGULAR_SPEED = Number(process.env.MANUAL_ANGULAR_SPEED || '0.5');
 const CONTROL_MODE = JETSON_AGENT_URL ? 'proxy' : 'mock';
@@ -2113,7 +2116,7 @@ async function getJetsonAgent(endpoint) {
   return requestUrl(`${JETSON_AGENT_URL}${endpoint}`, { allowErrorResult: true });
 }
 
-async function postJetsonAgent(endpoint, payload) {
+async function postJetsonAgent(endpoint, payload, timeoutMs) {
   if (!JETSON_AGENT_URL) {
     return { ok: false, message: 'JETSON_AGENT_URL is not configured' };
   }
@@ -2121,6 +2124,11 @@ async function postJetsonAgent(endpoint, payload) {
     method: 'POST',
     jsonBody: payload,
     allowErrorResult: true,
+    // 2026-10-07: 之前不传 timeoutMs，而 requestUrl 在该值非有限数时不设超时，
+    // 上游一旦不回响应就会永久挂住。
+    timeoutMs: Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Number(timeoutMs)
+      : 10000,
   });
 }
 
@@ -2713,18 +2721,31 @@ function serveFile(req, res) {
   });
 }
 
-function readBody(req) {
+function readBody(req, timeoutMs) {
+  // 2026-10-07: 原来只监听 data/end，没有超时。若请求体永远不结束（对端异常、
+  // 连接半开等），这里会永久挂住，调用方的 HTTP 响应也就永远发不出去
+  // （现场：POST /api/feature/mapping/recover 经 :3000 挂 30s 无响应）。
   return new Promise((resolve, reject) => {
     let body = '';
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(arg);
+    };
+    const timer = Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? setTimeout(() => finish(reject, new Error('Request body timed out')), Number(timeoutMs))
+      : null;
     req.on('data', chunk => {
       body += chunk;
       if (body.length > 1e6) {
-        reject(new Error('Body too large'));
+        finish(reject, new Error('Body too large'));
         req.destroy();
       }
     });
-    req.on('end', () => resolve(body));
-    req.on('error', reject);
+    req.on('end', () => finish(resolve, body));
+    req.on('error', error => finish(reject, error));
   });
 }
 
@@ -2772,13 +2793,36 @@ const server = http.createServer(async (req, res) => {
   // "mapping start failed" modal re-opened on every 1 Hz /api/status poll after dismissal.
   // The agent archives only a TERMINAL, non-active session, so this is safe to expose.
   if (req.method === 'POST' && pathname === '/api/feature/mapping/recover') {
+    // 2026-10-07: 这条转发之前没有超时保护。实测：直连 agent :8001 是 15ms/200，
+    // 但经这里会永久挂住（30s+ 无响应），小程序只好等到自己的 15s 超时，
+    // 表现为"正在自动恢复建图服务"一直转、弹窗消不掉。
+    // 现在：读体 5s、转发 8s，超时/异常都返回结构化结果（HTTP 200 + ok:false），
+    // 让前端立刻收敛，绝不挂住。
     let recoverBody = {};
     try {
-      recoverBody = (await readBody(req)) || {};
+      recoverBody = (await readBody(req, RECOVER_BODY_TIMEOUT_MS)) || {};
     } catch (error) {
       recoverBody = {};
     }
-    sendJson(res, 200, await postJetsonAgent('/api/feature/mapping/recover', recoverBody));
+    try {
+      const recovered = await postJetsonAgent(
+        '/api/feature/mapping/recover',
+        recoverBody,
+        RECOVER_PROXY_TIMEOUT_MS,
+      );
+      sendJson(res, 200, recovered);
+    } catch (error) {
+      sendJson(res, 200, {
+        ok: false,
+        accepted: false,
+        recovering: false,
+        recovered: false,
+        supported: true,
+        reasonCode: 'PROXY_TIMEOUT',
+        reasonText: `Mapping recovery proxy did not answer in ${RECOVER_PROXY_TIMEOUT_MS}ms`,
+        lastError: String((error && error.message) || error || ''),
+      });
+    }
     return;
   }
 
