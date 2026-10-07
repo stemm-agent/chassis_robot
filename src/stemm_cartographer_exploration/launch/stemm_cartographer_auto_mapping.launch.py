@@ -214,11 +214,14 @@ def generate_launch_description():
             'return_home_tf_max_age_sec': 0.20,
             'return_home_tf_stable_sec': 1.5,
             'return_home_max_retries': 3,
-            # R1 (2026-09-29): bounded reverse before giving up on a boxed-in return-home
-            # 2026-10-07 现场决定：雷达因安装角度看不到后方，倒车等于盲倒，已在返航中撞障。
-            # 暂时彻底关停该倒车恢复（唯一的反向速度发布点在
-            # cartographer_manager._retreat_from_occupied_cells，其两道门都读本开关：
-            # 行 589 的 R1b 清障后退 与 行 961 的主倒车；返航失败重试路径亦经同一函数）。
+            # 2026-10-07（修正上一版的一次性关停）：倒车按生命周期拆成两个独立开关。
+            #   唯一的反向速度发布点仍是 cartographer_manager._retreat_from_occupied_cells，
+            #   但它的闸门现在按“当前阶段”取：
+            #     探索期 R1b 清障后退 / R1c 发目标前净空后退  -> exploration_retreat_enabled
+            #     返航   R1 起点被占用 / 返航重试前后退        -> return_home_retreat_enabled
+            # 现场事实：雷达因安装角度看不到后方，返航倒车等于盲倒，已于 2026-10-07 13:38 撞障，
+            # 因此返航倒车默认关闭；探索期脱困保持开启（上一版误将其一并关停）。
+            'exploration_retreat_enabled': True,
             'return_home_retreat_enabled': False,
             'return_home_retreat_speed_mps': 0.15,
             # 2026-10-06: 0.60 -> 0.90。返航失败常见形态是起点被近处障碍夹住
@@ -229,7 +232,9 @@ def generate_launch_description():
             'return_home_retreat_rear_margin_m': 0.25,
             'return_home_retreat_settle_sec': 0.4,
             # 2026-10-06: 返航因 Nav2 失败而重试时，是否先做一次受控后退。
-            'return_home_failure_retreat_enabled': True,
+            # 2026-10-07: 该行为已由 return_home_retreat_enabled 统一管理；本开关保留仅为
+            # 兼容旧配置，固定为 False（两者必须同时为真才会后退）。
+            'return_home_failure_retreat_enabled': False,
             # R1b (2026-09-29): escape a blocked-clearance deadlock (front too close to
             # resume, and no backup/spin available) with one bounded reverse.
             'blocked_retreat_after_sec': 2.0,

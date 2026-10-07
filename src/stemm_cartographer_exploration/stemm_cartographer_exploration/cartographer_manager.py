@@ -124,7 +124,12 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         # End-mapping has two bounded stages: Cartographer finalization before
         # a home goal, then the actual return-home navigation.
         # R1 (2026-09-29): bounded reverse when a return-home start is boxed in.
-        self.declare_parameter('return_home_retreat_enabled', True)
+        # 2026-10-07: the reverse is gated per lifecycle stage instead of by one shared
+        # switch.  Exploration (R1b blocked-clearance, R1c pre-goal) keeps its retreat;
+        # return-home (R1 boxed-in, retry pre-retreat) is off by default because the
+        # lidar cannot see behind the robot (field collision on 2026-10-07 13:38).
+        self.declare_parameter('exploration_retreat_enabled', True)
+        self.declare_parameter('return_home_retreat_enabled', False)
         self.declare_parameter('return_home_retreat_speed_mps', 0.15)   # R1e
         self.declare_parameter('return_home_retreat_max_distance_m', 0.60)   # R1e
         self.declare_parameter('return_home_retreat_max_sec', 3.0)
@@ -586,7 +591,9 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         least blocked_retreat_min_interval_sec apart, and never more than the R1 envelope of
         0.50 m at 0.12 m/s with the rear strip verified in /map first.
         """
-        if not bool(self.get_parameter('return_home_retreat_enabled').value):
+        # 2026-10-07: R1b is an EXPLORATION retreat -> it reads the exploration gate, not
+        # the return-home one (the shared gate used to switch both off together).
+        if not bool(self.get_parameter('exploration_retreat_enabled').value):
             return
         max_per_session = int(self.get_parameter('blocked_retreat_max_per_session').value)
         if self._blocked_retreat_count >= max_per_session:
@@ -600,7 +607,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         saved_latch = getattr(self, '_retreat_used_for_attempt', False)
         self._retreat_used_for_attempt = False
         try:
-            status, moved = self._retreat_from_occupied_cells()
+            status, moved = self._retreat_from_occupied_cells('exploration')
         finally:
             self._retreat_used_for_attempt = saved_latch
         front = -1.0 if self.front_min_range is None else float(self.front_min_range)
@@ -950,15 +957,34 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         )
 
     # ---------------------------------------------------------------- R1 (2026-09-29)
-    def _retreat_from_occupied_cells(self):
-        """Bounded reverse so a return-home that starts boxed-in can be retried.
+    def _retreat_context(self):
+        """Which lifecycle stage owns the current tick: 'exploration' or 'return_home'.
 
-        Only ever called from _fail_return_home_before_dispatch when the gate said
-        "too close to occupied /map cells".  The mapping stack has no Nav2 backup behaviour
-        on purpose, so this issues the reverse directly, once per return-home attempt, and
-        refuses to move at all unless /map shows a free strip behind the robot.
+        The base class sets return_home_requested immediately before it dispatches the
+        home goal through send_nav_goal (stemm_nav2_manager/manager.py:1015-1017), which
+        also runs R1c.  Without this check a return-home dispatch would still reverse.
         """
-        if not bool(self.get_parameter('return_home_retreat_enabled').value):
+        if (getattr(self, 'return_home_requested', False)
+                or getattr(self, 'pending_home_goal', False)):
+            return 'return_home'
+        return 'exploration'
+
+    def _retreat_from_occupied_cells(self, context=None):
+        """Bounded reverse; the gate depends on the lifecycle stage, not one shared switch.
+
+        Callers:
+          exploration : R1b blocked-clearance retreat, R1c pre-goal clearance retreat
+          return_home : R1 boxed-in start (before dispatch), return-home retry pre-retreat
+
+        The mapping stack has no Nav2 backup behaviour on purpose, so this issues the
+        reverse directly and refuses to move at all unless /map shows a free strip behind
+        the robot.  context=None falls back to the current lifecycle stage, so a call site
+        that forgets to pass one can never silently inherit the wrong policy.
+        """
+        feature = context or self._retreat_context()
+        gate = ('exploration_retreat_enabled' if feature == 'exploration'
+                else 'return_home_retreat_enabled')
+        if not bool(self.get_parameter(gate).value):
             return 'disabled', 0.0
         if getattr(self, '_retreat_used_for_attempt', False):
             return 'already-used', 0.0
@@ -1020,8 +1046,8 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self.publish_zero_velocity()
             time.sleep(settle)
         self.get_logger().warn(
-            'R1 bounded reverse: moved back %.2f m at %.2f m/s in %.1f s '
-            '(limit %.2f m / %.1f s)' % (travelled, speed, time.monotonic() - start,
+            'R1 bounded reverse: context=%s moved back %.2f m at %.2f m/s in %.1f s '
+            '(limit %.2f m / %.1f s)' % (feature, travelled, speed, time.monotonic() - start,
                                          max_dist, max_sec))
         return 'moved', travelled
 
@@ -1037,7 +1063,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         # R1 (2026-09-29): if the start is refused for being too close to occupied
         # cells, back away a little and let the normal retry chain re-evaluate.
         if 'too close to occupied' in str(message):
-            status, moved = self._retreat_from_occupied_cells()
+            status, moved = self._retreat_from_occupied_cells('return_home')
             if status == 'moved':
                 clear, why = self.current_start_is_map_clear()
                 self.get_logger().warn(
@@ -1096,7 +1122,11 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         于是 3 次预算耗尽、返航失败。这里复用既有 R1 有界后退（自带后方净空校验、
         限速 0.15m/s、距离与时长双上限），每次重试最多一次，让下一次规划有通道。
         """
-        if bool(self.get_parameter('return_home_failure_retreat_enabled').value):
+        # 2026-10-07: the reverse is now owned by return_home_retreat_enabled (context
+        # 'return_home'); this older per-feature flag is kept for configuration
+        # compatibility and kept False.  Both must allow it before anything moves.
+        if (bool(self.get_parameter('return_home_failure_retreat_enabled').value)
+                and bool(self.get_parameter('return_home_retreat_enabled').value)):
             self._safe_call(
                 'return-home failure retreat',
                 self._retreat_before_return_home_retry,
@@ -1114,7 +1144,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             time.sleep(0.1)
         # 每次返航尝试允许一次后退（R1 的 per-attempt 闩锁按尝试复位）。
         self._retreat_used_for_attempt = False
-        status, moved = self._retreat_from_occupied_cells()
+        status, moved = self._retreat_from_occupied_cells('return_home')
         self.get_logger().warn(
             'return-home retry pre-retreat: status=%s moved=%.2fm '
             '(front=%.2fm)'
@@ -1843,7 +1873,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         saved_latch = getattr(self, '_retreat_used_for_attempt', False)
         self._retreat_used_for_attempt = False
         try:
-            status, moved = self._retreat_from_occupied_cells()
+            status, moved = self._retreat_from_occupied_cells('exploration')
         finally:
             self._retreat_used_for_attempt = saved_latch
         ready_after, reason_after = self.current_start_is_map_clear()
