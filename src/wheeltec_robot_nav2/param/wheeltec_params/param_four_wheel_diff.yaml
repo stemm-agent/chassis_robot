@@ -118,6 +118,13 @@ controller_server:
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController" #旋转控制器
       primary_controller: "nav2_mppi_controller::MPPIController" #MPPI控制器
+      # 2026-10-07: RotationShim 参数显式化（此前全部走默认值）
+      # 原默认 angular_dist_threshold=0.785(45°)：路径起始航向差 >45° 就原地旋转，
+      # 现场表现为"三次导航里夹一次意外旋转"。放宽到 1.22(70°)，中等转弯交给 MPPI 边走边转。
+      angular_dist_threshold: 1.22      # 45° -> 70°：只在必须掉头时才原地转
+      max_angular_accel: 2.4            # 3.2 -> 2.4：确需旋转时更柔和
+      simulate_ahead_time: 1.0          # 旋转前碰撞仿真时长（保持默认）
+      forward_sampling_distance: 0.5    # 路径采样前瞻距离（保持默认）
       time_steps: 48    #2026-10-06: 56->48（配合 iteration_count=2，控制单周期计算量）
       model_dt: 0.10    #每个时间步长的时间步长的长度dt（以秒为单位）是预测范围（=1/controller_frequency）
       batch_size: 600   #2026-10-07: 1000->600（单周期 48x600x2=57.6k 轨迹，消除控制环掉频与首周期优化失败）
