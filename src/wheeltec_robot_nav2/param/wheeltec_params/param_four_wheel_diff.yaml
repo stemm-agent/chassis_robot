@@ -118,7 +118,7 @@ controller_server:
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController" #旋转控制器
       primary_controller: "nav2_mppi_controller::MPPIController" #MPPI控制器
-      time_steps: 56    #候选轨迹中的时间步长（点）数
+      time_steps: 48    #2026-10-06: 56->48（配合 iteration_count=2，控制单周期计算量）
       model_dt: 0.10    #每个时间步长的时间步长的长度dt（以秒为单位）是预测范围（=1/controller_frequency）
       batch_size: 1000  #从2000降到1000，减轻计算负载
       vx_std: 0.2       #Vx 的抽样标准差
@@ -132,7 +132,7 @@ controller_server:
       ax_min: -1.5
       ay_max: 0.0
       az_max: 1.5
-      iteration_count: 1 #迭代次数
+      iteration_count: 2 #2026-10-06: 1->2（提高优化质量，减少优化失败）
       prune_distance: 1.5 #路径上距离机器人最近点的距离（米）
       enforce_path_inversion: false
       transform_tolerance: 1.0
@@ -228,11 +228,11 @@ local_costmap:
       height: 3            #代价地图的高度（m）
       resolution: 0.05     #代价地图1像素的分辨率，以米为单位
       #robot_radius: 0.20   #机器人半径，如果未提供足迹坐标，则使用机器人半径。
-      footprint: "[[-0.16, -0.175], [-0.16, 0.175], [0.30, 0.175], [0.30, -0.175]]"
+      footprint: "[[-0.18, -0.20], [-0.18, 0.20], [0.32, 0.20], [0.32, -0.20]]"   #2026-10-06: 四周各留约 2-5cm 余量（原 0.46x0.35，现 0.50x0.40）
       plugins: ["voxel_layer","inflation_layer"] #插件包括:{“体素层”，“膨胀层”}
       inflation_layer:                             #膨胀层参数
         plugin: "nav2_costmap_2d::InflationLayer"  #膨胀层插件。
-        cost_scaling_factor: 4.0                   #成本缩放因子，决定障碍物成本随距离的递减速度。
+        cost_scaling_factor: 2.5                   #2026-10-06: 4.0->2.5（降低陡峭度，减少 MPPI '算不出路径'）
         inflation_radius: 0.32                     #膨胀半径
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"      #体素层插件。
@@ -284,7 +284,7 @@ global_costmap:
       use_sim_time: False
       transform_tolerance: 1.0
       #robot_radius: 0.20                #机器人半径
-      footprint: "[[-0.16, -0.175], [-0.16, 0.175], [0.30, 0.175], [0.30, -0.175]]"
+      footprint: "[[-0.18, -0.20], [-0.18, 0.20], [0.32, 0.20], [0.32, -0.20]]"   #2026-10-06: 四周各留约 2-5cm 余量（原 0.46x0.35，现 0.50x0.40）
       resolution: 0.05                  #全局地图1像素的分辨率，以米为单位
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"] #插件包括：{“静态层”，“障碍层”，“膨胀层”}
