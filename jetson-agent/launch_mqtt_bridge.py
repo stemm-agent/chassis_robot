@@ -68,6 +68,7 @@ else:
     AUTO_NAVIGATION_OWNER = DEVICE_ID == 'robot-001'
 # 单次尝试，不重试（用户决定）。重新武装只可能由"新一场建图会话"触发。
 _auto_navigation_state = {'taskId': '', 'firedTaskId': ''}
+_auto_navigation_state = {'taskId': '', 'firedTaskId': '', 'lastSkipReason': ''}
 _auto_navigation_lock = threading.Lock()
 HEARTBEAT_INTERVAL = float(os.getenv('MQTT_HEARTBEAT_INTERVAL', '5'))
 SERVICE_CALL_TIMEOUT = float(os.getenv('MQTT_SERVICE_CALL_TIMEOUT', '30'))
@@ -1663,6 +1664,13 @@ def normalize_navigation_system_probe(payload: dict) -> tuple[dict | None, str]:
         'safetyError': safety_error,
         'lastError': last_error,
         'message': message,
+        # 2026-10-09: 播种结论原样透传（voice_recharge_bridge -> robot_agent）。
+        # 不做严格白名单校验：它是诊断性附加字段，缺失或未来扩展都不应
+        # 让整条导航状态探针失效。
+        'localizationSeed': (
+            payload.get('localizationSeed')
+            if isinstance(payload.get('localizationSeed'), dict) else None
+        ),
         'observedAtEpochMs': observed_at_epoch_ms,
     }, ''
 
@@ -1692,6 +1700,7 @@ def navigation_system_state_from_probe() -> tuple[dict, str]:
             'lastError': fetch_error,
             'message': fetch_error,
             'observedAtEpochMs': int(time.time() * 1000),
+            'localizationSeed': None,
         }, 'unknown'
 
     navigation_system, validation_error = normalize_navigation_system_probe(payload)
@@ -1718,6 +1727,7 @@ def navigation_system_state_from_probe() -> tuple[dict, str]:
             'lastError': validation_error,
             'message': validation_error,
             'observedAtEpochMs': int(time.time() * 1000),
+            'localizationSeed': None,
         }, 'unknown'
     return navigation_system, 'ready'
 
@@ -2221,6 +2231,31 @@ def _autonav_should_arm(session: dict) -> bool:
     return bool(str(session.get('taskId') or '').strip())
 
 
+def _autonav_seed_rejection_reason(navigation_system: dict) -> str:
+    """Return a non-empty reason when AMCL seeding was refused.
+
+    2026-10-09: 定位播种结论来自 voice_recharge_bridge。
+      * 结论必须是新鲜的，否则视为未知，不阻断（避免用陈旧结论误判）。
+      * state == 'refused' 或 anchorValid is False => 现在拉起导航栈也一定
+        停在 starting（AMCL 拿不到初值 -> 无 map->odom -> 栈"起来但不可用"），
+        因此拒绝自动拉起，把原因暴露出去而不是制造一个静默不可用的栈。
+    """
+    if not isinstance(navigation_system, dict):
+        return ''
+    seed = navigation_system.get('localizationSeed')
+    if not isinstance(seed, dict):
+        return ''
+    if seed.get('fresh') is not True:
+        return ''
+    if str(seed.get('state') or '').strip().lower() != 'refused' \
+            and seed.get('anchorValid') is not False:
+        return ''
+    code = str(seed.get('reasonCode') or '').strip()
+    reason = str(seed.get('reason') or '').strip()
+    detail = reason or code or 'localization seeding was refused'
+    return 'localizationSeed=%s: %s' % (code or 'refused', detail)
+
+
 def _autonav_idle_navigation_allowed(navigation_system: dict) -> tuple[bool, str]:
     state_name = str(navigation_system.get('state') or '').strip().lower()
     if state_name in {'starting', 'ready', 'stopping'}:
@@ -2293,6 +2328,22 @@ def _autonav_after_session_tick(
     nav = navigation_system if isinstance(navigation_system, dict) else {}
     allowed, why = _autonav_idle_navigation_allowed(nav)
     if not allowed:
+        return
+
+    # 2026-10-09: 定位播种被拒时不自动拉起导航栈。否则会拉起一个
+    # "进程都在、却永远不可用" 的栈（AMCL 无初值 -> 无 map->odom）。
+    # 注意：这里刻意不消费 firedTaskId，这样脱桩重锚后新的 AMCL 实例
+    # 仍可在同一场会话里成功拉起。
+    seed_rejection = _autonav_seed_rejection_reason(nav)
+    if seed_rejection:
+        with _auto_navigation_lock:
+            changed = _auto_navigation_state.get('lastSkipReason') != seed_rejection
+            _auto_navigation_state['lastSkipReason'] = seed_rejection
+        if changed:
+            print(
+                '[WARN] Auto-navigation withheld for %s: %s. '
+                'Dock the robot (charging contact) to re-anchor, then start '
+                'navigation manually.' % (task_id, seed_rejection), flush=True)
         return
 
     # 只消费一次，无论结果如何。
@@ -2438,6 +2489,7 @@ def publish_navigation_feature_status(
             'enabled': AUTO_NAVIGATION_AFTER_MAPPING,
             'armedTaskId': _auto_navigation_state['taskId'],
             'firedTaskId': _auto_navigation_state['firedTaskId'],
+            'lastSkipReason': _auto_navigation_state.get('lastSkipReason', ''),
         }
     if mapping_owns_vehicle(mapping_session):
         # Report a coherent suspended state instead of the mapping session's own

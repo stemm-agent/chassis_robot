@@ -362,6 +362,15 @@ MAPPING_ACTIVE_SESSION_STALE_TIMEOUT = max(
 VOICE_TARGET_NAVIGATION_STATUS_TOPIC = os.getenv(
     'VOICE_TARGET_NAVIGATION_STATUS_TOPIC', '/stemm_voice_navigation/status'
 ).strip()
+# 2026-10-09: 定位播种结论（voice_recharge_bridge 发布）。
+# 导航栈起来但 AMCL 拿不到初值时，栈会一直 starting 且 targetNavigation=false；
+# 这个字段让"为什么起不来"变得可判定、可显示。
+LOCALIZATION_SEED_STATUS_TOPIC = os.getenv(
+    'LOCALIZATION_SEED_STATUS_TOPIC', '/localization/seed_status'
+)
+LOCALIZATION_SEED_STATUS_STALE_SEC = max(
+    1.0, float(os.getenv('LOCALIZATION_SEED_STATUS_STALE_SEC', '10.0'))
+)
 VOICE_TARGET_NAVIGATION_SESSION_STATUS_PATH = os.getenv(
     'VOICE_TARGET_NAVIGATION_SESSION_STATUS_PATH',
     os.path.expanduser('~/.local/state/stemm-voice-target-navigation-session.json'),
@@ -1097,6 +1106,16 @@ class VelocityPublisher:
                 self._on_mapping_voice_state,
                 recharge_status_qos,
             )
+        if String is not None and LOCALIZATION_SEED_STATUS_TOPIC:
+            self.localization_seed_status_subscription = (
+                self.node.create_subscription(
+                    String,
+                    LOCALIZATION_SEED_STATUS_TOPIC,
+                    self._on_localization_seed_status,
+                    10,
+                )
+            )
+
         if String is not None and VOICE_TARGET_NAVIGATION_STATUS_TOPIC:
             self.voice_target_navigation_status_subscription = (
                 self.node.create_subscription(
@@ -1207,6 +1226,10 @@ class VelocityPublisher:
         self.manual_active = False
         self.publish_stop_once = False
         self.lock = threading.Lock()
+        # 2026-10-09: 播种结论缓存（由 /localization/seed_status 更新）。
+        # 必须在创建订阅之前初始化，否则回调可能先于赋值触发。
+        self.localization_seed_status = None
+        self.localization_seed_status_at = 0.0
         self.navigation_system_status_cache = TimedStatusSnapshotCache(
             STATUS_SNAPSHOT_CACHE_TTL_SEC
         )
@@ -1468,6 +1491,44 @@ class VelocityPublisher:
             self.latest_guarded_pose_observed_monotonic = now_monotonic
             self.latest_guarded_pose_stamp_ns = transform_stamp_ns
             self.latest_guarded_pose_probe_error = ''
+
+    def _on_localization_seed_status(self, message) -> None:
+        """Cache the seeding verdict published by voice_recharge_bridge.
+
+        2026-10-09: 该结论此前只写在 wheeltec-mic 的 journal 里，于是
+        "导航栈起来了但 AMCL 永远收敛不了" 对前端完全不可见。
+        """
+        try:
+            payload = json.loads(message.data)
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            payload = None
+        with self.lock:
+            self.localization_seed_status = payload
+            self.localization_seed_status_at = time.monotonic() if payload else 0.0
+
+    def _localization_seed_status_snapshot(self) -> dict:
+        """Return the cached verdict with a freshness judgement."""
+        with self.lock:
+            payload = (dict(self.localization_seed_status)
+                       if isinstance(self.localization_seed_status, dict) else None)
+            observed = float(self.localization_seed_status_at or 0.0)
+        if payload is None:
+            return {
+                'available': False,
+                'state': 'unknown',
+                'reasonCode': '',
+                'reason': '',
+                'fresh': False,
+            }
+        age = max(0.0, time.monotonic() - observed) if observed > 0.0 else None
+        snapshot = dict(payload)
+        snapshot['available'] = True
+        snapshot['fresh'] = bool(
+            age is not None and age <= LOCALIZATION_SEED_STATUS_STALE_SEC)
+        snapshot['ageSec'] = None if age is None else round(age, 2)
+        return snapshot
 
     def _on_recharge_status(self, message) -> None:
         status = str(getattr(message, 'data', '') or '').strip().upper()
@@ -4178,6 +4239,7 @@ class VelocityPublisher:
             **localization_transport,
             **navigation_safety,
             'startupAgeSec': startup_age_sec,
+            'localizationSeed': self._localization_seed_status_snapshot(),
             'observedAt': _utc_now(),
             'observedAtEpochMs': now_epoch_ms,
             'lastError': last_error,
