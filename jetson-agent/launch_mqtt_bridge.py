@@ -56,6 +56,16 @@ AUTO_NAVIGATION_TRIGGER_REASONS = tuple(
     ).split(',')
     if item.strip()
 )
+# 哪个 bridge 负责执行自动拉起：只有主桥具备启动 wheeltec_nav2 的权限。
+AUTO_NAVIGATION_OWNER = os.getenv(
+    'MQTT_AUTO_NAVIGATION_OWNER', 'launch-mqtt-bridge').strip()
+_bridge_role = os.getenv('MQTT_BRIDGE_ROLE', '').strip()
+if _bridge_role:
+    AUTO_NAVIGATION_OWNER = AUTO_NAVIGATION_OWNER == _bridge_role
+else:
+    # 未显式声明角色时按 device id 推断：主桥 MQTT_DEVICE_ID=robot-001，
+    # 建图桥为 robot-001-cartographer。
+    AUTO_NAVIGATION_OWNER = DEVICE_ID == 'robot-001'
 # 单次尝试，不重试（用户决定）。重新武装只可能由"新一场建图会话"触发。
 _auto_navigation_state = {'taskId': '', 'firedTaskId': ''}
 _auto_navigation_lock = threading.Lock()
@@ -2225,6 +2235,15 @@ def _autonav_after_session_tick(
     navigation_system: object,
 ) -> None:
     """Arm on a live session; fire exactly once when that session ends successfully."""
+    if not AUTO_NAVIGATION_OWNER:
+        # 2026-10-09: 本钩子挂在共享函数 publish_navigation_feature_status 里。
+        # 该函数在 stemm-cartographer-mqtt-bridge（建图桥）中因
+        # NAVIGATION_FEATURE_STATUS_ENABLED=False 于本函数前段即早退，因此建图桥
+        # 从来不会执行到这里；真正每拍调用它的是主桥 launch-mqtt-bridge 的
+        # navigation_feature_status_loop。而且只有主桥的 ALLOWED_LAUNCH_TARGETS
+        # 含 wheeltec_nav2，具备启动导航栈的白名单权限。故用环境变量显式指定
+        # owner，避免两个 bridge 都尝试拉起导航。
+        return
     if not AUTO_NAVIGATION_AFTER_MAPPING:
         return
     session_file = _read_mapping_session_termination()
