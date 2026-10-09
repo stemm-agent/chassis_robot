@@ -38,6 +38,27 @@ CARTOGRAPHER_TASK_PATH = os.getenv(
     'CARTOGRAPHER_TASK_PATH',
     os.path.expanduser('~/.local/state/stemm-cartographer-task.json'),
 )
+# 2026-10-09: 建图会话状态文件的权威来源。bridge 需要 terminationReason 才能区分
+# "返航成功收尾" 与 "用户取消 / 设备重启 / 启动超时" —— 归一化后的 mappingSession
+# 白名单里没有这个字段（只有 reasonCode=MAPPING_SUCCEEDED，无法区分后三者）。
+CARTOGRAPHER_SESSION_STATUS_PATH = os.getenv(
+    'CARTOGRAPHER_SESSION_STATUS_PATH',
+    os.path.expanduser('~/.local/state/stemm-cartographer-session.json'),
+)
+# 自动拉起导航：总开关与触发原因白名单（可用环境变量覆盖，便于现场关停）
+AUTO_NAVIGATION_AFTER_MAPPING = os.getenv(
+    'MQTT_AUTO_NAVIGATION_AFTER_MAPPING', '1').strip().lower() not in {
+        '0', 'false', 'no', 'off'}
+AUTO_NAVIGATION_TRIGGER_REASONS = tuple(
+    item.strip()
+    for item in os.getenv(
+        'MQTT_AUTO_NAVIGATION_TRIGGER_REASONS', 'return_home_complete',
+    ).split(',')
+    if item.strip()
+)
+# 单次尝试，不重试（用户决定）。重新武装只可能由"新一场建图会话"触发。
+_auto_navigation_state = {'taskId': '', 'firedTaskId': ''}
+_auto_navigation_lock = threading.Lock()
 HEARTBEAT_INTERVAL = float(os.getenv('MQTT_HEARTBEAT_INTERVAL', '5'))
 SERVICE_CALL_TIMEOUT = float(os.getenv('MQTT_SERVICE_CALL_TIMEOUT', '30'))
 NAVIGATION_SYSTEM_STATUS_URL = os.getenv(
@@ -2150,6 +2171,145 @@ def navigation_state_since_epoch_ms(state_name: object) -> int:
     return int(_navigation_state_since['epochMs'])
 
 
+# ---------------------------------------------------------------------------
+# 2026-10-09 (operator): 返航完成后自动拉起导航栈。
+#
+# 用户诉求："建完图我就要直接使用导航，不想每次手动拉起导航栈"。
+# 设计约束（均经车主确认）：
+#   * 只在 terminationReason == 'return_home_complete' 时触发；
+#     用户取消 / 设备重启 / 启动超时一律不触发——那几条路径要保留"不自动"
+#     以便复盘 AMCL bootstrap。
+#   * 单次尝试，不重试。失败只记录，不阻断用户手动再点。
+#   * 返航完成时若确实在充电（chargingConfirmed 为 True），跳过。正常情况返航
+#     停在建图原点（= 充电桩前约 0.6 m），并不在桩上；此分支只覆盖
+#     "建图起点本身就在桩上" 的边界情形，避免撞上充电互锁。
+# ---------------------------------------------------------------------------
+
+def _read_mapping_session_termination() -> dict:
+    """Read the runner's terminal reason. Fail-soft: any error means 'unknown'."""
+    path = CARTOGRAPHER_SESSION_STATUS_PATH
+    if not path:
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _autonav_should_arm(session: dict) -> bool:
+    """A new mapping session is running: allow exactly one future after-session start."""
+    if not AUTO_NAVIGATION_AFTER_MAPPING:
+        return False
+    if session.get('terminal') is True:
+        return False
+    if str(session.get('phase') or '').strip().lower() not in {
+        'starting', 'mapping', 'returning_home',
+    }:
+        return False
+    return bool(str(session.get('taskId') or '').strip())
+
+
+def _autonav_idle_navigation_allowed(navigation_system: dict) -> tuple[bool, str]:
+    state_name = str(navigation_system.get('state') or '').strip().lower()
+    if state_name in {'starting', 'ready', 'stopping'}:
+        return False, f'navigation is already {state_name or "busy"}'
+    return True, ''
+
+
+def _autonav_after_session_tick(
+    client: 'mqtt.Client',
+    mapping_session: object,
+    recharge: object,
+    navigation_system: object,
+) -> None:
+    """Arm on a live session; fire exactly once when that session ends successfully."""
+    if not AUTO_NAVIGATION_AFTER_MAPPING:
+        return
+    session_file = _read_mapping_session_termination()
+    task_id = str(session_file.get('taskId') or '').strip()
+
+    if _autonav_should_arm(session_file):
+        with _auto_navigation_lock:
+            if _auto_navigation_state['taskId'] != task_id:
+                _auto_navigation_state['taskId'] = task_id
+                _auto_navigation_state['firedTaskId'] = ''
+                print(
+                    '[INFO] Auto-navigation armed after mapping session %s.'
+                    % task_id, flush=True)
+        return
+
+    with _auto_navigation_lock:
+        armed_task = _auto_navigation_state['taskId']
+        already_fired = _auto_navigation_state['firedTaskId']
+    if not armed_task or task_id != armed_task or already_fired == task_id:
+        return
+
+    # --- 会话已终态：检查触发条件 ---
+    mapping = mapping_session if isinstance(mapping_session, dict) else {}
+    if mapping.get('terminal') is not True:
+        return
+    if mapping.get('functionalServicesRestored') is not True:
+        # 服务尚未恢复时 start_launch 的准入必然会拒绝，等下一拍。
+        return
+    reason = str(session_file.get('terminationReason') or '').strip()
+    if reason not in AUTO_NAVIGATION_TRIGGER_REASONS:
+        with _auto_navigation_lock:
+            _auto_navigation_state['firedTaskId'] = task_id
+        print(
+            '[INFO] Auto-navigation skipped: terminationReason=%r taskId=%s'
+            % (reason, task_id), flush=True)
+        return
+
+    charging = recharge if isinstance(recharge, dict) else {}
+    if charging.get('chargingConfirmed') is True:
+        with _auto_navigation_lock:
+            _auto_navigation_state['firedTaskId'] = task_id
+        print(
+            '[INFO] Auto-navigation skipped: vehicle is charging '
+            '(chargingConfirmed=true) taskId=%s' % task_id, flush=True)
+        return
+
+    nav = navigation_system if isinstance(navigation_system, dict) else {}
+    allowed, why = _autonav_idle_navigation_allowed(nav)
+    if not allowed:
+        return
+
+    # 只消费一次，无论结果如何。
+    with _auto_navigation_lock:
+        if _auto_navigation_state['firedTaskId'] == task_id:
+            return
+        _auto_navigation_state['firedTaskId'] = task_id
+
+    request_id = 'auto-nav-%s' % task_id
+    print(
+        '[INFO] Auto-navigation: starting %s/%s after %s (requestId=%s).'
+        % (DEFAULT_PACKAGE, DEFAULT_LAUNCH_FILE, reason, request_id), flush=True)
+    try:
+        start_launch(client, {
+            'package': DEFAULT_PACKAGE,
+            'launchFile': DEFAULT_LAUNCH_FILE,
+            'requestId': request_id,
+        })
+    except Exception as exc:  # noqa: BLE001 - 自动路径绝不能让 bridge 挂掉
+        print(
+            '[ERROR] Auto-navigation failed to start: %s' % exc, flush=True)
+        try:
+            publish_json(
+                client,
+                ERROR_TOPIC,
+                build_status_payload(
+                    'Auto-navigation after mapping failed to start: %s' % exc,
+                    status='failed',
+                    action='auto_navigation',
+                    requestId=request_id,
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def publish_navigation_feature_status(
     client: mqtt.Client,
     reason: str,
@@ -2253,6 +2413,13 @@ def publish_navigation_feature_status(
             'actionBlockedReason': 'Navigation shutdown is in progress.',
         }
     navigation_system.update(navigation_control)
+    # 2026-10-09: 暴露自动拉起状态，便于审计与避免前端误判为"卡在 starting"。
+    with _auto_navigation_lock:
+        navigation_system['autostart'] = {
+            'enabled': AUTO_NAVIGATION_AFTER_MAPPING,
+            'armedTaskId': _auto_navigation_state['taskId'],
+            'firedTaskId': _auto_navigation_state['firedTaskId'],
+        }
     if mapping_owns_vehicle(mapping_session):
         # Report a coherent suspended state instead of the mapping session's own
         # Nav2 graph, which the probe can only describe as ready/failed.
@@ -2382,6 +2549,9 @@ def publish_navigation_feature_status(
                 f"readiness={vehicle_readiness['state']}, "
                 f"availability={availability})."
             )
+    # 2026-10-09: 会话收尾钩子。放在 return 之前，确保电量/会话状态已归一化。
+    _autonav_after_session_tick(
+        client, mapping_session, recharge, navigation_system)
     return snapshot
 
 
