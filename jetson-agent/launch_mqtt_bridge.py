@@ -56,6 +56,12 @@ AUTO_NAVIGATION_TRIGGER_REASONS = tuple(
     ).split(',')
     if item.strip()
 )
+# 2026-10-10: 自动拉起前的静置窗口。建图收尾会先恢复功能服务白名单
+# （含 bodyfollow-nav2.service，会拉起跟随栈），若紧接着就拉起导航栈，
+# 两者会在根命名空间/资源上打架——实测 10:52:20 那次 wheeltec_nav2 从未起来。
+AUTO_NAVIGATION_SETTLE_SEC = max(
+    0.0, float(os.getenv('MQTT_AUTO_NAVIGATION_SETTLE_SEC', '5.0'))
+)
 # 哪个 bridge 负责执行自动拉起：只有主桥具备启动 wheeltec_nav2 的权限。
 AUTO_NAVIGATION_OWNER = os.getenv(
     'MQTT_AUTO_NAVIGATION_OWNER', 'launch-mqtt-bridge').strip()
@@ -68,7 +74,10 @@ else:
     AUTO_NAVIGATION_OWNER = DEVICE_ID == 'robot-001'
 # 单次尝试，不重试（用户决定）。重新武装只可能由"新一场建图会话"触发。
 _auto_navigation_state = {'taskId': '', 'firedTaskId': ''}
-_auto_navigation_state = {'taskId': '', 'firedTaskId': '', 'lastSkipReason': ''}
+_auto_navigation_state = {
+    'taskId': '', 'firedTaskId': '', 'lastSkipReason': '',
+    'settleSince': 0.0,
+}
 _auto_navigation_lock = threading.Lock()
 HEARTBEAT_INTERVAL = float(os.getenv('MQTT_HEARTBEAT_INTERVAL', '5'))
 SERVICE_CALL_TIMEOUT = float(os.getenv('MQTT_SERVICE_CALL_TIMEOUT', '30'))
@@ -2289,6 +2298,7 @@ def _autonav_after_session_tick(
             if _auto_navigation_state['taskId'] != task_id:
                 _auto_navigation_state['taskId'] = task_id
                 _auto_navigation_state['firedTaskId'] = ''
+                _auto_navigation_state['settleSince'] = 0.0
                 print(
                     '[INFO] Auto-navigation armed after mapping session %s.'
                     % task_id, flush=True)
@@ -2329,6 +2339,26 @@ def _autonav_after_session_tick(
     allowed, why = _autonav_idle_navigation_allowed(nav)
     if not allowed:
         return
+
+    # 2026-10-10 时序修复：功能服务恢复刚发起时不要立刻拉起导航栈。收尾会
+    # 先启动 bodyfollow-nav2.service（跟随栈 + /nofmap），立刻拉起
+    # wheeltec_nav2 会让两者抢同一批根命名空间资源——实测 10:52:20 那次
+    # wheeltec_nav2.launch.py 从未产生任何进程。这里要求静置一段时间。
+    if AUTO_NAVIGATION_SETTLE_SEC > 0.0:
+        now_monotonic = time.monotonic()
+        with _auto_navigation_lock:
+            if _auto_navigation_state.get('settleSince', 0.0) <= 0.0:
+                _auto_navigation_state['settleSince'] = now_monotonic
+                settle_since = now_monotonic
+            else:
+                settle_since = _auto_navigation_state['settleSince']
+        settled_for = now_monotonic - settle_since
+        if settled_for < AUTO_NAVIGATION_SETTLE_SEC:
+            with _auto_navigation_lock:
+                _auto_navigation_state['lastSkipReason'] = (
+                    'waiting for post-restore settle %.1f/%.1fs'
+                    % (settled_for, AUTO_NAVIGATION_SETTLE_SEC))
+            return
 
     # 2026-10-09: 定位播种被拒时不自动拉起导航栈。否则会拉起一个
     # "进程都在、却永远不可用" 的栈（AMCL 无初值 -> 无 map->odom）。
