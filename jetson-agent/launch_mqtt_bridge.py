@@ -2240,6 +2240,17 @@ def _autonav_should_arm(session: dict) -> bool:
     return bool(str(session.get('taskId') or '').strip())
 
 
+# P0b-20261014: how long to wait for the mapping session runner to exit
+# before starting navigation anyway.  The runner's own force-terminate path
+# runs after INNER_LAUNCH_EXIT_GRACE_SEC (60 s) plus teardown, so this cap has
+# to exceed that.  It is a safety valve, not a target: "never brings navigation
+# up" is far worse than "brings it up late".
+AUTO_NAVIGATION_RUNNER_WAIT_SEC = max(
+    0.0,
+    float(os.getenv('MQTT_AUTO_NAVIGATION_RUNNER_WAIT_SEC', '90.0')),
+)
+
+
 def _autonav_seed_rejection_reason(navigation_system: dict) -> str:
     """Return a non-empty reason when AMCL seeding was refused.
 
@@ -2270,6 +2281,37 @@ def _autonav_idle_navigation_allowed(navigation_system: dict) -> tuple[bool, str
     if state_name in {'starting', 'ready', 'stopping'}:
         return False, f'navigation is already {state_name or "busy"}'
     return True, ''
+
+
+def _mapping_session_runner_alive() -> bool:
+    """P0b-20261014: True while a mapping session runner process still exists.
+
+    The runner spawns the inner Cartographer launch and force-terminates it if it
+    overruns INNER_LAUNCH_EXIT_GRACE_SEC.  Kicking off navigation while that
+    teardown is still running puts the new Nav2 bringup straight into the restart
+    storm -- measured 2026-10-14 09:36, where both component containers timed out
+    on load_node and /amcl was never created.
+
+    Reads /proc directly (same style as nav_restore.navigation_launch_running) so
+    a `pgrep`-based diagnostic shell that merely mentions the name cannot be
+    mistaken for a live runner.
+    """
+    marker = b'stemm_cartographer_session_runner'
+    try:
+        entries = list(os.scandir('/proc'))
+    except OSError:
+        # Fail open: an unreadable /proc must not block navigation forever.
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open('/proc/%s/cmdline' % entry.name, 'rb') as handle:
+                if marker in handle.read():
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def _autonav_after_session_tick(
@@ -2359,6 +2401,40 @@ def _autonav_after_session_tick(
                     'waiting for post-restore settle %.1f/%.1fs'
                     % (settled_for, AUTO_NAVIGATION_SETTLE_SEC))
             return
+
+    # P0b-20261014 —— 等建图会话真正退场再拉起导航栈。
+    #
+    # 实测 2026-10-14 09:30 那轮：会话文件 09:36:27 已是终态且
+    # functionalServicesRestored=True，但建图的 `ros2 launch` 包装体直到
+    # 09:36:27 才退出 —— 因为它在所有子进程 finished cleanly 之后仍卡在
+    # ep_poll，等满 60s 宽限被 session_runner 强杀（SIGINT）。
+    # 于是桥在 09:36:32 拉起导航栈时，正好撞上那次强杀引发的重启风暴
+    # （同一秒还在重启 bodyfollow-nav2 / recharge / 低电监控），
+    # 两个容器的 load_node 双超时 → /amcl 从未创建 → 栈被判 failed。
+    #
+    # 门禁：仍有 session_runner 存活时不 fire，只记原因等下一拍。
+    # 带超时放行 —— "永久不拉起"比"偶尔晚拉起"严重得多（P24~P35 一路的教训），
+    # 所以超时后照常拉起，并明确打印。
+    if _mapping_session_runner_alive():
+        now_monotonic = time.monotonic()
+        with _auto_navigation_lock:
+            if _auto_navigation_state.get('runnerWaitSince', 0.0) <= 0.0:
+                _auto_navigation_state['runnerWaitSince'] = now_monotonic
+            runner_wait_since = _auto_navigation_state['runnerWaitSince']
+        waited = now_monotonic - runner_wait_since
+        if waited < AUTO_NAVIGATION_RUNNER_WAIT_SEC:
+            with _auto_navigation_lock:
+                _auto_navigation_state['lastSkipReason'] = (
+                    'waiting for the mapping session runner to exit '
+                    '%.1f/%.1fs' % (waited, AUTO_NAVIGATION_RUNNER_WAIT_SEC))
+            return
+        print(
+            '[WARN] Mapping session runner still alive after %.0fs; starting '
+            'navigation anyway so the vehicle is never left without it.'
+            % waited, flush=True)
+    else:
+        with _auto_navigation_lock:
+            _auto_navigation_state['runnerWaitSince'] = 0.0
 
     # 2026-10-09: 定位播种被拒时不自动拉起导航栈。否则会拉起一个
     # "进程都在、却永远不可用" 的栈（AMCL 无初值 -> 无 map->odom）。
