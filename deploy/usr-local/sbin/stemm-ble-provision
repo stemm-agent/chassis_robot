@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""STEMM BLE provisioning channel (car side, additive / parallel to the Wi-Fi AP path).
+
+Design rule (operator, 2026-09-28): this is a NEW, PARALLEL channel.  It must not modify,
+replace or interfere with the existing AP fallback in any way:
+
+  * it never calls nmcli itself and never touches connection profiles, the autopilot timer or
+    the AP profile;
+  * it only *delegates* to the existing, already verified helper
+    /usr/local/sbin/stemm-network-agent-launch (--connect / --connect-status), so the state
+    machine, the rollback, the SSID pre-check and the autopilot guards all apply unchanged;
+  * removing/stopping this unit leaves the Wi-Fi path byte-for-byte identical.
+
+Why BLE: it is an independent radio, so the car can be provisioned while it is still online,
+the link survives the Wi-Fi switch (the app keeps receiving stages), and no hotspot password
+has to be typed on a phone at all.
+
+GATT layout (advertised name STEMM-<machine-id 4 hex>, same tag as the AP SSID):
+
+  service        7f9a0001-5b3c-4d2e-9f10-8a6b1c2d3e40
+  command char   7f9a0002-...   write / write-without-response
+      payload    JSON, may be split into <=20 byte chunks:
+                 {"schemaVersion":1,"requestId":"ble-xxxxxxxx","ssid":"...",
+                  "password":"...","token":"..."}
+  status char    7f9a0003-...   read / notify
+      payload    {"ok":true,"requestId":"...","generation":N,"stage":"connecting"}
+
+Authorization: a per-car token, generated once at /var/lib/wheeltec/network/ble_token and
+published (world readable) in /etc/stemm-ble-provision.txt so it can be shown to the operator
+and handed to the mini program.  A cloud-issued token is the follow-up (see F-23d).
+
+Self test (no BLE needed):  stemm-ble-provision --self-test '<json command>'
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+STATE_DIR = '/var/lib/wheeltec/network'
+TOKEN_FILE = os.path.join(STATE_DIR, 'ble_token')
+HINT_FILE = '/etc/stemm-ble-provision.txt'
+HELPER = '/usr/local/sbin/stemm-network-agent-launch'
+
+SERVICE_UUID = '7f9a0001-5b3c-4d2e-9f10-8a6b1c2d3e40'
+COMMAND_UUID = '7f9a0002-5b3c-4d2e-9f10-8a6b1c2d3e40'
+STATUS_UUID = '7f9a0003-5b3c-4d2e-9f10-8a6b1c2d3e40'
+
+MAX_COMMAND_BYTES = 1024
+TOKEN_RE = re.compile(r'^[A-Za-z0-9]{6,32}$')
+REQUEST_RE = re.compile(r'^[A-Za-z0-9_-]{8,128}$')
+
+
+def log(message):
+    sys.stderr.write('[stemm-ble-provision] %s\n' % message)
+    sys.stderr.flush()
+    try:
+        subprocess.run(['logger', '-t', 'stemm-ble-provision', message], timeout=5)
+    except Exception:
+        pass
+
+
+def machine_tag():
+    try:
+        with open('/etc/machine-id', 'r', encoding='utf-8') as handle:
+            digest = subprocess.run(['sha256sum'], input=handle.read(), capture_output=True,
+                                    text=True, timeout=5).stdout
+        return digest[:4].upper() or '0000'
+    except Exception:
+        return '0000'
+
+
+def adapter_name():
+    return 'STEMM-%s' % machine_tag()
+
+
+def ensure_token():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not os.path.exists(TOKEN_FILE) or os.path.getsize(TOKEN_FILE) == 0:
+        raw = subprocess.run(['head', '-c', '6', '/dev/urandom'], capture_output=True).stdout
+        token = raw.hex()[:8].upper()
+        try:
+            old_umask = os.umask(0o077)
+            try:
+                with open(TOKEN_FILE, 'w', encoding='utf-8') as handle:
+                    handle.write(token)
+            finally:
+                os.umask(old_umask)
+        except Exception as exc:
+            # unprivileged runs (e.g. the self test as hnh) must still work
+            log('cannot persist the token (unprivileged run?): %s' % exc)
+    token = ''
+    try:
+        with open(TOKEN_FILE, 'r', encoding='utf-8') as handle:
+            token = handle.read().strip()
+    except Exception:
+        token = ''
+    if not token:
+        token = re.sub(r'[^A-Za-z0-9]', '', machine_tag() + 'TOKEN')[:8].upper()
+    try:
+        publish_hint(token)
+    except Exception:
+        pass
+    return token
+
+
+def publish_hint(token):
+    body = (
+        'STEMM BLE provisioning channel\n'
+        'Adapter name : %s\n'
+        'Token       : %s\n'
+        'Service UUID: %s\n'
+        'Command chr : %s\n'
+        'Status  chr : %s\n'
+        'This channel is independent of the Wi-Fi hotspot fallback and does not change it.\n'
+        % (adapter_name(), token, SERVICE_UUID, COMMAND_UUID, STATUS_UUID)
+    )
+    try:
+        with open(HINT_FILE, 'w', encoding='utf-8') as handle:
+            handle.write(body)
+        os.chmod(HINT_FILE, 0o644)
+    except Exception as exc:
+        log('cannot publish hint file: %s' % exc)
+
+
+# ------------------------------------------------------------------ command layer
+class Provisioner:
+    """Validates BLE commands and delegates to the existing Wi-Fi helper."""
+
+    def __init__(self, token):
+        self.token = token
+        self.buffer = ''
+        self.last_request = ''
+        self._cache = None          # (monotonic-ish timestamp, payload) for the status reads
+
+    def feed(self, chunk):
+        """Accumulate a chunk; return a (ok, code, detail) tuple when a frame completes."""
+        self.buffer += chunk
+        if len(self.buffer) > MAX_COMMAND_BYTES:
+            self.buffer = ''
+            return False, 'COMMAND_TOO_LARGE', ''
+        text = self.buffer.strip()
+        if not text.startswith('{'):
+            self.buffer = ''
+            return False, 'BAD_COMMAND', ''
+        try:
+            command = json.loads(text)
+        except Exception:
+            return None, '', ''          # incomplete frame -> wait for more chunks
+        self.buffer = ''
+        if not isinstance(command, dict):
+            return False, 'BAD_COMMAND', ''
+        return self.execute(command)
+
+    def execute(self, command):
+        request_id = str(command.get('requestId', '')).strip()
+        ssid = str(command.get('ssid', '')).strip()
+        password = str(command.get('password', ''))
+        token = str(command.get('token', '')).strip()
+
+        if not TOKEN_RE.match(token) or token != self.token:
+            return False, 'UNAUTHORIZED', ''
+        if not REQUEST_RE.match(request_id):
+            return False, 'BAD_REQUEST', ''
+        if not 1 <= len(ssid.encode('utf-8')) <= 32:
+            return False, 'INVALID_SSID', ''
+        if password and not 8 <= len(password) <= 63:
+            return False, 'INVALID_PASSWORD', ''
+
+        # Delegate: the helper is the single owner of the network state machine.
+        try:
+            result = subprocess.run(
+                [HELPER, '--connect', '--request-id', request_id,
+                 '--ssid', ssid, '--password', password],
+                capture_output=True, text=True, timeout=20)
+        except Exception as exc:
+            log('helper invocation failed: %s' % exc)
+            return False, 'INTERNAL', ''
+        payload = {}
+        try:
+            payload = json.loads((result.stdout or '').strip().splitlines()[-1])
+        except Exception:
+            payload = {}
+        if payload.get('ok') is True:
+            self.last_request = request_id
+            log('accepted %s ssid=%s' % (request_id, ssid))
+            return True, payload.get('stage', 'accepted'), request_id
+        code = payload.get('errorCode') or 'INTERNAL'
+        log('rejected %s: %s' % (request_id, code))
+        return False, code, request_id
+
+    def network_snapshot(self):
+        """The car's CURRENT network, for the BLE status payload.
+
+        2026-09-28: the mini program talks to us over BLE precisely when it is NOT on the car's
+        Wi-Fi, so it cannot call GET /api/network/status at all.  Without this the page could
+        only show a stale or empty network name during Bluetooth provisioning.
+        """
+        try:
+            result = subprocess.run([HELPER, '--status'], capture_output=True, text=True,
+                                    timeout=15)
+            net = (json.loads((result.stdout or '').strip().splitlines()[-1]) or {}).get('network') or {}
+        except Exception as exc:
+            log('network snapshot unavailable: %s' % exc)
+            return {}
+        return {
+            'ssid': net.get('ssid', ''),
+            'ipv4': net.get('ipv4', ''),
+            'connected': bool(net.get('connected')),
+            'hotspotActive': bool(net.get('hotspotActive')),
+            'hotspotSsid': net.get('hotspotSsid', ''),
+        }
+
+    def status(self, request_id=None, max_age=0.8):
+        # max_age=0.0 forces a fresh read (used by the GATT ReadValue path); the 1 Hz notify tick
+        # reuses the cache so a subscribed phone does not make us shell out twice per second.
+        now = time.time()
+        if request_id is None and self._cache and (now - self._cache[0]) < max_age:
+            return dict(self._cache[1])
+        rid = request_id or self.last_request
+        if not rid:
+            payload = {'ok': True, 'requestId': '', 'stage': 'idle', 'generation': 0}
+        else:
+            try:
+                result = subprocess.run(
+                    [HELPER, '--connect-status', '--request-id', rid],
+                    capture_output=True, text=True, timeout=15)
+                payload = json.loads((result.stdout or '').strip().splitlines()[-1])
+            except Exception:
+                payload = {'ok': True, 'requestId': rid, 'stage': 'unknown', 'generation': 0}
+        payload.update(self.network_snapshot())
+        self._cache = (now, dict(payload))
+        return payload
+
+
+# --------------------------------------------------------------------- BLE layer
+def run_ble_server():                                        # pragma: no cover (needs BlueZ)
+    import dbus
+    import dbus.service
+    import dbus.mainloop.glib
+    from gi.repository import GLib
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    token = ensure_token()
+    provisioner = Provisioner(token)
+
+    BLUEZ = 'org.bluez'
+    OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
+    PROPS_IFACE = 'org.freedesktop.DBus.Properties'
+    ADAPTER_PATH = '/org/bluez/hci0'
+    APP_PATH = '/com/stemm/provision'
+    SERVICE_PATH = APP_PATH + '/service'
+    ADVERT_PATH = APP_PATH + '/advert'
+
+    class Characteristic(dbus.service.Object):
+        """org.bluez.GattCharacteristic1.
+
+        dbus-python notes learned the hard way (2026-09-28, the first build crash-looped):
+          * PropertiesChanged lives on org.freedesktop.DBus.Properties with signature
+            'sa{sv}as' -- three arguments, not one, or the decorator raises at class creation;
+          * BlueZ reads properties through Get as well as GetAll, so both are implemented;
+          * every property must be returned with explicit dbus types.
+        """
+
+        def __init__(self, path, uuid, flags, service_path):
+            self.uuid = uuid
+            self.flags = flags
+            self.service_path = service_path
+            self.value = b''
+            self.notifying = False
+            dbus.service.Object.__init__(self, bus, path)
+
+        def properties(self):
+            return {
+                'UUID': self.uuid,
+                'Service': dbus.ObjectPath(self.service_path),
+                'Flags': dbus.Array(self.flags, signature='s'),
+                'Value': dbus.ByteArray(self.value),
+            }
+
+        def publish(self, payload):
+            self.value = payload
+            self.PropertiesChanged(PROPS_IFACE, {'Value': dbus.ByteArray(payload)},
+                                   dbus.Array([], signature='s'))
+
+        @dbus.service.method(PROPS_IFACE, in_signature='ss', out_signature='v')
+        def Get(self, interface, name):
+            return self.properties()[name]
+
+        @dbus.service.method(PROPS_IFACE, in_signature='s', out_signature='a{sv}')
+        def GetAll(self, interface):
+            return self.properties()
+
+        @dbus.service.signal(PROPS_IFACE, signature='sa{sv}as')
+        def PropertiesChanged(self, interface, changed, invalidated):
+            pass
+
+        @dbus.service.method(BLUEZ + '.GattCharacteristic1', in_signature='a{sv}',
+                             out_signature='ay')
+        def ReadValue(self, options):
+            # A plain read must be fresh: a phone may only ever read (never subscribe), and while
+            # it is off the car's Wi-Fi this BLE payload is its only source of the network name.
+            try:
+                self.publish(json.dumps(provisioner.status(max_age=0.0), ensure_ascii=False)
+                             .encode('utf-8'))
+            except Exception as exc:
+                log('status refresh on read failed: %s' % exc)
+            return dbus.ByteArray(self.value)
+
+        @dbus.service.method(BLUEZ + '.GattCharacteristic1', in_signature='aya{sv}')
+        def WriteValue(self, value, options):
+            chunk = bytes(bytearray(value)).decode('utf-8', 'replace')
+            status_characteristic = APPLICATION.status
+            ok, code, rid = provisioner.feed(chunk)
+            if ok is None:
+                return                       # incomplete frame, wait for more chunks
+            reply = json.dumps({'ok': bool(ok), 'code': code, 'requestId': rid,
+                                'stage': 'accepted' if ok else 'failed'},
+                               ensure_ascii=False).encode('utf-8')
+            if status_characteristic is not None and status_characteristic.notifying:
+                status_characteristic.publish(reply)
+            log('command ok=%s code=%s rid=%s' % (ok, code, rid))
+
+        @dbus.service.method(BLUEZ + '.GattCharacteristic1', in_signature='', out_signature='')
+        def StartNotify(self):
+            self.notifying = True
+
+        @dbus.service.method(BLUEZ + '.GattCharacteristic1', in_signature='', out_signature='')
+        def StopNotify(self):
+            self.notifying = False
+
+    class Service(dbus.service.Object):
+        def __init__(self, path, uuid, characteristics):
+            self.uuid = uuid
+            self.characteristics = characteristics
+            dbus.service.Object.__init__(self, bus, path)
+
+        def properties(self):
+            return {
+                'UUID': self.uuid,
+                'Primary': dbus.Boolean(True),
+                'Characteristics': dbus.Array(
+                    [dbus.ObjectPath(c._object_path) for c in self.characteristics],
+                    signature='o'),
+            }
+
+        @dbus.service.method(PROPS_IFACE, in_signature='ss', out_signature='v')
+        def Get(self, interface, name):
+            return self.properties()[name]
+
+        @dbus.service.method(PROPS_IFACE, in_signature='s', out_signature='a{sv}')
+        def GetAll(self, interface):
+            return self.properties()
+
+    class Advertisement(dbus.service.Object):
+        def __init__(self, path):
+            self.path = path
+            dbus.service.Object.__init__(self, bus, path)
+
+        def properties(self):
+            return {
+                'Type': 'peripheral',
+                'LocalName': adapter_name(),
+                'ServiceUUIDs': dbus.Array([SERVICE_UUID], signature='s'),
+                'Includes': dbus.Array(['tx-power'], signature='s'),
+            }
+
+        @dbus.service.method(PROPS_IFACE, in_signature='ss', out_signature='v')
+        def Get(self, interface, name):
+            return self.properties()[name]
+
+        @dbus.service.method(PROPS_IFACE, in_signature='s', out_signature='a{sv}')
+        def GetAll(self, interface):
+            return self.properties()
+
+        @dbus.service.method(BLUEZ + '.LEAdvertisement1', in_signature='', out_signature='')
+        def Release(self):
+            log('advertisement released')
+
+    class Application(dbus.service.Object):
+        def __init__(self, path, service, command, status):
+            self.service = service
+            self.command = command
+            self.status = status
+            dbus.service.Object.__init__(self, bus, path)
+
+        @dbus.service.method(OM_IFACE, in_signature='', out_signature='a{oa{sa{sv}}}')
+        def GetManagedObjects(self):
+            objects = {
+                self.service._object_path: {
+                    BLUEZ + '.GattService1': self.service.properties()},
+                self.command._object_path: {
+                    BLUEZ + '.GattCharacteristic1': self.command.properties()},
+                self.status._object_path: {
+                    BLUEZ + '.GattCharacteristic1': self.status.properties()},
+            }
+            return objects
+
+    command = Characteristic(SERVICE_PATH + '/command', COMMAND_UUID,
+                             ['write', 'write-without-response'], SERVICE_PATH)
+    status = Characteristic(SERVICE_PATH + '/status', STATUS_UUID, ['read', 'notify'],
+                            SERVICE_PATH)
+    service = Service(SERVICE_PATH, SERVICE_UUID, [command, status])
+    APPLICATION = Application(APP_PATH, service, command, status)
+    advertisement = Advertisement(ADVERT_PATH)
+
+    object_manager = dbus.Interface(bus.get_object(BLUEZ, '/'), OM_IFACE)
+    object_manager.GetManagedObjects()          # fail fast if BlueZ is not answering
+    adapter = bus.get_object(BLUEZ, ADAPTER_PATH)
+    gatt_manager = dbus.Interface(adapter, BLUEZ + '.GattManager1')
+    ad_manager = dbus.Interface(adapter, BLUEZ + '.LEAdvertisingManager1')
+    adapter_props = dbus.Interface(adapter, PROPS_IFACE)
+    APPLICATION.status = status
+
+    def tick():
+        if not status.notifying:
+            return True          # nobody subscribed: do not shell out to the helper every second
+        payload = provisioner.status()
+        text = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        if status.notifying and text != status.value:
+            status.publish(text)
+        return True
+
+    def register():
+        # 2026-09-28 (second live bug): RegisterApplication makes BlueZ call *back* into us for
+        # GetManagedObjects, so it must be issued from inside the main loop and asynchronously --
+        # a synchronous call before GLib.MainLoop().run() deadlocks and BlueZ logs
+        # "client_ready_cb() No object received".
+        try:
+            adapter_props.Set(BLUEZ + '.Adapter1', 'Powered', dbus.Boolean(True))
+        except Exception as exc:
+            log('cannot power the adapter: %s' % exc)
+        try:
+            gatt_manager.RegisterApplication(
+                APP_PATH, {},
+                reply_handler=lambda: log('GATT application registered'),
+                error_handler=lambda err: log('GATT registration failed: %s' % err))
+            ad_manager.RegisterAdvertisement(
+                ADVERT_PATH, {},
+                reply_handler=lambda: log('advertisement registered as %s' % adapter_name()),
+                error_handler=lambda err: log('advertisement failed: %s' % err))
+        except Exception as exc:
+            log('registration call failed: %s' % exc)
+        log('BLE provisioning up: name=%s service=%s' % (adapter_name(), SERVICE_UUID))
+        return False
+
+    GLib.timeout_add_seconds(1, tick)
+    GLib.idle_add(register)
+    GLib.MainLoop().run()
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == '--self-test':
+        token = ensure_token()
+        provisioner = Provisioner(token)
+        # Deliberately a WRONG token: this exercises the chunked frame assembly and the whole
+        # validation path while guaranteeing that the network helper is never invoked, so the
+        # self test cannot touch the Wi-Fi state that the AP fallback depends on.
+        command = args[1] if len(args) > 1 else json.dumps(
+            {'schemaVersion': 1, 'requestId': 'ble-selftest0001',
+             'ssid': '__stemm_ble_selftest__', 'password': '12345678',
+             'token': 'DELIBERATELY-WRONG'})
+        half = len(command) // 2
+        result = provisioner.feed(command[:half])
+        result = provisioner.feed(command[half:])
+        print(json.dumps({'feedResult': result, 'status': provisioner.status()},
+                         ensure_ascii=False))
+        return 0
+    if args and args[0] == '--token':
+        print(ensure_token())
+        return 0
+    if os.geteuid() != 0:
+        print('must run as root', file=sys.stderr)
+        return 1
+    return run_ble_server()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

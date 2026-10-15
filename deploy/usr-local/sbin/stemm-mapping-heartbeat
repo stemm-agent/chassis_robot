@@ -1,0 +1,37 @@
+#!/bin/bash
+# STEMM cartographer session heartbeat (2026-09-29)
+#
+# Why: /usr/local/sbin/stemm-mapping-leftover-killer decides a session is dead
+# from the mtime of stemm-cartographer-session.json (age > 60s => leftover).
+# While the session runs, session_runner.py blocks inside _wait_for_inner_launch()
+# and therefore never rewrites that file; the only writer was the sweeper's own
+# touch loop in an earlier revision.  Result: a healthy, actively mapping session
+# is classified as "leftover" roughly 60-130s after it starts and its
+# cartographer/auto-mapping/nav2 processes are SIGTERM/SIGKILLed mid-map.
+#
+# This unit refreshes the mtime of the session file *only* while the session
+# runner process is alive, so the sweeper's staleness rule keeps working for
+# genuinely crashed sessions (file goes stale => sweeper terminalizes as before)
+# while a healthy session is no longer misjudged as leftover.
+#
+# It never modifies the file contents, never touches ROS, and never sends motion.
+set +u
+
+SESSION="${STEMM_SESSION_FILE:-/home/hnh/.local/state/stemm-cartographer-session.json}"
+LOG=/var/log/stemm-mapping-heartbeat.log
+PAT='stemm_cartographer_exploration/lib/stemm_cartographer_exploration/stemm_cartographer_session_runner'
+
+[ -f "$SESSION" ] || exit 0
+# A terminal session is over; leave it stale so the sweeper can clean it up.
+grep -q '"terminal": true' "$SESSION" 2>/dev/null && exit 0
+# Only a live session runner may keep the file fresh.
+pgrep -f "$PAT" >/dev/null 2>&1 || exit 0
+
+touch "$SESSION" 2>/dev/null || exit 0
+
+now=$(date +%s)
+last=$(stat -c %Y "$LOG" 2>/dev/null || echo 0)
+if [ $(( now - last )) -ge 300 ]; then
+  echo "$(date -Is) heartbeat: session runner alive, refreshed session file mtime" >> "$LOG" 2>/dev/null
+fi
+exit 0

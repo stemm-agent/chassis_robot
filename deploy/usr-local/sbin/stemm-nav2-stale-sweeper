@@ -1,0 +1,137 @@
+#!/bin/bash
+# Kill nav2 processes left over from a previous navigation launch.
+#
+# 2026-10-06 修复（误杀并行导航栈）：
+#   现象：每次 bodyfollow-nav2（跟随栈，自带一套完整 Nav2）启动后约 3-13 秒，
+#         地图导航栈（wheeltec_nav2）的两个 component_container_isolated 与
+#         amcl_odom_limiter 被 SIGKILL（exit -9），用户看到“导航又崩了”。
+#         实证日志：
+#           15:27:28 stale nav2 pid=458560 older_than_launch_by=845s
+#           15:27:32 SIGKILL stale pid=458560 / 458562
+#         三次导航容器死亡（15:06:42 / 15:10:47 / 15:27:32）均紧随 bodyfollow 重启。
+#   根因：本脚本把“最新的导航类 launch”当作唯一参考（第 27-30 行不区分是哪条栈），
+#         再把所有早于它 MARGIN 秒的 nav2 节点当残留 kill 掉。但架构上
+#         wheeltec_nav2（地图栈）与 bodyfollow_nav2（跟随栈，含 nofmap 栈）会并行存在，
+#         于是后启动的跟随栈会让“正在服务的地图栈”被判成上一轮残留。
+#   修复：
+#     1) 参考改为“最新 launch 的进程组(PGID)”，只清理**同属该进程组**的 nav2 节点；
+#        属于其他 launch 进程组（另一条并行栈）的节点一律跳过并记录 SKIP other-stack；
+#     2) TERM/KILL 两个阶段使用同一份判定，且跳过已推出的 PID（消除重复刷）。
+#   保留：活跃建图会话时完全不清扫（2026-10-06 早前的 mapguard 修复）。
+#   关闭本次新增保护：STEMM_NAV2_SWEEP_CROSS_STACK=1（回到旧的跨栈清理行为）。
+set +u
+MARGIN=${STEMM_NAV2_STALE_MARGIN:-90}
+LOG=/var/log/stemm-nav2-sweeper.log
+
+# start time (epoch) of a pid, via /proc/<pid>/stat field 22 (starttime in clock ticks)
+pid_start_epoch() {
+  local pid=$1 ticks hz boot
+  ticks=$(awk '{print $22}' /proc/$pid/stat 2>/dev/null) || return 1
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  boot=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null) || return 1
+  [ -n "$ticks" ] && [ -n "$boot" ] || return 1
+  echo $(( boot + ticks / hz ))
+}
+
+# process group id of a pid, via /proc/<pid>/stat field 5
+pid_pgid() {
+  awk '{print $5}' /proc/$1/stat 2>/dev/null
+}
+
+# is the pid owned by the reference launch's process group?
+same_launch_group() {
+  local pid=$1 want_pgid=$2 got_pgid
+  if [ "${STEMM_NAV2_SWEEP_CROSS_STACK:-0}" = "1" ]; then
+    return 0                       # legacy behaviour: no stack separation
+  fi
+  got_pgid=$(pid_pgid "$pid")
+  [ -n "$got_pgid" ] && [ -n "$want_pgid" ] && [ "$got_pgid" = "$want_pgid" ]
+}
+
+# 2026-10-06 (1): 活跃建图会话存在时绝不清扫——导航栈正是本次建图要用的。
+# 2026-10-06 (2): 参照只认真正的导航/跟随 launch 包装。
+if pgrep -f 'stemm_cartographer_session_runner' >/dev/null 2>&1; then
+  # 2026-10-09: record WHAT matched, in the same instant as the match.  This guard has been seen
+  # tripping on ~61 % of runs while a manual `pgrep -af stemm_cartographer_session_runner` finds
+  # nothing: the matcher is a very short-lived process (~1-2 ms, caught once in a 120 Hz sampling
+  # loop) that only exists while the timer fires.  Without this line the decision cannot be
+  # audited after the fact.  `pgrep -af` reads the cmdline itself, so the race window is minimal.
+  # Logging only -- the guard condition is unchanged.
+  sess_hit=$(pgrep -af 'stemm_cartographer_session_runner' 2>/dev/null | tr '\n' '|' | cut -c1-220)
+  echo "$(date -Is) active mapping session detected - skipping nav2 sweep [matched: ${sess_hit:-none}]" >> "$LOG"
+  exit 0
+fi
+
+# 找出“最新的导航/跟随 launch 包装”，并记住它自己的进程组。
+newest=0
+newest_pid=0
+for p in $(pgrep -f 'wheeltec_nav2.launch.py|bodyfollow_nav2.launch.py' 2>/dev/null); do
+  s=$(pid_start_epoch "$p") || continue
+  if [ "$s" -gt "$newest" ]; then
+    newest=$s
+    newest_pid=$p
+  fi
+done
+[ "$newest" -eq 0 ] && exit 0        # no navigation launch running: nothing to judge
+
+# 2026-10-06: 只清理与参考 launch 同进程组的 nav2 节点；并行运行的另一条栈不动。
+# 2026-10-09: record WHICH launch is the reference.  The SKIP other-stack protection (2026-10-06)
+# is correct, but without this a reader cannot tell whether the protected stack is the map stack
+# (wheeltec_nav2, i.e. real navigation) or the always-on follow stack (bodyfollow_nav2).
+# Logging only -- the protection logic is unchanged.
+ref_cmd=$(tr '\0' ' ' < /proc/$newest_pid/cmdline 2>/dev/null)
+ref_launch=$(printf '%s' "$ref_cmd" | grep -oE '[A-Za-z0-9_]+\.launch\.py' | tail -1)
+[ -n "$ref_launch" ] || ref_launch=unknown
+newest_pgid=$(pid_pgid "$newest_pid")
+if [ -z "$newest_pgid" ]; then
+  echo "$(date -Is) cannot read pgid of reference launch pid=$newest_pid - skipping sweep" >> "$LOG"
+  exit 0
+fi
+
+PATTERN='controller_server|planner_server|behavior_server|bt_navigator|lifecycle_manager|component_container_isolated|amcl_odom_limiter|/amcl |map_server'
+
+# nav2 node processes
+killed=0
+skipped=0
+for p in $(pgrep -f "$PATTERN" 2>/dev/null); do
+  [ -r "/proc/$p/stat" ] || continue
+  cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+  case "$cmd" in
+    *nav2_controller*|*nav2_planner*|*nav2_behaviors*|*nav2_bt_navigator*|*nav2_lifecycle_manager*|*component_container_isolated*|*amcl_odom_limiter*|*nav2_amcl*|*nav2_map_server*) ;;
+    *) continue ;;
+  esac
+  s=$(pid_start_epoch "$p") || continue
+  if [ $(( newest - s )) -gt "$MARGIN" ]; then
+    if ! same_launch_group "$p" "$newest_pgid"; then
+      echo "$(date -Is) SKIP other-stack pid=$p pgid=$(pid_pgid "$p") ref_pgid=$newest_pgid newer_launch_pid=$newest_pid ref_launch=$ref_launch cmd=${cmd:0:50}" >> "$LOG"
+      skipped=$((skipped+1))
+      continue
+    fi
+    echo "$(date -Is) stale nav2 pid=$p older_than_launch_by=$(( newest - s ))s cmd=${cmd:0:60}" >> "$LOG"
+    kill -TERM "$p" 2>/dev/null
+    killed=$((killed+1))
+  fi
+done
+
+if [ "$killed" -gt 0 ]; then
+  sleep 4
+  for p in $(pgrep -f "$PATTERN" 2>/dev/null); do
+    [ -r "/proc/$p/stat" ] || continue
+    cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+    s=$(pid_start_epoch "$p") || continue
+    if [ $(( newest - s )) -gt "$MARGIN" ]; then
+      if ! same_launch_group "$p" "$newest_pgid"; then
+        continue
+      fi
+      case "$cmd" in
+        *nav2_*|*component_container_isolated*) echo "$(date -Is) SIGKILL stale pid=$p" >> "$LOG"; kill -KILL "$p" 2>/dev/null ;;
+      esac
+    fi
+  done
+  echo "$(date -Is) swept $killed stale nav2 process(es) (skipped $skipped from other launch group)" >> "$LOG"
+elif [ "$skipped" -gt 0 ]; then
+  # 2026-10-09: make the "protected a parallel stack" outcome explicit once per run instead of
+  # leaving only per-pid SKIP lines.  Logging only -- no branch of the kill decision changed.
+  echo "$(date -Is) nothing swept: $skipped nav2 process(es) belong to another launch group (ref_launch=$ref_launch); a parallel stack is running and is deliberately left alone" >> "$LOG"
+fi
+exit 0

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# STEMM 开机自动解锁钥匙串并恢复远程桌面
+# 由 stemm-vnc-bootstrap.service 在图形会话就绪后调用（以 root 运行）
+set -u
+
+UID_NUM=1000
+USER_NM=hnh
+HOME_DIR=/home/hnh
+export XDG_RUNTIME_DIR=/run/user/$UID_NUM
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$UID_NUM/bus
+
+log() { echo "[stemm-vnc-bootstrap] $*"; }
+
+# ---- 0. 等待用户会话与 D-Bus 就绪（最多等 60 秒）----
+for i in $(seq 1 60); do
+  if [ -S "$XDG_RUNTIME_DIR/bus" ] && pgrep -u "$USER_NM" -f gnome-keyring >/dev/null 2>&1; then
+    log "会话就绪（等待 ${i} 秒）"
+    break
+  fi
+  sleep 1
+done
+[ -S "$XDG_RUNTIME_DIR/bus" ] || { log "错误：$XDG_RUNTIME_DIR/bus 不可用，放弃"; exit 1; }
+
+run_as_user() {
+  sudo -u "$USER_NM" env HOME="$HOME_DIR" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+       DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" "$@"
+}
+
+# ---- 1. 用空口令解锁钥匙串 ----
+log "解锁钥匙串 ..."
+sudo -u "$USER_NM" env HOME="$HOME_DIR" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+  bash -c "printf '\n' | gnome-keyring-daemon --unlock --replace --daemonize --components=secrets" \
+  >/dev/null 2>&1
+sleep 3
+
+# ---- 2. 重启远程桌面，确保它加载到凭据 ----
+log "重启远程桌面服务 ..."
+run_as_user systemctl --user restart gnome-remote-desktop >/dev/null 2>&1
+sleep 4
+
+# ---- 3. 校验并记录结果 ----
+STATUS="$(run_as_user grdctl status 2>&1 || true)"
+log "远程桌面状态："
+echo "$STATUS" | sed 's/^/    /' >&2
+
+if echo "$STATUS" | grep -qiE '^\s*VNC:' && echo "$STATUS" | grep -qiE 'Password: \(hidden\)'; then
+  log "结果：VNC 凭据已可用 ✅"
+  exit 0
+fi
+
+# 凭据缺失时：若存在已保存的口令文件则重新写入
+if [ -s /etc/stemm-vnc/vnc-password ]; then
+  log "凭据缺失，使用已保存口令重新写入 ..."
+  PW="$(cat /etc/stemm-vnc/vnc-password)"
+  run_as_user grdctl vnc set-password "$PW" >/dev/null 2>&1
+  run_as_user systemctl --user restart gnome-remote-desktop >/dev/null 2>&1
+  sleep 3
+  if run_as_user grdctl status 2>&1 | grep -qiE 'Password: \(hidden\)'; then
+    log "结果：已重新写入口令，VNC 可用 ✅"
+    exit 0
+  fi
+fi
+
+log "结果：VNC 凭据仍不可用 ⚠️（可手动执行 sudo stemm-vnc-pass set <口令>）"
+exit 0

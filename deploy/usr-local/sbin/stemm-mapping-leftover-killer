@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# 修 stemm-mapping-leftover-killer：不得把“独立导航栈”当建图残留杀掉。
+#
+# 证据（2026-10-06 13:53:24，bpftrace 信号归属 + 它自己的日志）：
+#   KILL leftover pid=229532 age=62s cmd=.../amcl_odom_limiter
+#   KILL leftover pid=229534 age=62s cmd=.../component_container_isolated
+#   KILL leftover pid=229536 age=62s cmd=.../component_container_isolated
+#   SIGKILL ×3 → swept 3 leftover(s)
+#   发送者: PID=232759 COMM=stemm-mapping-l  SIG=9
+#
+# 根因：PAT 里包含 [c]omponent_container_isolated / [a]mcl_odom_limiter，
+# 而 wheeltec_nav2.launch.py 的独立导航栈用的正是这两个同名进程。
+# 脚本只判断“建图会话是否活着”，没有“导航是否在运行”的保护，
+# 于是无建图会话时，存活超过 60s 的导航进程会被按残留 TERM→KILL 掉。
+#
+# 本补丁加两道保护：
+#   A) 检测到独立导航/跟随 launch 正在运行 → 本轮不做任何清理（退出码 0，只记日志）
+#   B) 若因竞态仍进入清理循环，则通过 PPID 匹配排除“导航 launch 的子进程树”
+set +u
+LOG=/var/log/stemm-mapping-leftover.log
+SESSION=/home/hnh/.local/state/stemm-cartographer-session.json
+SESSION_PAT='[s]temm_cartographer_exploration/lib/stemm_cartographer_exploration/stemm_cartographer_session_runner'
+PAT='[a]uto_mapping.launch|[s]ession_runner|[c]artographer_node|[o]ccupancy_grid|stemm_cartographer_nav2_manager|[n]av2_controller|[n]av2_planner|[n]av2_bt_navigator|[n]av2_behaviors|[n]av2_lifecycle_manager|[n]av2_amcl|[n]av2_map_server|[c]omponent_container_isolated|[a]mcl_odom_limiter|body_nav2_follower|body_nav2_profile_guard'
+
+NAV_LAUNCH_PAT='ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py|ros2 launch bodyreader bodyfollow_nav2.launch.py'
+
+live=0
+if [ -f "$SESSION" ]; then
+  mtime=$(stat -c %Y "$SESSION" 2>/dev/null || echo 0)
+  age=$(( $(date +%s) - mtime ))
+  if [ "$age" -lt 60 ] && ! grep -q '"terminal": true' "$SESSION" 2>/dev/null; then
+    live=1
+  fi
+fi
+
+# --- 2026-09-29: a crashed session must not stay "running" for ever.
+if [ -f "$SESSION" ]; then
+  mtime=$(stat -c %Y "$SESSION" 2>/dev/null || echo 0)
+  if [ $(( $(date +%s) - mtime )) -gt 60 ] \
+     && ! grep -q '"terminal": true' "$SESSION" 2>/dev/null \
+     && ! pgrep -f "$PAT" >/dev/null 2>&1; then
+    echo "$(date -Is) TERMINALIZE zombified session (no live process, stale file)" >> "$LOG"
+    python3 - "$SESSION" <<'PYEOF'
+import json, sys, time
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    sys.exit(0)
+d['phase'] = 'idle'
+d['status'] = 'stopped'    # STARTABLE: see white-box test 2026-09-29
+d['taskStatus'] = 'stopped'
+d['terminal'] = True
+d['sessionActive'] = False
+d['processExited'] = True
+d['terminationStatus'] = 'failed'   # the failure stays on record
+d['functionalServicesRestored'] = True   # STARTABLE: otherwise start stays locked
+d['terminationReason'] = d.get('terminationReason') or 'session_manager_crashed'
+d['taskId'] = ''   # TASKID-CLEAR: a dead task must not own the vehicle
+d['updatedAt'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
+d['updatedAtEpochMs'] = int(time.time() * 1000)
+json.dump(d, open(p, 'w'))
+print('    terminalized:', d.get('phase'), d.get('status'), d.get('terminationReason'))
+PYEOF
+  fi
+fi
+
+# New rule: the session manager decides.  The broad pattern is only used to find what to clean.
+if pgrep -f "$SESSION_PAT" >/dev/null 2>&1; then
+  if [ -f "$SESSION" ] \
+     && ! grep -q '"terminal": true' "$SESSION" 2>/dev/null \
+     && [ $(( $(date +%s) - $(stat -c %Y "$SESSION" 2>/dev/null || echo 0) )) -gt 60 ]; then
+    touch "$SESSION" 2>/dev/null
+    echo "$(date -Is) session runner alive; refreshed stale session-state mtime (no kill)" >> "$LOG"
+  fi
+  exit 0
+fi
+
+# --- A) 2026-10-06 (fix): 独立导航/跟随栈在运行时，绝不清理。
+# 依据：PAT 覆盖 component_container_isolated 与 amcl_odom_limiter，
+# 而独立导航栈使用的正是这两个同名进程，会被误判为“建图残留”。
+if pgrep -f "$NAV_LAUNCH_PAT" >/dev/null 2>&1; then
+  # 2026-10-09: name WHICH launch matched.  bodyfollow_nav2.launch.py belongs to the
+  # permanently-running bodyfollow-nav2.service, so this branch almost always means "the follow
+  # stack is up" rather than "navigation is running"; the old wording sent the reader looking for
+  # a navigation stack that was not there.  The guard condition itself is UNCHANGED -- the two
+  # extra pgrep calls only build the message.
+  nav_why=""
+  pgrep -f 'ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py' >/dev/null 2>&1 \
+    && nav_why="wheeltec_nav2(navigation)"
+  pgrep -f 'ros2 launch bodyreader bodyfollow_nav2.launch.py' >/dev/null 2>&1 \
+    && nav_why="${nav_why:+$nav_why+}bodyfollow_nav2(follow,always-on)"
+  echo "$(date -Is) guard A: independent launch running [${nav_why:-unknown}] - skipping mapping-leftover kill (expected while bodyfollow-nav2.service is up)" >> "$LOG"
+  exit 0
+fi
+
+# No session manager: everything the broad pattern matches is a leftover.
+echo "$(date -Is) no live session manager - cleaning mapping leftovers" >> "$LOG"
+  # --- BOOT-CLEAN (2026-09-29)
+  if [ ! -f /tmp/.stemm-boot-clean-done ]; then
+    if ! pgrep -f "$PAT" >/dev/null 2>&1; then
+      rm -f /tmp/stemm-cartographer-exploration.lock 2>/dev/null
+      printf '%s' '{"taskId":"","status":"idle"}' > /home/hnh/.local/state/stemm-cartographer-task.json 2>/dev/null
+      if command -v mosquitto_sub >/dev/null 2>&1; then
+        timeout 6 mosquitto_sub -h 127.0.0.1 -t '#' -v --retained-only 2>/dev/null > /tmp/.stemm-retained.txt
+        while IFS= read -r line; do
+          topic=$(echo "$line" | awk '{print $1}')
+          [ -z "$topic" ] && continue
+          case "$topic" in
+            *mapping*|*cartographer*|*navigation*|*nav_state*|*feature*|*status*|*task*)
+              mosquitto_pub -h 127.0.0.1 -t "$topic" -r -n 2>/dev/null ;;
+          esac
+        done < /tmp/.stemm-retained.txt
+      fi
+      echo "$(date -Is) BOOT-CLEAN: cleared mapping lock/task/retained state" >> "$LOG"
+      touch /tmp/.stemm-boot-clean-done
+    fi
+  fi
+
+  # --- B) 2026-10-06 (fix): 排除“导航 launch 的子进程树”。
+  # 即便 A 因竞态漏检，也不允许杀掉导航 launch 的直接子进程（容器/limiter）。
+  NAV_TREE=""
+  for nl in $(pgrep -f "$NAV_LAUNCH_PAT" 2>/dev/null); do
+    NAV_TREE="$NAV_TREE $(pgrep -P "$nl" 2>/dev/null | tr '\n' ' ')"
+  done
+
+  now=$(date +%s)
+  hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+  boot=$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null || echo 0)
+  killed=0
+  for p in $(pgrep -f "$PAT" 2>/dev/null); do
+    [ -r /proc/$p/stat ] || continue
+    case " $NAV_TREE " in
+      *" $p "*) echo "$(date -Is) SKIP nav-tree pid=$p (independent navigation owns it)" >> "$LOG"; continue ;;
+    esac
+    ticks=$(awk '{print $22}' /proc/$p/stat 2>/dev/null) || continue
+    start=$(( boot + ticks / hz ))
+    age=$(( now - start ))
+    [ "$age" -lt 60 ] && continue
+    cmd=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+    echo "$(date -Is) KILL leftover pid=$p age=${age}s cmd=${cmd:0:70}" >> "$LOG"
+    kill -TERM "$p" 2>/dev/null
+    killed=$(( killed + 1 ))
+  done
+  if [ "$killed" -gt 0 ]; then
+    sleep 2
+    for p in $(pgrep -f "$PAT" 2>/dev/null); do
+      [ -r /proc/$p/stat ] || continue
+      case " $NAV_TREE " in
+        *" $p "*) continue ;;
+      esac
+      ticks=$(awk '{print $22}' /proc/$p/stat 2>/dev/null) || continue
+      start=$(( boot + ticks / hz ))
+      [ $(( now - start )) -lt 60 ] && continue
+      echo "$(date -Is) SIGKILL pid=$p" >> "$LOG"
+      kill -KILL "$p" 2>/dev/null
+    done
+    echo "$(date -Is) swept $killed leftover(s)" >> "$LOG"
+  fi
+  exit 0
+exit 0

@@ -1,0 +1,15 @@
+#!/bin/bash
+# 只读记录器：把发往导航/建图桥的每一条 MQTT 命令落盘（含 source/timestamp/requestId）
+# 目的：定位“谁在停导航”。此前无任何环节记录命令，导致 SIGINT/SIGKILL 归属不可查。
+set +u
+LOG=/var/log/stemm-mqtt-commands.log
+{
+  echo "=== command logger start $(date -Is) ==="
+  mosquitto_sub -h 127.0.0.1 -v \
+    -t 'robot/robot-001/launch/command' \
+    -t 'robot/robot-001/cartographer/launch/command' \
+    -t 'robot/robot-001/command' 2>/dev/null \
+  | while IFS= read -r line; do
+      printf '%s %s\n' "$(date -Is)" "$line"
+    done
+} >> "$LOG" 2>&1

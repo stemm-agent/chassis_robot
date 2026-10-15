@@ -1,0 +1,612 @@
+#!/usr/bin/env bash
+# STEMM network agent (car side, root only).
+#
+# Implements the 0927 mini-program contract behind demo-control :3000:
+#   --status                                       network snapshot for /api/network/status
+#   --scan                                         nearby networks for /api/network/scan
+#   --connect --request-id ID --ssid S --password P   async connect (returns immediately)
+#   --connect-status --request-id ID               stage/errorCode polling
+#   --hotspot --enable 1|0 [--duration-sec N]      AP fallback control
+#   --autopilot                                     reconnect-first -> AP fallback tick
+#   --connect-run --request-id ID                   internal worker (root only)
+#
+# Design rules approved 2026-09-28 (F-23a):
+#   * reconnect first with a backoff window (5 min) and never report failure during it;
+#   * enter AP fallback when the window expires, when no saved Wi-Fi exists, or on an
+#     explicit request; AP is always password protected and auto-closes after 10 min;
+#   * STA retries are suspended while the AP is up (single radio);
+#   * leave AP when a known network or wired link returns;
+#   * roll back to the previous connection when a new network cannot be brought up.
+#
+# Everything is audited to /var/log/stemm-network-agent.log.
+set -uo pipefail
+
+STATE_DIR=/var/lib/wheeltec/network
+CONNECT_FILE="$STATE_DIR/connect.json"
+HOTSPOT_FILE="$STATE_DIR/hotspot.json"
+GEN_FILE="$STATE_DIR/generation"
+LOG_FILE=/var/log/stemm-network-agent.log
+WIFI_DEV=wlp4s0
+AP_IFACE=wlp4s0
+AP_CON=stemm-hotspot
+AP_GATEWAY=10.42.0.1
+AP_DEFAULT_SEC=600
+RECONNECT_WINDOW_SEC=40        # operator decision 2026-09-28: 300 s -> 40 s
+RECONNECT_BACKOFF="15 30 60 120 240"
+REFRESH_UNIT=demo-control-network-refresh.service
+
+# 2026-09-28 (operator decision A): the fallback AP uses a *fixed per car* SSID and password.
+# A random password (the first implementation) was unusable exactly when the AP matters: the
+# car is offline, so neither the app nor the cloud can tell the operator what to type.  The
+# SSID is derived from the machine id and the password is generated once and kept, so both can
+# be documented, printed on a label, or read on site.
+AP_SECRET_FILE="$STATE_DIR/ap_secret"
+AP_HINT_FILE="$STATE_DIR/ap_hint.txt"
+# 2026-09-28: the state directory is 0700 root-only, so a 0644 file inside it is still
+# unreadable for the operator.  Keep a second copy on a world-readable path.
+AP_HINT_PUBLIC=/etc/stemm-access-point.txt
+
+ap_secret() {
+  mkdir -p "$STATE_DIR"
+  if [ ! -s "$AP_SECRET_FILE" ]; then
+    (umask 077; head -c 9 /dev/urandom | base64 | tr -d '/+=' | head -c 10 > "$AP_SECRET_FILE")
+  fi
+  cat "$AP_SECRET_FILE" 2>/dev/null
+}
+
+ap_ssid() {
+  local tag
+  tag="$(cat /etc/machine-id 2>/dev/null | sha256sum | cut -c1-4 | tr 'a-f' 'A-F')"
+  printf 'STEMM-%s' "${tag:-0000}"
+}
+
+write_ap_hint() {
+  # Intentionally world readable: on-site service reads it from the console or VNC.
+  mkdir -p "$STATE_DIR"
+  local body
+  body="$(printf 'STEMM car access point\nSSID: %s\nPASSWORD: %s\nGateway: %s\nOpens only while the car has no known network; closes after 10 minutes.\n' \
+    "$(ap_ssid)" "$(ap_secret)" "$AP_GATEWAY")"
+  printf '%s' "$body" > "$AP_HINT_FILE" 2>/dev/null || true
+  chmod 0644 "$AP_HINT_FILE" 2>/dev/null || true
+  printf '%s' "$body" > "$AP_HINT_PUBLIC" 2>/dev/null || true
+  chmod 0644 "$AP_HINT_PUBLIC" 2>/dev/null || true
+}
+
+log() {
+  if [ -w "$(dirname "$LOG_FILE")" ]; then
+    printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+}
+
+epoch_ms() { date +%s%3N; }
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+require_root() { [ "$(id -u)" -eq 0 ] || { echo '{"ok":false,"errorCode":"NOT_PERMITTED"}'; exit 1; }; }
+
+# ---------------------------------------------------------------- state helpers
+write_json() {  # $1 = file, $2 = body
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$2" > "$1.tmp" && mv "$1.tmp" "$1" && chmod 600 "$1"
+}
+
+read_connect_field() {
+  [ -f "$CONNECT_FILE" ] || return 1
+  python3 - "$CONNECT_FILE" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    sys.exit(1)
+v = d.get(sys.argv[2])
+print('' if v is None else v)
+PY
+}
+
+next_generation() {
+  local g=0
+  [ -f "$GEN_FILE" ] && g=$(cat "$GEN_FILE" 2>/dev/null || echo 0)
+  g=$((g + 1))
+  mkdir -p "$STATE_DIR"; printf '%s' "$g" > "$GEN_FILE"
+  printf '%s' "$g"
+}
+
+# ------------------------------------------------------------------ NM wrappers
+# 2026-09-28 (live finding from the joint app test): GENERAL.CONNECTION is the *profile
+# name*, and the helper names its own profiles stemm-<requestId> -- so the mini program was
+# shown "stemm-prov-..." instead of the Wi-Fi name and the signal lookup always failed.
+# Read the associated SSID for display; keep the profile name for rollback.
+nm_active_profile() {
+  nmcli -t -f GENERAL.CONNECTION dev show "$WIFI_DEV" 2>/dev/null | cut -d: -f2
+}
+nm_connected_ssid() {
+  local prof ssid
+  prof="$(nm_active_profile)"
+  [ -n "$prof" ] || { printf ''; return; }
+  # 2026-09-28 fix: the authoritative Wi-Fi name is the active profile's own SSID property.
+  # The previous scan-based lookup used the wrong field name ("ACTIVE" instead of "IN-USE"),
+  # so it failed silently and fell back to the profile name -- the hotspot page and the BLE
+  # flow both displayed "stemm-<requestId>" instead of the real network name.
+  ssid="$(nmcli -t -f 802-11-wireless.ssid connection show "$prof" 2>/dev/null | cut -d: -f2)"
+  if [ -z "$ssid" ]; then
+    ssid="$(nmcli -t -f IN-USE,SSID dev wifi 2>/dev/null | awk -F: '$1=="*"{print $2; exit}')"
+  fi
+  [ -n "$ssid" ] || ssid="$prof"
+  printf '%s' "$ssid"
+}
+nm_ipv4() {
+  nmcli -t -f IP4.ADDRESS dev show "$WIFI_DEV" 2>/dev/null | head -1 | cut -d: -f2 | cut -d/ -f1
+}
+nm_signal() {
+  local ssid; ssid="$(nm_connected_ssid)"
+  [ -n "$ssid" ] || { echo "-1"; return; }
+  # 2026-09-28: same field-name fix as above ("IN-USE", not "ACTIVE"); the cached scan list is
+  # all nmcli offers here, so -1 simply means "no recent scan" and the app shows no bars.
+  nmcli -t -f IN-USE,SSID,SIGNAL dev wifi list 2>/dev/null \
+    | awk -F: -v s="$ssid" '$1=="*" || $2==s {print $3; exit}' \
+    | head -1 | grep -E '^[0-9]+$' || echo "-1"
+}
+nm_connectivity() {
+  case "$(nmcli -t -f CONNECTIVITY general status 2>/dev/null)" in
+    full) echo full ;; limited) echo limited ;; portal) echo portal ;;
+    none) echo none ;; *) echo unknown ;;
+  esac
+}
+hotspot_active() {
+  nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx "$AP_CON" && echo true || echo false
+}
+hotspot_ssid() {
+  if [ "$(hotspot_active)" = true ]; then
+    nmcli -t -f 802-11-wireless.ssid connection show "$AP_CON" 2>/dev/null | cut -d: -f2
+  else
+    echo ""
+  fi
+}
+
+cmd_status() {
+  local ssid ip sig conn hs hssid hspass
+  ssid="$(nm_connected_ssid)"; ip="$(nm_ipv4)"; sig="$(nm_signal)"
+  conn="$(nm_connectivity)"; hs="$(hotspot_active)"; hssid="$(hotspot_ssid)"
+  hspass=""
+  [ "$hs" = true ] && hspass="$(ap_secret)"
+  local connected=false
+  [ -n "$ssid" ] && [ "$hs" = false ] && connected=true
+  printf '{"ok":true,"network":{"connected":%s,"ssid":"%s","ipv4":"%s","signalPercent":%s,"connectivity":"%s","hotspotActive":%s,"hotspotSsid":"%s","hotspotPassword":"%s"}}\n' \
+    "$connected" "$(json_escape "$ssid")" "$(json_escape "$ip")" "$sig" "$conn" "$hs" \
+    "$(json_escape "$hssid")" "$(json_escape "$hspass")"
+}
+
+cmd_scan() {
+  # nmcli only lists cached results for an unprivileged user; as root (the real path) ask
+  # for a fresh scan first so the mini program sees the current neighbourhood.
+  nmcli dev wifi rescan >/dev/null 2>&1 || true
+  sleep 3
+  # 2026-09-28: while the car hosts its own AP the single radio cannot scan, so the live list
+  # comes back empty and the app showed "未扫描到 Wi-Fi".  Serve the last good scan instead,
+  # flagged as cached, so the operator can still pick a network by name.
+  SCAN_CACHE="$STATE_DIR/scan_cache.json" python3 - <<'PY'
+import subprocess, json, os
+out = subprocess.run(['nmcli','-t','-f','SSID,SIGNAL,SECURITY','dev','wifi','list'],
+                     capture_output=True, text=True, timeout=25).stdout
+seen, networks = set(), []
+for line in out.splitlines():
+    parts = line.split(':')
+    if len(parts) < 3:
+        continue
+    ssid = parts[0].strip()
+    if not ssid or ssid in seen or ssid == '--':
+        continue
+    try:
+        signal = int(parts[1])
+    except ValueError:
+        continue
+    seen.add(ssid)
+    networks.append({'ssid': ssid, 'signalPercent': signal, 'secured': bool(parts[2].strip())})
+networks.sort(key=lambda n: n['signalPercent'], reverse=True)
+cache_path = os.environ.get('SCAN_CACHE', '')
+result = {'ok': True, 'networks': networks[:40]}
+if networks and cache_path:
+    try:
+        json.dump(result, open(cache_path, 'w', encoding='utf-8'), ensure_ascii=False)
+    except Exception:
+        pass
+printed = False
+if not networks and cache_path and os.path.exists(cache_path):
+    try:
+        cached = json.load(open(cache_path, encoding='utf-8'))
+        if cached.get('networks'):
+            cached['cached'] = True
+            print(json.dumps(cached, ensure_ascii=False))
+            printed = True
+    except Exception:
+        pass
+if not printed:
+    print(json.dumps(result, ensure_ascii=False))
+PY
+}
+
+# ------------------------------------------------------- connect: request + worker
+cmd_connect() {
+  local rid="$1" ssid="$2" password="$3" gen prev
+  if [ -z "$rid" ] || [ -z "$ssid" ]; then
+    printf '{"ok":false,"errorCode":"BAD_REQUEST"}\n'; return
+  fi
+  # idempotency: the same request id returns its current stage
+  if [ "$(read_connect_field requestId 2>/dev/null)" = "$rid" ]; then
+    local stage; stage="$(read_connect_field stage 2>/dev/null)"
+    printf '{"ok":true,"accepted":true,"reused":true,"requestId":"%s","generation":%s,"stage":"%s"}\n' \
+      "$(json_escape "$rid")" "$(cat "$GEN_FILE" 2>/dev/null || echo 0)" "$(json_escape "$stage")"
+    return
+  fi
+  case "$(read_connect_field stage 2>/dev/null)" in
+    accepted|connecting)
+      printf '{"ok":false,"errorCode":"BUSY","requestId":"%s"}\n' "$(json_escape "$(read_connect_field requestId 2>/dev/null)")"
+      return ;;
+  esac
+  gen="$(next_generation)"
+  prev="$(nm_active_profile)"
+  write_json "$CONNECT_FILE" "$(printf '{"requestId":"%s","generation":%s,"ssid":"%s","stage":"accepted","errorCode":"","previousConnection":"%s","requestedAtEpochMs":%s,"updatedAtEpochMs":%s}' \
+    "$(json_escape "$rid")" "$gen" "$(json_escape "$ssid")" "$(json_escape "$prev")" "$(epoch_ms)" "$(epoch_ms)")"
+  log "connect accepted rid=$rid ssid=$ssid gen=$gen previous='$prev'"
+  # detach the worker so the HTTP call returns immediately
+  local passfile="/run/stemm-network-$rid.psk"
+  umask 077; printf '%s' "$password" > "$passfile"
+  systemd-run --unit="stemm-net-connect-$(date +%s)" --collect --quiet \
+    /usr/local/sbin/stemm-network-agent-launch --connect-run --request-id "$rid" >>"$LOG_FILE" 2>&1 \
+    || { log "worker launch failed rid=$rid"
+         write_json "$CONNECT_FILE" "$(printf '{"requestId":"%s","generation":%s,"ssid":"%s","stage":"failed","errorCode":"INTERNAL","previousConnection":"%s","requestedAtEpochMs":%s,"updatedAtEpochMs":%s}' \
+           "$(json_escape "$rid")" "$gen" "$(json_escape "$ssid")" "$(json_escape "$prev")" "$(epoch_ms)" "$(epoch_ms)")"
+         printf '{"ok":false,"errorCode":"INTERNAL"}\n'; return; }
+  printf '{"ok":true,"accepted":true,"reused":false,"requestId":"%s","generation":%s,"stage":"accepted"}\n' \
+    "$(json_escape "$rid")" "$gen"
+}
+
+set_stage() {  # $1 stage, $2 errorCode, $3 extra json fields (optional)
+  local rid ssid gen prev
+  rid="$(read_connect_field requestId 2>/dev/null)"
+  ssid="$(read_connect_field ssid 2>/dev/null)"
+  gen="$(read_connect_field generation 2>/dev/null)"
+  prev="$(read_connect_field previousConnection 2>/dev/null)"
+  write_json "$CONNECT_FILE" "$(printf '{"requestId":"%s","generation":%s,"ssid":"%s","stage":"%s","errorCode":"%s","previousConnection":"%s","requestedAtEpochMs":%s,"updatedAtEpochMs":%s%s}' \
+    "$(json_escape "$rid")" "${gen:-0}" "$(json_escape "$ssid")" "$1" "$(json_escape "$2")" \
+    "$(json_escape "$prev")" "${REQUEST_AT:-$(epoch_ms)}" "$(epoch_ms)" "${3:-}")"
+}
+
+map_nm_error() {  # $1 = nmcli output
+  local text; text="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  case "$text" in
+    *"secrets were required"*|*"wrong password"*|*"802-11-wireless-security"*|*"not authorized"*) echo AUTH_FAILED ;;
+    *"no network with ssid"*|*"not found"*|*"no suitable"*) echo NETWORK_NOT_FOUND ;;
+    *"timeout"*|*"timed out"*) echo ASSOCIATION_TIMEOUT ;;
+    *"ip configuration"*|*"dhcp"*|*"could not activate"*) echo DHCP_FAILED ;;
+    *) echo ASSOCIATION_TIMEOUT ;;
+  esac
+}
+
+run_connect_worker() {
+  local rid="$1" ssid password passfile con out rc code
+  require_root
+  ssid="$(read_connect_field ssid 2>/dev/null)"
+  passfile="/run/stemm-network-$rid.psk"
+  password="$(cat "$passfile" 2>/dev/null || echo '')"
+  con="stemm-$rid"
+  log "worker start rid=$rid ssid=$ssid"
+
+  set_stage connecting ""
+  # 2026-09-28 (live case): the operator sent "HuaNanHuNo.1-5G" (hyphen) while the real SSID is
+  # "HuaNanHuNo.1_5G" (underscore).  The car burned ~40 s on a doomed association and the app
+  # then mis-read the still-online car as "reconnected".  Fail fast with the documented code
+  # when the SSID is neither currently visible nor known from a saved profile.
+  if ! nmcli -t -f SSID dev wifi list 2>/dev/null | grep -Fxq "$ssid"; then
+    local known=0 cand sid
+    while IFS= read -r cand; do
+      [ -n "$cand" ] || continue
+      sid="$(nmcli -t -f 802-11-wireless.ssid connection show "$cand" 2>/dev/null | cut -d: -f2)"
+      [ "$sid" = "$ssid" ] && { known=1; break; }
+    done <<EOF
+$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $1}')
+EOF
+    if [ "$known" -eq 0 ]; then
+      log "ssid '$ssid' is neither visible nor saved -> NETWORK_NOT_FOUND"
+      set_stage failed "NETWORK_NOT_FOUND"; rm -f "$passfile"; return
+    fi
+  fi
+  # 2026-09-28: reuse an existing profile for this SSID.  Creating a fresh stemm-<requestId>
+  # profile on every provisioning left the car with several profiles for one network (the
+  # joint test produced stemm-prov-... alongside HuaNanHuNo.1_5G).
+  local existing="" cand sid pass
+  for pass in 1 2; do
+    while IFS= read -r cand; do
+      [ -n "$cand" ] || continue
+      case "$cand" in
+        stemm-*) [ "$pass" = 1 ] && continue ;;   # prefer a human-named profile first
+      esac
+      sid="$(nmcli -t -f 802-11-wireless.ssid connection show "$cand" 2>/dev/null | cut -d: -f2)"
+      if [ "$sid" = "$ssid" ]; then existing="$cand"; break; fi
+    done <<EOF
+$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $1}')
+EOF
+    [ -n "$existing" ] && break
+  done
+  if [ -n "$existing" ]; then
+    con="$existing"
+    log "reusing profile '$con' for ssid=$ssid"
+    if [ -n "$password" ]; then
+      nmcli con modify "$con" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$password" >/dev/null 2>&1 || true
+    fi
+    nmcli con up "$con" >/dev/null 2>&1 || true   # refresh in case the PSK changed
+  else
+    nmcli con delete "$con" >/dev/null 2>&1 || true
+    if [ -n "$password" ]; then
+      out="$(nmcli con add type wifi con-name "$con" ifname "$WIFI_DEV" ssid "$ssid" \
+               wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$password" connection.autoconnect no 2>&1)" || rc=$?
+    else
+      out="$(nmcli con add type wifi con-name "$con" ifname "$WIFI_DEV" ssid "$ssid" \
+               connection.autoconnect no 2>&1)" || rc=$?
+    fi
+  fi
+  if [ "${rc:-0}" -ne 0 ]; then
+    code="$(map_nm_error "$out")"; log "con add failed: $out"
+    nmcli con delete "$con" >/dev/null 2>&1 || true
+    set_stage failed "$code"; rm -f "$passfile"; return
+  fi
+
+  rc=0
+  out="$(timeout 45 nmcli --wait 40 con up "$con" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    code="$(map_nm_error "$out")"; log "con up failed rc=$rc: $out"
+    nmcli con delete "$con" >/dev/null 2>&1 || true
+    # roll back to the previous network so the car is not left offline
+    local prev; prev="$(read_connect_field previousConnection 2>/dev/null)"
+    # 2026-09-28: hold the stage at rolling_back until the rollback finishes.  With 'failed'
+    # published first, the autopilot stopped treating this as an active provisioning, saw a
+    # momentarily disconnected device and opened the AP right on top of the rollback.
+    set_stage rolling_back ""
+    if [ -n "$prev" ] && [ "$prev" != "--" ]; then
+      log "rolling back to '$prev'"
+      timeout 30 nmcli con up "$prev" >/dev/null 2>&1 || log "rollback to '$prev' failed"
+    fi
+    set_stage failed "$code"; rm -f "$passfile"; return
+  fi
+
+  nmcli con modify "$con" connection.autoconnect yes >/dev/null 2>&1 || true
+  set_stage connected ""
+  local ip; ip="$(nm_ipv4)"
+  log "connected rid=$rid ssid=$ssid ip=$ip"
+
+  # business + cloud recovery (reuse the existing hook)
+  systemctl start "$REFRESH_UNIT" >/dev/null 2>&1 || log "refresh unit start failed"
+  sleep 5
+  local conn; conn="$(nm_connectivity)"
+  if [ "$conn" = none ]; then
+    log "connected but no connectivity -> ROLLED_BACK"
+    set_stage failed NO_INTERNET
+  else
+    set_stage cloud_recovered ""
+    sleep 2
+    set_stage completed ""
+    log "connect completed rid=$rid ssid=$ssid connectivity=$conn"
+  fi
+  rm -f "$passfile"
+}
+
+cmd_connect_status() {
+  local rid="$1"
+  if [ ! -f "$CONNECT_FILE" ]; then
+    printf '{"ok":false,"errorCode":"UNKNOWN_REQUEST"}\n'; return
+  fi
+  local cur stage code gen
+  cur="$(read_connect_field requestId 2>/dev/null)"; stage="$(read_connect_field stage 2>/dev/null)"
+  code="$(read_connect_field errorCode 2>/dev/null)"; gen="$(read_connect_field generation 2>/dev/null)"
+  if [ -n "$rid" ] && [ "$rid" != "$cur" ]; then
+    printf '{"ok":false,"requestId":"%s","generation":%s,"errorCode":"UNKNOWN_REQUEST"}\n' "$(json_escape "$rid")" "${gen:-0}"
+    return
+  fi
+  if [ "$stage" = failed ]; then
+    printf '{"ok":false,"requestId":"%s","generation":%s,"errorCode":"%s","stage":"failed"}\n' \
+      "$(json_escape "$cur")" "${gen:-0}" "$(json_escape "$code")"
+  else
+    printf '{"ok":true,"requestId":"%s","generation":%s,"stage":"%s"}\n' "$(json_escape "$cur")" "${gen:-0}" "$(json_escape "$stage")"
+  fi
+}
+
+# ------------------------------------------------------------------ AP fallback
+cmd_hotspot() {
+  local enable="$1" duration="$2" ssid pass expires
+  require_root
+  if [ "$enable" = "0" ]; then
+    nmcli con down "$AP_CON" >/dev/null 2>&1 || true
+    nmcli con delete "$AP_CON" >/dev/null 2>&1 || true
+    rm -f "$HOTSPOT_FILE"
+    log "hotspot disabled"
+    printf '{"ok":true,"hotspotActive":false}\n'
+    return
+  fi
+  if [ "$(hotspot_active)" = true ]; then
+    ssid="$(hotspot_ssid)"
+    pass="$(ap_secret)"
+    write_ap_hint
+    expires="$(python3 -c "import json;print(json.load(open('$HOTSPOT_FILE')).get('expiresAtEpochMs',0))" 2>/dev/null || echo 0)"
+    printf '{"ok":true,"hotspotSsid":"%s","hotspotPassword":"%s","ipv4":"%s","expiresAtEpochMs":%s,"reused":true}\n' \
+      "$(json_escape "$ssid")" "$(json_escape "$pass")" "$AP_GATEWAY" "${expires:-0}"
+    return
+  fi
+  [ "$duration" -gt 0 ] 2>/dev/null || duration=$AP_DEFAULT_SEC
+  ssid="$(ap_ssid)"
+  pass="$(ap_secret)"
+  write_ap_hint
+  expires=$(( $(date +%s) * 1000 + duration * 1000 ))
+  nmcli con delete "$AP_CON" >/dev/null 2>&1 || true
+  # 2026-09-28 (iPhone cannot join, root-caused): this host has no hostapd, so the AP is
+  # served by wpa_supplicant's AP mode, and its log says "nl80211 driver interface is not
+  # designed to be used with ap_scan=2; this can result in connection failures".  Pin the
+  # crypto suite and the channel instead of leaving them to auto-negotiation, which is the
+  # part iOS is picky about.  Installing hostapd (the proper fix) makes NetworkManager use
+  # it automatically; these settings stay correct in both cases.
+  if ! nmcli con add type wifi ifname "$AP_IFACE" con-name "$AP_CON" autoconnect no ssid "$ssid" \
+        802-11-wireless.mode ap 802-11-wireless.band bg 802-11-wireless.channel 6 \
+        802-11-wireless-security.key-mgmt wpa-psk \
+        802-11-wireless-security.proto rsn 802-11-wireless-security.pairwise ccmp \
+        802-11-wireless-security.group ccmp 802-11-wireless-security.pmf 1 \
+        ipv4.method shared \
+        802-11-wireless-security.psk "$pass" >/dev/null 2>&1; then
+    log "hotspot add failed"; printf '{"ok":false,"errorCode":"HOTSPOT_FAILED"}\n'; return
+  fi
+  # 2026-09-28 (live finding): the first implementation reported success as soon as
+  # "nmcli con up" returned 0, but the AP never actually served — the station profile's
+  # autoconnect won the race for the only radio (the car was seen with no network at all
+  # and hotspotActive=false six seconds after a "successful" enable).  Release the radio
+  # first, retry once, and only report ok after the AP is verifiably active.
+  nmcli dev disconnect "$WIFI_DEV" >/dev/null 2>&1 || true
+  sleep 2
+  local up=0 attempt
+  for attempt in 1 2; do
+    if timeout 30 nmcli con up "$AP_CON" >/dev/null 2>&1; then
+      local wait_i
+      for wait_i in 1 2 3 4 5 6; do
+        sleep 2
+        if [ "$(hotspot_active)" = true ]; then up=1; break; fi
+      done
+    fi
+    [ "$up" = 1 ] && break
+    log "hotspot attempt $attempt did not become active; retrying"
+    nmcli con down "$AP_CON" >/dev/null 2>&1 || true
+    sleep 2
+  done
+  if [ "$up" != 1 ]; then
+    nmcli con delete "$AP_CON" >/dev/null 2>&1 || true
+    log "hotspot verification failed: the AP never became active"
+    printf '{"ok":false,"errorCode":"HOTSPOT_FAILED"}\n'
+    return
+  fi
+  write_json "$HOTSPOT_FILE" "$(printf '{"ssid":"%s","password":"%s","ipv4":"%s","manual":%s,"expiresAtEpochMs":%s,"startedAtEpochMs":%s}' \
+    "$(json_escape "$ssid")" "$(json_escape "$pass")" "$AP_GATEWAY" "${HOTSPOT_MANUAL:-false}" "$expires" "$(epoch_ms)")"
+  log "hotspot enabled ssid=$ssid duration=${duration}s (fixed credential)"
+  printf '{"ok":true,"hotspotSsid":"%s","hotspotPassword":"%s","ipv4":"%s","expiresAtEpochMs":%s}\n' \
+    "$(json_escape "$ssid")" "$(json_escape "$pass")" "$AP_GATEWAY" "$expires"
+}
+
+# rule 1-4 of F-23a: reconnect first, AP only when the window is exhausted
+cmd_autopilot() {
+  require_root
+  mkdir -p "$STATE_DIR"
+  # Safety: never race an in-flight provisioning request.  The connect worker owns the
+  # radio until it reaches a terminal stage.
+  case "$(read_connect_field stage 2>/dev/null)" in
+    accepted|connecting|rolling_back)
+      log "autopilot: provisioning in progress (stage=$(read_connect_field stage 2>/dev/null)) -> skipping this tick"
+      return ;;
+  esac
+  # 2026-09-28 (live bug, confirmed in the NetworkManager journal): the autopilot must never
+  # treat an in-flight activation as "stranded".  During the app's provisioning the device sits
+  # in config/need-auth with no IPv4 yet; combined with a window start left over from the
+  # previous offline spell (elapsed = tens of minutes), the autopilot opened the AP and killed
+  # the activation ("config -> deactivating (user-requested)"), so the car dropped the Wi-Fi it
+  # had just joined and kept looping.  While the device is busy, do nothing.
+  local devstate
+  devstate="$(nmcli -t -f STATE dev show "$WIFI_DEV" 2>/dev/null | cut -d: -f2)"
+  case "$devstate" in
+    *connect*|*config*|*prepare*|*need-auth*|*deactivat*)
+      logger -t stemm-network-agent "autopilot: device busy ($devstate) -> skipping this tick"
+      return ;;
+  esac
+  local attempt_file="$STATE_DIR/reconnect.json" attempt=0 first=0 now connected
+  if [ -f "$attempt_file" ]; then
+    attempt="$(python3 -c "import json;print(json.load(open('$attempt_file')).get('attempt',0))" 2>/dev/null || echo 0)"
+    first="$(python3 -c "import json;print(json.load(open('$attempt_file')).get('firstAtEpochMs',0))" 2>/dev/null || echo 0)"
+  fi
+  now="$(epoch_ms)"
+  # 2026-09-28 (live finding): with the fallback AP up, the device's own IPv4 address IS
+  # 10.42.0.1, so the previous "[ -n nm_ipv4 ] => connected" test convinced the autopilot that
+  # a known network had come back and it closed the AP roughly 20 s after opening it -- the
+  # operator never saw the hotspot, and the car drifted onto another saved network.  Connected
+  # now means: an active profile that is NOT the AP, with an IPv4 address.
+  connected=false
+  if [ "$(nm_active_profile)" != "$AP_CON" ] && [ -n "$(nm_ipv4)" ]; then
+    connected=true
+  fi
+
+  if [ "$connected" = true ]; then
+    if [ "$(hotspot_active)" = true ]; then
+      local manual; manual="$(python3 -c "import json;print(json.load(open('$HOTSPOT_FILE')).get('manual',False))" 2>/dev/null || echo False)"
+      if [ "$manual" != "True" ]; then
+        log "autopilot: known network is back -> closing the fallback hotspot"
+        cmd_hotspot 0 0 >/dev/null
+      fi
+    fi
+    rm -f "$attempt_file"
+    return
+  fi
+
+  # hotspot bookkeeping: auto-close when it expires
+  if [ "$(hotspot_active)" = true ]; then
+    # 2026-09-28: never let a reconnect-window timestamp survive an AP session.  The AP was up
+    # for minutes while the car was legitimately "not connected" (it WAS the AP), so 'first'
+    # stayed ancient; the first transient disconnection afterwards then satisfied the window
+    # instantly and re-opened the AP on top of a provisioning rollback (elapsed=262s in the
+    # live log).  While the AP is serving, the window is meaningless -> start it fresh.
+    rm -f "$attempt_file"
+    local expires; expires="$(python3 -c "import json;print(json.load(open('$HOTSPOT_FILE')).get('expiresAtEpochMs',0))" 2>/dev/null || echo 0)"
+    if [ "${expires:-0}" -gt 0 ] && [ "$now" -ge "$expires" ]; then
+      log "autopilot: hotspot expired -> closing"
+      logger -t stemm-network-agent "autopilot: AP expired -> closing"
+      cmd_hotspot 0 0 >/dev/null
+      rm -f "$attempt_file"   # 2026-09-28: the next offline spell gets its own window
+    fi
+    return   # STA retries are suspended while the AP is up (single radio)
+  fi
+
+  [ "$first" -gt 0 ] || first="$now"
+  attempt=$((attempt + 1))
+  write_json "$attempt_file" "$(printf '{"attempt":%s,"firstAtEpochMs":%s,"updatedAtEpochMs":%s}' "$attempt" "$first" "$now")"
+
+  local saved; saved="$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $1}' | grep -vx "$AP_CON" | wc -l)"
+  local elapsed=$(( (now - first) / 1000 ))
+
+  if [ "$elapsed" -ge "$RECONNECT_WINDOW_SEC" ] || [ "$saved" -eq 0 ]; then
+    log "autopilot: reconnect window exhausted (${elapsed}s, saved=$saved) -> enabling AP fallback"
+    logger -t stemm-network-agent "autopilot: stranded (elapsed=${elapsed}s saved=$saved) -> opening AP"
+    HOTSPOT_MANUAL=false cmd_hotspot 1 "$AP_DEFAULT_SEC" >/dev/null
+    # 2026-09-28: start a fresh window for the NEXT offline spell.  Without this the old
+    # timestamp survived the whole AP session, so the first transient disconnection afterwards
+    # (e.g. a provisioning switch) satisfied the window instantly and re-opened the AP.
+    rm -f "$attempt_file"
+    return
+  fi
+  # keep trying the saved networks with the documented backoff
+  local idx=$(( attempt - 1 )); [ "$idx" -gt 4 ] && idx=4
+  local delay; delay="$(echo "$RECONNECT_BACKOFF" | cut -d' ' -f$((idx + 1)))"
+  log "autopilot: reconnect attempt $attempt (${elapsed}s into the ${RECONNECT_WINDOW_SEC}s window, next in ${delay}s)"
+  timeout 20 nmcli dev wifi rescan >/dev/null 2>&1 || true
+  timeout "$delay" nmcli --wait "$delay" dev connect "$WIFI_DEV" >/dev/null 2>&1 || true
+}
+
+# ------------------------------------------------------------------------ main
+require_root
+ACTION=""; REQUEST_ID=""; SSID=""; PASSWORD=""; ENABLE=""; DURATION=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status) ACTION=status; shift ;;
+    --scan) ACTION=scan; shift ;;
+    --connect) ACTION=connect; shift ;;
+    --connect-run) ACTION=connect_run; shift ;;
+    --connect-status) ACTION=connect_status; shift ;;
+    --hotspot) ACTION=hotspot; shift ;;
+    --autopilot) ACTION=autopilot; shift ;;
+    --request-id) REQUEST_ID="${2:-}"; shift 2 ;;
+    --ssid) SSID="${2:-}"; shift 2 ;;
+    --password) PASSWORD="${2:-}"; shift 2 ;;
+    --enable) ENABLE="${2:-}"; shift 2 ;;
+    --duration-sec) DURATION="${2:-0}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+case "$ACTION" in
+  status) cmd_status ;;
+  scan) cmd_scan ;;
+  connect) cmd_connect "$REQUEST_ID" "$SSID" "$PASSWORD" ;;
+  connect_run) run_connect_worker "$REQUEST_ID" ;;
+  connect_status) cmd_connect_status "$REQUEST_ID" ;;
+  hotspot) cmd_hotspot "$ENABLE" "$DURATION" ;;
+  autopilot) cmd_autopilot ;;
+  *) printf '{"ok":false,"errorCode":"BAD_REQUEST"}\n' ;;
+esac

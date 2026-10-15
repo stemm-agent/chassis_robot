@@ -1,0 +1,46 @@
+#!/bin/bash
+# STEMM core 自动分析（2026-09-29）
+# 扫描 /home/hnh/nav-crashes/core.*，对每个尚未分析的 core 生成 gdb 回溯报告并压缩保存。
+# 由 stemm-coredump-analyze.timer 每 2 分钟调用一次。
+set +u
+
+DIR=/home/hnh/nav-crashes
+LOG="$DIR/analyze.log"
+MIN_BYTES=1024      # 太小的 core 视为损坏，跳过
+
+[ -d "$DIR" ] || exit 0
+cd "$DIR" || exit 0
+
+for core in core.*; do
+  [ -f "$core" ] || continue
+  case "$core" in
+    *.gz|*.txt) continue ;;
+  esac
+  size=$(stat -c %s "$core" 2>/dev/null || echo 0)
+  [ "$size" -ge "$MIN_BYTES" ] || continue
+  report="$core.report.txt"
+  [ -f "$report" ] && continue
+
+  {
+    echo "=== STEMM core report $(date -Is) ==="
+    echo "core=$core size=$size"
+    echo
+    if command -v gdb >/dev/null 2>&1; then
+      gdb -q -batch \
+        -ex 'set pagination off' \
+        -ex 'set print frame-arguments none' \
+        -ex 'info threads' \
+        -ex 'thread apply all bt' \
+        --core "$core" 2>&1
+    else
+      echo "(gdb 不可用)"
+    fi
+  } > "$report" 2>&1
+  chmod 0640 "$report" 2>/dev/null
+
+  # 压缩 core 省空间（保留报告）
+  gzip -9 "$core" 2>/dev/null
+
+  echo "$(date -Is) analyzed $core -> $report ($size bytes)" >> "$LOG"
+done
+exit 0
