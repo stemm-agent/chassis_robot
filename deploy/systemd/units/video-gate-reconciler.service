@@ -1,0 +1,10 @@
+[Unit]
+Description=STEMM Video Gate Reconciler (release orphaned SIGSTOP on video pipeline)
+Documentation=file:///usr/local/bin/video_gate_reconciler.sh
+After=network.target
+
+[Service]
+Type=oneshot
+# Only ever sends SIGCONT to already-stopped video pipeline processes.
+ExecStart=/usr/local/bin/video_gate_reconciler.sh
+Nice=5

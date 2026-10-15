@@ -1,0 +1,8 @@
+[Unit]
+Description=STEMM core dump analyzer (gdb backtrace for nav container crashes)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/stemm-coredump-analyze
+Nice=10

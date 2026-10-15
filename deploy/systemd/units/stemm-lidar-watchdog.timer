@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the resident LiDAR watchdog every 10 s
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=10s
+AccuracySec=2s
+Unit=stemm-lidar-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=STEMM Astra S Headless Camera
+Wants=wheeltec-robot.service
+After=wheeltec-robot.service systemd-udev-settle.service
+ConditionPathExists=/dev/astra_s
+
+[Service]
+Type=simple
+User=hnh
+Environment=HOME=/home/hnh
+Environment=WORKSPACE_ROOT=/home/hnh/wheeltec_ros2
+WorkingDirectory=/home/hnh/wheeltec_ros2
+ExecStart=/opt/demo-control/deploy/nuc/start_astra_camera.sh
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Wheeltec Body Follow Nav2 Launch
+Wants=wheeltec-robot.service stemm-astra-camera.service
+After=network.target wheeltec-robot.service stemm-astra-camera.service
+
+[Service]
+Nice=-5
+Type=simple
+User=hnh
+Environment=HOME=/home/hnh
+Environment=WORKSPACE_ROOT=/home/hnh/wheeltec_ros2
+Environment=BODYFOLLOW_START_DELAY=5
+WorkingDirectory=/home/hnh/wheeltec_ros2
+ExecStart=/opt/demo-control/deploy/nuc/start_bodyfollow_nav2.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

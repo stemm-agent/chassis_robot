@@ -1,0 +1,17 @@
+[Unit]
+Description=STEMM BLE provisioning channel (parallel to the Wi-Fi AP fallback)
+Documentation=file:///etc/stemm-ble-provision.txt
+After=bluetooth.service
+Wants=bluetooth.service
+# Deliberately independent of NetworkManager and of stemm-network-autopilot: this channel must
+# work while the car has no network at all, and it must never influence the Wi-Fi path.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/stemm-ble-provision
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Wheeltec LiDAR resident driver (single owner of /dev/wheeltec_lidar)
+After=network.target
+# Nothing may start the LiDAR except this unit: navigation and the body-follow
+# stack only consume /scan, and mapping requires this unit to be stopped first.
+
+[Service]
+Type=simple
+User=hnh
+WorkingDirectory=/home/hnh/wheeltec_ros2
+Environment=HOME=/home/hnh
+Environment=ROS_DOMAIN_ID=0
+Environment=ROS_LOCALHOST_ONLY=0
+ExecStart=/home/hnh/wheeltec_lidar_service.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=25
+
+[Install]
+WantedBy=multi-user.target

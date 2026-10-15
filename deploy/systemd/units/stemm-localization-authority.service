@@ -1,0 +1,14 @@
+[Unit]
+Description=STEMM localization authority contract adaptor (limiter health -> nav2 readiness contract)
+After=network.target
+
+[Service]
+Type=simple
+User=hnh
+Environment=HOME=/home/hnh
+ExecStart=/home/hnh/stemm_localization_authority/run_adaptor.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

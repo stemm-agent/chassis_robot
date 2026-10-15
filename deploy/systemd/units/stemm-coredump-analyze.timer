@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the STEMM core dump analyzer every 2 minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=stemm-coredump-analyze.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=Wheeltec Mic ROS2 Launch Stack
+After=network.target
+
+[Service]
+Type=simple
+User=hnh
+WorkingDirectory=/opt/demo-control
+Environment=APP_ROOT=/opt/demo-control
+Environment=MIC_INIT_DELAY=3
+ExecStart=/opt/demo-control/deploy/nuc/start_wheeltec_mic.sh
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

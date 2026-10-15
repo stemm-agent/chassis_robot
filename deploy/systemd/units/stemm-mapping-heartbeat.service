@@ -1,0 +1,8 @@
+[Unit]
+Description=STEMM cartographer session heartbeat (keep a live session file fresh for the leftover killer)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/stemm-mapping-heartbeat
+Nice=10

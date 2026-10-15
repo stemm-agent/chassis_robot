@@ -1,0 +1,8 @@
+[Unit]
+Description=STEMM nav2 stale-process sweeper (a stopped navigation must leave nothing behind)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/stemm-nav2-stale-sweeper
+Nice=5

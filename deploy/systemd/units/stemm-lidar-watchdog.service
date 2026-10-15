@@ -1,0 +1,6 @@
+[Unit]
+Description=Resident LiDAR watchdog (single device-handover check)
+
+[Service]
+Type=oneshot
+ExecStart=/home/hnh/stemm-lidar-watchdog.sh

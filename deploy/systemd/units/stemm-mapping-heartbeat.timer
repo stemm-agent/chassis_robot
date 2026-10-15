@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the STEMM cartographer session heartbeat every 5 s
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=5s
+AccuracySec=1s
+Unit=stemm-mapping-heartbeat.service
+
+[Install]
+WantedBy=timers.target

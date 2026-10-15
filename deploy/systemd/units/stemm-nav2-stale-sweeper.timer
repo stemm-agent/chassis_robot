@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the STEMM nav2 stale-process sweeper every 15 s
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=15s
+AccuracySec=5s
+Unit=stemm-nav2-stale-sweeper.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,30 @@
+[Unit]
+Description=STEMM Video Stream Gate (pause video push while body follow is active)
+After=network.target wheeltec-robot.service
+Wants=bodyfollow-nav2.service
+
+[Service]
+Type=simple
+User=hnh
+Environment=HOME=/home/hnh
+Environment=ROS_DOMAIN_ID=0
+Environment=STEMM_VIDEO_GATE_STATE_DIR=/run/stemm-video-gate
+# systemd creates /run/stemm-video-gate owned by the service user, so the node
+# can persist its "paused" marker across a hard kill of this unit.
+RuntimeDirectory=stemm-video-gate
+RuntimeDirectoryMode=0755
+WorkingDirectory=/home/hnh
+# Fault tolerance: release any video pipeline process left SIGSTOPped by a
+# previous gate instance that was killed hard, so the unit always starts from a
+# clean state. Only sends SIGCONT to already-stopped video processes.
+ExecStartPre=+/usr/local/bin/video_gate_reconciler.sh --boot
+ExecStart=/bin/bash -lc 'set +u; . /opt/ros/humble/setup.bash; . /home/hnh/wheeltec_ros2/install/setup.bash; exec /usr/bin/python3 /usr/local/bin/video_stream_gate.py'
+# Fallback: when the unit stops normally, resume anything still SIGSTOPped.
+ExecStopPost=+/usr/local/bin/video_gate_reconciler.sh --force
+Restart=always
+RestartSec=5
+KillMode=process
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

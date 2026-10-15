@@ -1,0 +1,13 @@
+[Unit]
+Description=STEMM restore GNOME Remote Desktop credentials after autologin
+After=graphical.target display-manager.service
+Wants=graphical.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/stemm-vnc-bootstrap
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+[Install]
+WantedBy=graphical.target
