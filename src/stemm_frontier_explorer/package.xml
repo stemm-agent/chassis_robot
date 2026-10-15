@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>stemm_frontier_explorer</name>
+  <version>0.1.0</version>
+  <description>
+    Grid-based frontier selection for STEMM cartographer exploration.
+    Replaces the wheeltec_robot_rrt random-sampling chain with deterministic
+    frontier clustering, distance-field clearance scoring and explicit
+    "no frontier available" reporting.
+  </description>
+  <maintainer email="stemm@example.com">stemm</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

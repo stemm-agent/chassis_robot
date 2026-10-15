@@ -9,12 +9,24 @@
   <BehaviorTree ID="MainTree">
     <RecoveryNode number_of_retries="6" name="NavigateRecovery">
       <PipelineSequence name="NavigateWithReplanning">
-        <RateController hz="0.05" name="RateControllerComputePathToPose">
+        <!-- 2026-10-07 (fix A): 0.05 Hz meant a replan was allowed only once every 20 s. -->
+        <RateController hz="2.0" name="RateControllerComputePathToPose">
           <RecoveryNode number_of_retries="1" name="ComputePathToPose">
             <Fallback name="ComputePathIfNeeded">
               <ReactiveSequence name="UseCurrentPathIfValid">
                 <Inverter>
                   <GlobalUpdatedGoal/>
+                </Inverter>
+                <!-- 2026-10-07 (fix A): a collision-free path that no longer leads to the goal
+                     used to be reused forever (probe: one path, 42 s, robot 1.7 m past its end,
+                     14 failed recoveries).  PathExpiringTimer returns FAILURE while the path is
+                     fresh and SUCCESS once it is older than N seconds, so with this Inverter the
+                     condition "the path is still fresh" must hold to keep the current path;
+                     otherwise ComputePathToPose runs and the plan is regenerated from the
+                     robot's CURRENT pose.  Wiring copied from nav2's reference tree
+                     nav_to_pose_with_consistent_replanning_and_if_path_becomes_invalid.xml. -->
+                <Inverter>
+                  <PathExpiringTimer seconds="15" path="{path}"/>
                 </Inverter>
                 <IsPathValid path="{path}"/>
               </ReactiveSequence>

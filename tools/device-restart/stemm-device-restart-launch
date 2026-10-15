@@ -1,0 +1,615 @@
+#!/usr/bin/env bash
+# STEMM device-restart executor (car side) -- v2  2026-10-08
+#
+# Operator decision 2026-10-08:
+#   1) service set: the 10 services below PLUS video-stream-gate + stemm-astra-camera
+#   2) do NOT auto-relaunch the navigation stack (wheeltec_nav2) after the restart
+#   3) mosquitto is stopped FIRST and started FIRST (shortest MQTT outage)
+#   4) cleanup is limited to deterministic-safe actions:
+#        - stale launch locks (owner pid provably dead)
+#        - zombie notification (SIGCHLD to the parent, never kill the zombie)
+#        - orphan component containers (process-group leader provably dead)
+#
+# Unchanged contract with /opt/demo-control/server/index.js:
+#   * invoked as: sudo -n /usr/local/sbin/stemm-device-restart-launch --idempotency-key restart-xxxxxxxx
+#   * request role prints ONE json object within the 6000 ms execFile timeout
+#   * state file /var/lib/wheeltec/device-restart/state.json, scope "service_stack"
+#   * worker detached through systemd-run so it survives demo-control being restarted
+set -uo pipefail
+
+STATE_DIR=/var/lib/wheeltec/device-restart
+STATE_FILE="$STATE_DIR/state.json"
+LOG_FILE=/var/log/stemm-device-restart.log
+WORKER_TAG=stemm-device-restart
+DEVICE_ID=robot-001
+# Request-role timing budget: the server runs this with a 6000 ms execFile timeout
+# (server/index.js requestDeviceRestart).  Everything slow must stay in the worker role,
+# otherwise the HTTP call fails with DEVICE_RESTART_UNAVAILABLE even though the restart
+# itself proceeds (observed 2026-10-08 13:53: the direct call worked, the HTTP call did not).
+REQUEST_ROLE_BUDGET_MS=5800
+
+# ---------------------------------------------------------------- service set
+# STOP order (top of the stack first, so nothing is orphaned mid-flight).
+# START order is the exact reverse, except mosquitto which is pinned first.
+STOP_ORDER=(
+  mosquitto.service                     # 3) stop first: shortest MQTT outage
+  demo-control.service                  # the HTTP/WS surface the app talks to
+  launch-mqtt-bridge.service            # parent of the wheeltec_nav2 launch
+  bodyfollow-nav2.service
+  wheeltec-mic.service
+  wheeltec-recharge-manager.service
+  low-battery-auto-recharge.service
+  video-stream-gate.service
+  stemm-astra-camera.service
+  device-reporter.service
+  wheeltec-robot.service
+  robot-agent.service
+)
+MANAGED_SERVICES=("${STOP_ORDER[@]}")
+
+# readiness probes (health block consumed by the mini program)
+AGENT_URL=http://127.0.0.1:8001/api/status
+CONTROL_URL=http://127.0.0.1:3000/api/status
+NAV_MQTT_TOPIC=robot/robot-001/launch/command
+NAV_LOCK_PATH=/tmp/wheeltec_nav2_launch.lock
+JOURNAL_LOCKS=(
+  /tmp/wheeltec_nav2_launch.lock          # {"owner":..., "pid": <bridge pid>}
+  /tmp/wheeltec_nav2-1000.launch.lock     # <ros2 launch pid>
+)
+
+log() {
+  if [ -w "$LOG_FILE" ]; then
+    printf '%s %s\n' "$(date -Is)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+}
+
+epoch_ms() { date +%s%3N; }
+boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\n'; }
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\n')"
+
+# ---------------------------------------------------------------- state helpers
+write_state() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$1" > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+  chmod 644 "$STATE_FILE"
+}
+
+read_field() {
+  [ -f "$STATE_FILE" ] || return 1
+  python3 - "$STATE_FILE" "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    sys.exit(1)
+value = data.get(sys.argv[2])
+if value is None:
+    print('')
+elif isinstance(value, bool):
+    print('true' if value else 'false')
+else:
+    print(value)
+PY
+}
+
+# $1 rid, $2 state, $3 phase, $4 err, $5 health_json, $6 started, $7 req, $8 fin, $9 cleanup
+state_object() {
+  local rid="$1" state="$2" phase="$3" err="$4" health="$5" started="$6" req="$7" fin="$8" clean="${9:-null}"
+  [ -n "${BOOT_ID:-}" ] || BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null | tr -d '\n')"
+  # deviceId is included so the mini program's restart-identity guard
+  # (isDeviceRestartComplete: status.deviceId === expectedDeviceId) has an explicit value
+  # instead of relying on normalizeDeviceRestartStatus filling it in.
+  printf '{"restartId":"%s","deviceId":"%s","scope":"service_stack","state":"%s","phase":"%s","requestedAtEpochMs":%s,"startedAtEpochMs":%s,"updatedAtEpochMs":%s,"finishedAtEpochMs":%s,"bootIdBefore":"%s","bootIdAfter":"%s","lastErrorCode":"%s","health":%s,"cleanup":%s}' \
+    "$(json_escape "$rid")" "$(json_escape "$DEVICE_ID")" "$state" "$(json_escape "$phase")" "$req" "$started" "$(epoch_ms)" \
+    "$fin" "$BOOT_ID" "$BOOT_ID" "$(json_escape "$err")" "$health" "$clean"
+}
+
+HEALTH_NOT_READY='{"ready":false,"managedServicesReady":false,"robotAgentReady":false,"featureStatusReady":false,"navigationReady":false}'
+
+# ------------------------------------------------------- zero-velocity evidence
+# Must stay inside the request-role budget: the first version waited a fixed 1.2 s, which
+# after a cold ROS discovery could yield ZERO samples, and the caller then retried (observed
+# in the 2026-10-08 13:53 log: samples=0 refused, then samples=7 accepted).  Now it returns
+# as soon as 6 samples are in, and only waits up to 2.6 s.
+velocity_ok() {
+  local out
+  out=$(timeout 7 bash -c '
+    source /opt/ros/humble/setup.bash 2>/dev/null
+    source /home/hnh/wheeltec_ros2/install/setup.bash 2>/dev/null
+    export ROS_DOMAIN_ID=0 FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+    timeout 6 python3 - <<PY 2>/dev/null
+import time
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+rclpy.init()
+node = rclpy.create_node("stemm_zero_velocity_probe")
+seen = []
+def cb(msg):
+    t = msg.twist.twist
+    seen.append((abs(t.linear.x), abs(t.linear.y), abs(t.angular.z)))
+node.create_subscription(Odometry, "/odom_combined", cb, 10)
+deadline = time.time() + 2.6
+while time.time() < deadline:
+    rclpy.spin_once(node, timeout_sec=0.1)
+    if len(seen) >= 6:
+        break
+node.destroy_node(); rclpy.shutdown()
+print(len(seen), max((v[0] for v in seen), default=-1.0),
+      max((v[1] for v in seen), default=-1.0), max((v[2] for v in seen), default=-1.0))
+PY
+  ' 2>/dev/null)
+  read -r count lx ly wz <<<"${out:-}"
+  log "zero-velocity probe: samples=${count:-0} |vx|=${lx:-?} |vy|=${ly:-?} |wz|=${wz:-?}"
+  [ -n "${count:-}" ] && [ "$count" -ge 5 ] || return 1
+  python3 - "$lx" "$ly" "$wz" <<'PY'
+import sys
+try:
+    lx, ly, wz = (float(v) for v in sys.argv[1:4])
+except Exception:
+    sys.exit(1)
+sys.exit(0 if lx < 0.02 and ly < 0.02 and wz < 0.05 else 1)
+PY
+}
+
+# ================================================================ CLEANUP PHASE
+# 4) deterministic-safe only.  Every action requires a PROVABLY dead owner.
+
+cleanup_json_parts=()
+
+add_cleanup() { cleanup_json_parts+=("$1"); }
+
+# --- (a) stale launch locks: remove only when the recorded owner pid is gone
+cleanup_stale_locks() {
+  local now_ms removed=0 kept=0 names=""
+  now_ms=$(epoch_ms)
+  for f in "${JOURNAL_LOCKS[@]}" /tmp/wheeltec_launch_mqtt_bridge_*.lock; do
+    [ -f "$f" ] || continue
+    local raw pid=""
+    raw=$(cat "$f" 2>/dev/null | tr -d '\n')
+    # Two on-disk shapes exist:
+    #   {"owner":"...","pid":39653,"acquiredAt":"..."}  (nav2 launch lock, bridge singleton)
+    #   50359                                           (plain pid, ros2 launch wrapper)
+    pid=$(python3 - "$f" <<'PY' 2>/dev/null
+import json, re, sys
+raw = open(sys.argv[1], encoding='utf-8', errors='replace').read().strip()
+pid = ''
+try:
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        pid = str(data.get('pid') or '')
+except Exception:
+    data = None
+if not pid:
+    m = re.fullmatch(r'\s*(\d{1,10})\s*', raw)
+    if m:
+        pid = m.group(1)
+print(pid)
+PY
+)
+    if [ -z "$pid" ]; then
+      log "  cleanup: $f carries no owner pid (content=$(printf '%.40s' "$raw")) -> left alone"
+      kept=$((kept+1)); continue
+    fi
+    if [ -d "/proc/$pid" ]; then
+      log "  cleanup: $f owner pid $pid is ALIVE -> left alone"
+      kept=$((kept+1)); continue
+    fi
+    rm -f "$f" 2>/dev/null && {
+      log "  cleanup: removed stale lock $f (owner pid $pid is gone)"
+      removed=$((removed+1)); names="$names$(basename "$f"),"
+    }
+  done
+  add_cleanup "{\"staleLocksRemoved\":$removed,\"staleLocksKept\":$kept,\"removed\":\"$(json_escape "${names%,}")\",\"checkedAtEpochMs\":$now_ms}"
+}
+
+# --- (b) zombie notification: SIGCHLD to the parent; never kill the zombie itself
+cleanup_zombies() {
+  local found=0 notified=0 daemon=0 pids=""
+  for d in /proc/[0-9]*; do
+    local pid="${d#/proc/}"
+    local state ppid
+    state=$(awk '{print $3}' "$d/stat" 2>/dev/null) || continue
+    [ "$state" = "Z" ] || continue
+    found=$((found+1))
+    ppid=$(awk '{print $4}' "$d/stat" 2>/dev/null)
+    pids="$pids$pid,"
+    if [ -z "$ppid" ] || [ "$ppid" = "0" ] || [ "$ppid" = "1" ]; then
+      log "  cleanup: zombie $pid has ppid=${ppid:-?} (systemd/none) -> cannot notify"
+      daemon=$((daemon+1)); continue
+    fi
+    if kill -CHLD "$ppid" 2>/dev/null; then
+      log "  cleanup: notified parent $ppid to reap zombie $pid"
+      notified=$((notified+1))
+      sleep 0.2
+      if [ -d "/proc/$pid" ]; then
+        # The parent is alive but does not reap: it is the parent's bug, not something a
+        # cleanup may fix by force (a zombie cannot be killed).  Record it for diagnosis.
+        local pcmd
+        pcmd=$(tr '\0' ' ' < "/proc/$ppid/cmdline" 2>/dev/null | cut -c1-80)
+        log "  cleanup: zombie $pid still unreaped after SIGCHLD; parent $ppid = ${pcmd:-?}"
+        daemon=$((daemon+1))
+      fi
+    else
+      log "  cleanup: cannot signal parent $ppid of zombie $pid"
+      daemon=$((daemon+1))
+    fi
+  done
+  add_cleanup "{\"zombiesFound\":$found,\"zombiesNotified\":$notified,\"zombiesUnreapable\":$daemon,\"zombiePids\":\"$(json_escape "${pids%,}")\"}"
+}
+
+# --- (c) orphan component containers: only when the process-group leader is gone
+cleanup_orphan_containers() {
+  local scanned=0 killed=0 alive=0 details=""
+  for d in /proc/[0-9]*; do
+    local pid="${d#/proc/}"
+    local cmd
+    cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+    case "$cmd" in
+      *component_container_isolated*) ;;
+      *) continue ;;
+    esac
+    scanned=$((scanned+1))
+    local pgid
+    pgid=$(awk '{print $5}' "$d/stat" 2>/dev/null)
+    if [ -z "$pgid" ]; then
+      log "  cleanup: container $pid has no readable pgid -> left alone"
+      alive=$((alive+1)); continue
+    fi
+    if [ -d "/proc/$pgid" ]; then
+      log "  cleanup: container $pid pgid=$pgid leader alive -> left alone"
+      alive=$((alive+1)); continue
+    fi
+    log "  cleanup: container $pid is an orphan (pgid $pgid gone) -> SIGTERM then SIGKILL"
+    kill -TERM "$pid" 2>/dev/null
+    sleep 1
+    if [ -d "/proc/$pid" ]; then
+      kill -KILL "$pid" 2>/dev/null
+    fi
+    if [ -d "/proc/$pid" ]; then
+      log "  cleanup: container $pid survived SIGKILL (unexpected)"
+      alive=$((alive+1))
+    else
+      killed=$((killed+1)); details="$details$pid,"
+    fi
+  done
+  add_cleanup "{\"containersScanned\":$scanned,\"orphanContainersKilled\":$killed,\"containersKept\":$alive,\"killedPids\":\"$(json_escape "${details%,}")\"}"
+}
+
+# --- (d) reset failed transient units of this feature only
+cleanup_transient_units() {
+  local reset=0
+  if systemctl reset-failed "${WORKER_TAG}-*" >/dev/null 2>&1; then
+    reset=1
+    log "  cleanup: reset-failed ${WORKER_TAG}-*"
+  fi
+  add_cleanup "{\"transientUnitsReset\":$reset}"
+}
+
+run_cleanup_phase() {
+  cleanup_json_parts=()
+  local t0; t0=$(epoch_ms)
+  log "cleanup phase start"
+  cleanup_stale_locks
+  cleanup_zombies
+  cleanup_orphan_containers
+  cleanup_transient_units
+  log "cleanup phase done in $(( $(epoch_ms) - t0 )) ms"
+  # Build VALID json: an object whose members are the four reports, each of which is itself a
+  # complete object.  (v2.0 emitted "cleanup":{"startedAtEpochMs":...,{...}} -- a parse error,
+  # so the server fell back to idle and the mini program never saw "restart in progress".)
+  local joined="" part
+  for part in "${cleanup_json_parts[@]}"; do
+    [ -n "$joined" ] && joined="$joined,"
+    joined="$joined$part"
+  done
+  printf '{"startedAtEpochMs":%s,"finishedAtEpochMs":%s,"reports":[%s],"ok":true}' \
+    "$t0" "$(epoch_ms)" "$joined"
+}
+
+# --------------------------------------------------------------- health probes
+probe_health() {
+  local managed=true agent=false feature=false nav=false
+  for svc in "${MANAGED_SERVICES[@]}"; do
+    systemctl is-active --quiet "$svc" || { managed=false; log "  probe: $svc not active"; }
+  done
+  curl -sf -m 3 "$AGENT_URL" >/dev/null 2>&1 && agent=true
+  curl -sf -m 3 "$CONTROL_URL" >/dev/null 2>&1 && feature=true
+  # navigation is intentionally NOT auto-started: report whether the action server exists
+  if timeout 6 bash -c '
+      source /opt/ros/humble/setup.bash 2>/dev/null
+      source /home/hnh/wheeltec_ros2/install/setup.bash 2>/dev/null
+      export ROS_DOMAIN_ID=0 FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+      timeout 4 ros2 action info /navigate_to_pose 2>/dev/null | grep -q "Action servers: 1"
+    ' 2>/dev/null; then nav=true; fi
+  local ready=false
+  [ "$managed" = true ] && [ "$agent" = true ] && [ "$feature" = true ] && ready=true
+  printf '{"ready":%s,"managedServicesReady":%s,"robotAgentReady":%s,"featureStatusReady":%s,"navigationReady":%s}' \
+    "$ready" "$managed" "$agent" "$feature" "$nav"
+}
+
+# ------------------------------------------------- graceful nav-stack shutdown
+# The wheeltec_nav2 launch is a child of launch-mqtt-bridge, so stopping the bridge
+# would SIGKILL the navigation containers.  Ask the bridge to stop it first.
+request_navigation_stop() {
+  if ! command -v mosquitto_pub >/dev/null 2>&1; then
+    log "  nav stop: mosquitto_pub unavailable -> skipping (bridge will be restarted anyway)"
+    return 0
+  fi
+  if ! systemctl is-active --quiet launch-mqtt-bridge.service; then
+    log "  nav stop: bridge not active -> nothing to ask"
+    return 0
+  fi
+  local rid payload
+  rid="task-devrestart-$(date +%s)"
+  payload="{\"requestId\":\"$rid\",\"deviceId\":\"robot-001\",\"action\":\"stop_launch\",\"package\":\"wheeltec_nav2\",\"launchFile\":\"wheeltec_nav2.launch.py\",\"args\":{},\"source\":\"device-restart\"}"
+  if timeout 8 mosquitto_pub -h 127.0.0.1 -p 1883 -t "$NAV_MQTT_TOPIC" -q 1 -m "$payload" 2>>"$LOG_FILE"; then
+    log "  nav stop: requested wheeltec_nav2 stop (requestId=$rid)"
+    sleep 5
+    return 0
+  fi
+  log "  nav stop: mosquitto_pub failed (continuing; bridge restart will clear it)"
+  return 0
+}
+
+# ---------------------------------------------- mapping-session settlement (fix 2026-10-08)
+# A device restart used to leave an orphaned Cartographer session behind: the mapping stack
+# starts, writes sessionActive=true, and if its bringup does not complete (RTPS shm port
+# collision, /waypoint_follower lifecycle unreachable) the record stays active but
+# unobservable.  The bridge then reports "Cartographer mapping status is not fully
+# observable", which locks BOTH the mapping and the navigation buttons in the mini program
+# (observed 2026-10-08 14:49, task-muz6atpb-010).  Settle it during the stop phase.
+MAPPING_SESSION_FILE=/home/hnh/.local/state/stemm-cartographer-session.json
+MAPPING_TASK_FILE=/home/hnh/.local/state/stemm-cartographer-task.json
+MAPPING_UNITS=(
+  stemm-cartographer-mqtt-bridge.service
+)
+MAPPING_SERVICE_PATTERNS=(
+  stemm_cartographer_nav2_manager
+  cartographer_manager
+  voice_cartographer_bridge
+  local_rrt
+  global_rrt
+)
+
+# Wait until a unit is really down.  `systemctl stop --wait` is not available on this
+# systemd (it only accepts --wait for start/restart), so poll the unit state instead: the next
+# service must not start while the previous unit still holds its FastRTPS shm ports.
+stop_unit_and_wait() {
+  local unit="$1" timeout_s="${2:-20}" waited=0 state
+  systemctl stop "$unit" >>"$LOG_FILE" 2>&1 || log "  stop $unit returned non-zero"
+  while [ "$waited" -lt "$timeout_s" ]; do
+    state=$(systemctl show -p ActiveState --value "$unit" 2>/dev/null)
+    case "$state" in
+      inactive|failed|not-found|'') return 0 ;;
+    esac
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  log "  stop $unit did not reach inactive within ${timeout_s}x0.5s (state=$state)"
+  return 0
+}
+
+settle_mapping_session() {
+  local active=false task_id=""
+  if [ -f "$MAPPING_SESSION_FILE" ]; then
+    read -r active task_id <<<"$(python3 - "$MAPPING_SESSION_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding='utf-8'))
+except Exception:
+    print('false'); raise SystemExit
+print('true' if d.get('sessionActive') is True and d.get('terminal') is not True else 'false',
+      d.get('taskId') or '-')
+PY
+)"
+  fi
+  if [ "$active" != "true" ]; then
+    log "  mapping: no active mapping session -> nothing to settle"
+    return 0
+  fi
+
+  log "  mapping: settling orphaned session taskId=$task_id"
+  local unit
+  for unit in "${MAPPING_UNITS[@]}"; do
+    systemctl is-active --quiet "$unit" || continue
+    log "  mapping: stopping $unit"
+    systemctl stop "$unit" >>"$LOG_FILE" 2>&1 || log "  mapping: stop $unit returned non-zero"
+  done
+
+  # kill only processes whose command line matches the mapping patterns (pid-targeted, no
+  # pattern that could match this script itself)
+  local pat pid cmd killed=0
+  for pat in "${MAPPING_SERVICE_PATTERNS[@]}"; do
+    for pid in $(pgrep -f "$pat" 2>/dev/null); do
+      [ "$pid" = "$$" ] && continue
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+      case "$cmd" in
+        *settle_mapping_session*|*stemm-device-restart-launch*) continue ;;
+      esac
+      log "  mapping: TERM $pid ($pat)"
+      kill -TERM "$pid" 2>/dev/null && killed=$((killed+1))
+    done
+  done
+  [ "$killed" -gt 0 ] && sleep 2
+
+  # write a terminal record (schema-preserving), then point the task file at idle
+  python3 - "$MAPPING_SESSION_FILE" "$MAPPING_TASK_FILE" <<'PY' 2>/dev/null
+import json, os, shutil, sys, time
+session, task = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(session, encoding='utf-8'))
+except Exception:
+    print('  mapping: session file unreadable'); raise SystemExit(0)
+if not isinstance(d, dict):
+    print('  mapping: session file is not an object'); raise SystemExit(0)
+shutil.copy2(session, '%s.bak-devrestart-%s' % (session, time.strftime('%Y%m%d-%H%M%S')))
+now_ms = int(time.time() * 1000)
+d.update({
+    'phase': 'closed', 'status': 'succeeded', 'taskStatus': 'succeeded',
+    'terminal': True, 'sessionActive': False, 'processExited': True,
+    'functionalServicesRestored': True, 'cancelRequested': False,
+    'terminationStatus': 'aborted',
+    'terminationReason': 'settled_by_device_restart',
+    'lastError': '', 'navigationState': 'stopped',
+    'updatedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'updatedAtEpochMs': now_ms,
+})
+tmp = session + '.tmp'
+with open(tmp, 'w', encoding='utf-8') as fh:
+    json.dump(d, fh)
+os.replace(tmp, session)
+os.chmod(session, 0o644)
+try:
+    with open(task, 'w', encoding='utf-8') as fh:
+        json.dump({'taskId': '', 'updatedAt': time.time(), 'status': 'idle'}, fh)
+    os.chmod(task, 0o644)
+except OSError:
+    pass
+print('  mapping: session marked terminal (taskId=%s)' % d.get('taskId'))
+PY
+  return 0
+}
+
+# ------------------------------------------------------------------ worker role
+run_worker() {
+  local rid="$1" req="$2" started
+  started=$(epoch_ms)
+  log "worker start restartId=$rid services=${#MANAGED_SERVICES[@]}"
+
+  write_state "$(state_object "$rid" stopping "stopping_services" "" "$HEALTH_NOT_READY" "$started" "$req" null)"
+
+  # 1) ask the bridge to stop the navigation stack before the bridge goes away
+  request_navigation_stop
+
+  # 2) settle any active Cartographer session BEFORE the services go down, otherwise the
+  #    leftover sessionActive=true record locks the mini program after the restart
+  settle_mapping_session
+
+  # 3) stop in the fixed order (mosquitto first), each stop followed by a state poll
+  #    (stop_unit_and_wait).  Waiting for the unit to be really down keeps FastRTPS
+  #    shared-memory ports from colliding with the instance started back up (observed
+  #    2026-10-08: "Failed init_port fastrtps_port7425: open_and_lock_file failed").
+  for svc in "${STOP_ORDER[@]}"; do
+    log "stopping $svc"
+    stop_unit_and_wait "$svc" 20
+  done
+
+  # 4) deterministic-safe cleanup while everything is down
+  write_state "$(state_object "$rid" restarting "cleanup" "" "$HEALTH_NOT_READY" "$started" "$req" null)"
+  local cleanup_json
+  cleanup_json=$(run_cleanup_phase)
+
+  # 5) start: mosquitto first, then the rest in reverse order
+  write_state "$(state_object "$rid" restarting "starting_services" "" "$HEALTH_NOT_READY" "$started" "$req" null "$cleanup_json")"
+  log "starting mosquitto.service (pinned first)"
+  systemctl start mosquitto.service >>"$LOG_FILE" 2>&1 || log "start mosquitto.service returned non-zero"
+  local idx
+  for (( idx=${#STOP_ORDER[@]}-1 ; idx>=0 ; idx-- )); do
+    local svc="${STOP_ORDER[$idx]}"
+    [ "$svc" = "mosquitto.service" ] && continue
+    log "starting $svc"
+    systemctl start "$svc" >>"$LOG_FILE" 2>&1 || log "start $svc returned non-zero"
+  done
+
+  # 6) readiness
+  write_state "$(state_object "$rid" recovering "awaiting_readiness" "" "$HEALTH_NOT_READY" "$started" "$req" null "$cleanup_json")"
+  local health="" ok=false
+  for _ in $(seq 1 20); do          # up to ~60 s
+    health=$(probe_health)
+    case "$health" in *'"ready":true'*) ok=true; break ;; esac
+    sleep 3
+  done
+  [ -n "$health" ] || health="$HEALTH_NOT_READY"
+  local fin; fin=$(epoch_ms)
+  if [ "$ok" = true ]; then
+    write_state "$(state_object "$rid" succeeded "completed" "" "$health" "$started" "$req" "$fin" "$cleanup_json")"
+    log "worker done: succeeded health=$health"
+  else
+    write_state "$(state_object "$rid" degraded "services_incomplete" "SERVICE_RECOVERY_INCOMPLETE" "$health" "$started" "$req" "$fin" "$cleanup_json")"
+    log "worker done: degraded health=$health"
+  fi
+}
+
+# ------------------------------------------------------------ internal re-entry
+if [ "${1:-}" = "--run" ]; then
+  [ "$(id -u)" -eq 0 ] || { echo '{"ok":false,"code":"NOT_PERMITTED"}'; exit 1; }
+  shift
+  rid=""; req="0"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --restart-id) rid="${2:-}"; shift 2 ;;
+      --requested-at) req="${2:-0}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  run_worker "$rid" "$req"
+  exit 0
+fi
+
+# -------------------------------------------------------------- request role
+KEY=""
+DRY_RUN=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --idempotency-key) KEY="${2:-}"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    *) shift ;;
+  esac
+done
+
+BOOT_ID="$(boot_id)"
+
+if ! printf '%s' "$KEY" | grep -Eq '^restart-[A-Za-z0-9_-]{8,128}$'; then
+  printf '{"ok":false,"code":"INVALID_IDEMPOTENCY_KEY"}\n'
+  exit 0
+fi
+
+CUR_STATE="$(read_field state 2>/dev/null || echo '')"
+CUR_ID="$(read_field restartId 2>/dev/null || echo '')"
+case "$CUR_STATE" in
+  queued|preparing|stopping|restarting|recovering)
+    if [ "$CUR_ID" = "$KEY" ]; then
+      printf '{"ok":true,"accepted":true,"reused":true,"code":"","restartId":"%s","state":"%s","deviceRestart":%s}\n' \
+        "$(json_escape "$CUR_ID")" "$CUR_STATE" "$(cat "$STATE_FILE" 2>/dev/null || echo "$HEALTH_NOT_READY")"
+      exit 0
+    fi
+    printf '{"ok":false,"code":"RESTART_ALREADY_ACTIVE","restartId":"%s","state":"%s","deviceRestart":%s}\n' \
+      "$(json_escape "$CUR_ID")" "$CUR_STATE" "$(cat "$STATE_FILE" 2>/dev/null || echo '{}')"
+    exit 0
+    ;;
+esac
+
+if ! velocity_ok; then
+  log "refused $KEY: zero velocity not confirmed"
+  printf '{"ok":false,"code":"ZERO_VELOCITY_NOT_CONFIRMED","restartId":"","state":"idle","deviceRestart":%s}\n' \
+    "$(state_object "$CUR_ID" idle idle "" "" 0 0 null)"
+  exit 0
+fi
+
+if [ "$DRY_RUN" = true ]; then
+  printf '{"ok":true,"accepted":false,"reused":false,"code":"DRY_RUN","restartId":"%s","state":"idle","deviceRestart":%s}\n' \
+    "$(json_escape "$KEY")" "$(state_object "$KEY" idle dry_run "" "$HEALTH_NOT_READY" 0 0 null)"
+  exit 0
+fi
+
+REQ="$(epoch_ms)"
+if ! write_state "$(state_object "$KEY" queued "accepted" "" "$HEALTH_NOT_READY" 0 "$REQ" null)"; then
+  printf '{"ok":false,"code":"STATE_WRITE_FAILED"}\n'
+  exit 0
+fi
+
+# detach: a transient unit survives the service restarts performed by the worker
+if ! systemd-run --unit="${WORKER_TAG}-$(date +%s)" --collect --quiet \
+      /usr/local/sbin/stemm-device-restart-launch --run \
+      --restart-id "$KEY" --requested-at "$REQ" >>"$LOG_FILE" 2>&1; then
+  write_state "$(state_object "$KEY" failed "launch_failed" "WORKER_LAUNCH_FAILED" "$HEALTH_NOT_READY" 0 "$REQ" "$(epoch_ms)")"
+  printf '{"ok":false,"code":"WORKER_LAUNCH_FAILED","restartId":"%s"}\n' "$(json_escape "$KEY")"
+  exit 0
+fi
+
+log "accepted $KEY (detached worker launched; ${#MANAGED_SERVICES[@]} services)"
+printf '{"ok":true,"accepted":true,"reused":false,"code":"","restartId":"%s","state":"queued","deviceRestart":%s}\n' \
+  "$(json_escape "$KEY")" "$(cat "$STATE_FILE")"
+exit 0

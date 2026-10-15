@@ -51,7 +51,14 @@ same_launch_group() {
 # 2026-10-06 (1): 活跃建图会话存在时绝不清扫——导航栈正是本次建图要用的。
 # 2026-10-06 (2): 参照只认真正的导航/跟随 launch 包装。
 if pgrep -f 'stemm_cartographer_session_runner' >/dev/null 2>&1; then
-  echo "$(date -Is) active mapping session detected - skipping nav2 sweep" >> "$LOG"
+  # 2026-10-09: record WHAT matched, in the same instant as the match.  This guard has been seen
+  # tripping on ~61 % of runs while a manual `pgrep -af stemm_cartographer_session_runner` finds
+  # nothing: the matcher is a very short-lived process (~1-2 ms, caught once in a 120 Hz sampling
+  # loop) that only exists while the timer fires.  Without this line the decision cannot be
+  # audited after the fact.  `pgrep -af` reads the cmdline itself, so the race window is minimal.
+  # Logging only -- the guard condition is unchanged.
+  sess_hit=$(pgrep -af 'stemm_cartographer_session_runner' 2>/dev/null | tr '\n' '|' | cut -c1-220)
+  echo "$(date -Is) active mapping session detected - skipping nav2 sweep [matched: ${sess_hit:-none}]" >> "$LOG"
   exit 0
 fi
 
@@ -68,6 +75,13 @@ done
 [ "$newest" -eq 0 ] && exit 0        # no navigation launch running: nothing to judge
 
 # 2026-10-06: 只清理与参考 launch 同进程组的 nav2 节点；并行运行的另一条栈不动。
+# 2026-10-09: record WHICH launch is the reference.  The SKIP other-stack protection (2026-10-06)
+# is correct, but without this a reader cannot tell whether the protected stack is the map stack
+# (wheeltec_nav2, i.e. real navigation) or the always-on follow stack (bodyfollow_nav2).
+# Logging only -- the protection logic is unchanged.
+ref_cmd=$(tr '\0' ' ' < /proc/$newest_pid/cmdline 2>/dev/null)
+ref_launch=$(printf '%s' "$ref_cmd" | grep -oE '[A-Za-z0-9_]+\.launch\.py' | tail -1)
+[ -n "$ref_launch" ] || ref_launch=unknown
 newest_pgid=$(pid_pgid "$newest_pid")
 if [ -z "$newest_pgid" ]; then
   echo "$(date -Is) cannot read pgid of reference launch pid=$newest_pid - skipping sweep" >> "$LOG"
@@ -89,7 +103,7 @@ for p in $(pgrep -f "$PATTERN" 2>/dev/null); do
   s=$(pid_start_epoch "$p") || continue
   if [ $(( newest - s )) -gt "$MARGIN" ]; then
     if ! same_launch_group "$p" "$newest_pgid"; then
-      echo "$(date -Is) SKIP other-stack pid=$p pgid=$(pid_pgid "$p") ref_pgid=$newest_pgid newer_launch_pid=$newest_pid cmd=${cmd:0:50}" >> "$LOG"
+      echo "$(date -Is) SKIP other-stack pid=$p pgid=$(pid_pgid "$p") ref_pgid=$newest_pgid newer_launch_pid=$newest_pid ref_launch=$ref_launch cmd=${cmd:0:50}" >> "$LOG"
       skipped=$((skipped+1))
       continue
     fi
@@ -115,5 +129,9 @@ if [ "$killed" -gt 0 ]; then
     fi
   done
   echo "$(date -Is) swept $killed stale nav2 process(es) (skipped $skipped from other launch group)" >> "$LOG"
+elif [ "$skipped" -gt 0 ]; then
+  # 2026-10-09: make the "protected a parallel stack" outcome explicit once per run instead of
+  # leaving only per-pid SKIP lines.  Logging only -- no branch of the kill decision changed.
+  echo "$(date -Is) nothing swept: $skipped nav2 process(es) belong to another launch group (ref_launch=$ref_launch); a parallel stack is running and is deliberately left alone" >> "$LOG"
 fi
 exit 0

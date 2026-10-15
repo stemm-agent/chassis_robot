@@ -282,6 +282,12 @@ class VoiceRechargeBridge(Node):
         self.declare_parameter('undock_max_travel_m', 1.20)
         self.declare_parameter('undock_still_sec', 0.5)
         self.declare_parameter('undock_still_eps_m', 0.01)
+        self.declare_parameter('seed_status_topic', '/localization/seed_status')
+        self.declare_parameter('seed_status_publish_hz', 1.0)
+        self.seed_status_topic = str(
+            self.get_parameter('seed_status_topic').value)
+        self.seed_status_publish_hz = max(
+            0.2, float(self.get_parameter('seed_status_publish_hz').value))
         self.declare_parameter('seed_sigma_xy', 0.15)
         self.declare_parameter('seed_sigma_yaw', 0.05)
         self.declare_parameter('seed_dead_reckoning_sigma_per_m', 0.02)
@@ -342,6 +348,10 @@ class VoiceRechargeBridge(Node):
         self.declare_parameter('odom_epoch_guard_enabled', True)
         self.declare_parameter('odom_restart_radius_m', 0.05)
         self.declare_parameter('odom_restart_min_anchor_m', 1.0)
+        # 2026-10-10 (operator): GID 变化是否"单独"足以判锚点无效。
+        # 实测 ekf_filter_node 重启会让 GID 变、但里程计数值仍连续，此时旧行为
+        # 会误判并把锚点作废，导致每次重启都要人工重锚。默认改为需要数值证据。
+        self.declare_parameter('odom_epoch_require_value_discontinuity', True)
         # (3) 2026-09-24: the age limit is disabled by default.  It was a proxy for
         # "did the odometry session change?" and refused a valid anchor after a long
         # mapping run (it blocked a navigation start on 2026-09-23 18:03).  The
@@ -358,10 +368,23 @@ class VoiceRechargeBridge(Node):
         self.declare_parameter('seed_map_max_occupied', 50)
         self.declare_parameter('seed_dock_consistency_enabled', True)
         self.declare_parameter('seed_dock_max_distance_m', 0.5)
+        # 2026-10-12 N-4b 方案2：离回充点多远之后就不再拿"桩证据"约束播种。
+        # 原 limit = seed_dock_max_distance_m + max(dock_offset_distance_m,
+        # undock_min_travel_m) = 0.5 + max(0.469, 0.15) = 0.97m，只覆盖
+        # "机器人还贴在桩上"。实测 15:15：导航栈被 auto-nav 正确拉起后，
+        # 播种候选 (-1.01, 0.70) 因离回充点 1.23m > 0.97m 被否决，
+        # 导航栈永久停在 starting（AMCL 无初值 -> 无 map->odom）。
+        # 建图后返航回原点的场景里，机器人本就可能已离桩 1m 以上，
+        # 桩证据此时不再适用。故单独给一个阈值，不动 undock_min_travel_m
+        # （它同时是脱桩检测门限与行程还原判据，抬高副作用更大）。
+        self.declare_parameter('seed_dock_evidence_max_away_m', 2.0)
         self.odom_epoch_guard_enabled = bool(
             self.get_parameter('odom_epoch_guard_enabled').value)
         self.odom_restart_radius_m = max(
             0.0, float(self.get_parameter('odom_restart_radius_m').value))
+        self.odom_epoch_require_value_discontinuity = bool(
+            self.get_parameter(
+                'odom_epoch_require_value_discontinuity').value)
         self.odom_restart_min_anchor_m = max(
             0.0, float(self.get_parameter('odom_restart_min_anchor_m').value))
         self.seed_restored_anchor_max_age_s = max(
@@ -377,6 +400,9 @@ class VoiceRechargeBridge(Node):
             0, min(100, int(self.get_parameter('seed_map_max_occupied').value)))
         self.seed_dock_consistency_enabled = bool(
             self.get_parameter('seed_dock_consistency_enabled').value)
+        self.seed_dock_evidence_max_away_m = max(
+            0.0, float(self.get_parameter(
+                'seed_dock_evidence_max_away_m').value))
         self.seed_dock_max_distance_m = max(
             0.0, float(self.get_parameter('seed_dock_max_distance_m').value))
         # ==== 2026-09-15 (B): odometry continuity validation for the anchor ====
@@ -387,7 +413,14 @@ class VoiceRechargeBridge(Node):
         self.odom_reset_radius_m = max(0.0, float(self.get_parameter('odom_reset_radius_m').value))
         self.odom_reset_min_prev_m = max(0.0, float(self.get_parameter('odom_reset_min_prev_m').value))
         # ==== 2026-09-15 (C/D): verify the seed actually landed, else relocalize globally
-        self.declare_parameter('seed_accept_timeout_s', 3.0)
+        # 2026-10-12: 3.0 -> 8.0。原 3.0s 对 AMCL 从收到 /initialpose 到激光匹配收敛
+        # 太紧：实测同一场会话里 1.3s 成功、6.7s 未收敛都出现过；一旦超时
+        # 就以 sticky 的 refused 发布，bridge 随即"扣住"自动拉起导航栈，
+        # 而 bridge 的重试入口要求会话仍在跑（会话往往已 closed）——
+        # 结果导航栈一直起不来（2026-10-12 14:41 实测）。
+        # 只放宽等待时间，判据（error <= seed_accept_max_error_m）、sticky
+        # 语义与全局定位补救路径均不变。
+        self.declare_parameter('seed_accept_timeout_s', 8.0)
         self.declare_parameter('seed_accept_max_error_m', 0.5)
         self.declare_parameter('seed_accept_grace_s', 15.0)
         self.declare_parameter('global_localization_on_failure', True)
@@ -414,6 +447,16 @@ class VoiceRechargeBridge(Node):
             self.get_parameter('global_localization_service_fallback').value)
         self._seed_publishes = 0
         self.initialpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        # 2026-10-09: 播种结论快照。之前这些结论只写在 journal 里，
+        # 前端只能看到 nav.state=starting 而没有原因（实测 2026-10-09 17:03
+        # "anchor invalidated (odometry restart)" 导致导航栈起来却永远不可用）。
+        self._seed_status = {
+            'state': 'idle',
+            'reasonCode': '',
+            'reason': '',
+            'anchorValid': True,
+        }
+        self._seed_status_sticky = False   # 拒绝类结论粘性，直到下一次播种尝试
         self._odom = None                 # (x, y, yaw)
         self._odom_at_dock = None         # 最后一次“确认在桩”时刻的里程计位姿
         self._odom_at_recharge_point = None   # 脱桩停稳那一刻（= 地图原点）
@@ -516,6 +559,9 @@ class VoiceRechargeBridge(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.feedback_pub = self.create_publisher(String, 'feedback_audio', 10)
+        # 2026-10-09: 播种结论话题（volatile，1 Hz 周期重发，接收方随时可读）
+        self.seed_status_pub = self.create_publisher(
+            String, self.seed_status_topic, 10)
         self.navigation_start_event_pub = self.create_publisher(
             String, self.navigation_start_event_topic, navigation_event_qos)
         self.voice_sub = self.create_subscription(
@@ -543,6 +589,8 @@ class VoiceRechargeBridge(Node):
             Float32, 'robot_charging_current', self._charging_current_callback, 10
         )
         self.create_subscription(UInt8, 'robot_red_flag', self._red_state_callback, 10)
+        self.create_timer(
+            1.0 / self.seed_status_publish_hz, self._publish_seed_status)
         self.create_timer(1.0, self._reap_finished_processes)
         self.create_timer(0.5, self._check_navigation_start_timeout)
         self.create_timer(
@@ -791,6 +839,45 @@ class VoiceRechargeBridge(Node):
                 path, age, restored, snap.get('reason'),
                 self._odom_at_recharge_point, self._odom_at_dock))
 
+    # ==== 2026-10-09: 定位播种结论对外可见 ====
+    def _set_seed_status(self, state, reason_code='', reason='', sticky=False):
+        """记录播种结论。sticky 用于拒绝类结论，避免被后续 waiting 覆盖。"""
+        if self._seed_status_sticky and not sticky:
+            return
+        self._seed_status = {
+            'state': str(state),
+            'reasonCode': str(reason_code or ''),
+            'reason': str(reason or ''),
+            'anchorValid': bool(getattr(self, '_anchor_valid', True)),
+        }
+        self._seed_status_sticky = bool(sticky)
+
+    def _seed_status_payload(self):
+        payload = dict(self._seed_status)
+        payload['schemaVersion'] = 1
+        payload['observedAtEpochMs'] = int(time.time() * 1000)
+        expected = self._seed_expected
+        if expected is not None:
+            payload['seeded'] = {
+                'x': round(float(expected[0]), 3),
+                'y': round(float(expected[1]), 3),
+                'yaw': round(float(expected[2]), 4),
+            }
+        error = self._seed_estimate_error_m
+        payload['estimateErrorM'] = None if error is None else round(float(error), 3)
+        payload['seedFailures'] = int(self._seed_failures)
+        payload['anchorInvalidReason'] = str(
+            getattr(self, '_anchor_invalid_reason', '') or '')
+        return payload
+
+    def _publish_seed_status(self):
+        try:
+            self.seed_status_pub.publish(
+                String(data=json.dumps(self._seed_status_payload(),
+                                       ensure_ascii=False)))
+        except Exception as exc:  # never let diagnostics break the bridge
+            self.get_logger().warn('seed status publish failed: %s' % exc)
+
     def _invalidate_anchor(self, reason):
         if not getattr(self, '_anchor_valid', True):
             return
@@ -809,6 +896,10 @@ class VoiceRechargeBridge(Node):
         self.get_logger().error(
             'Localization anchor invalidated: %s. A fresh dock/undock anchor is required '
             'before navigation can start.' % reason)
+        self._set_seed_status(
+            'refused', 'anchor_invalidated',
+            'Localization anchor invalidated: %s. A fresh dock/undock anchor is '
+            'required before navigation can start.' % reason, sticky=True)
 
     # ==== 2026-09-23: seed trust guards ====
     def _anchor_odom_reference(self):
@@ -867,7 +958,11 @@ class VoiceRechargeBridge(Node):
         return tuple(sorted(gids))
 
     def _check_odom_epoch(self):
-        """Guard (1, precise): void the anchor when the odometry publisher changed."""
+        """Guard (1, precise): void the anchor when the odometry session restarted.
+
+        2026-10-10 (rev2): 判据是"记录中的发布者是否都还在"，而不是
+        "集合是否完全不相交"。
+        """
         if not self.odom_epoch_guard_enabled or not self._anchor_valid:
             return
         if self._anchor_odom_reference() is None:
@@ -880,15 +975,65 @@ class VoiceRechargeBridge(Node):
             # before discovery finished has no baseline yet): adopt it.
             self._odom_epoch_gids = current
             return
-        if set(current).isdisjoint(set(self._odom_epoch_gids)):
+        # 2026-10-10 (rev2): 判据由"集合完全不相交"改为"记录中的发布者是否
+        # 都还在"（子集判据）。原判据在 GID 集合成员变化但 EKF 未重启时会
+        # 误判——实测 10:25:05 打印的是 (010fca40 -> 010fca40)，两边前 8 位
+        # 相同仍被判为断代。只要记录的发布者仍在当前图中，里程计会话就没断。
+        # 不再在探测阶段改写 _odom_epoch_gids（原实现有此副作用）。
+        recorded_gids = set(self._odom_epoch_gids)
+        current_gids = set(current)
+        if recorded_gids and not recorded_gids.issubset(current_gids):
             recorded = ','.join(g[:8] for g in self._odom_epoch_gids)
             now = ','.join(g[:8] for g in current)
             self._odom_epoch_gids = current
-            self.get_logger().error(
-                'Odometry publisher changed (%s -> %s): the odometry session restarted, '
-                'so the stored odom<->map correspondence is void.' % (recorded, now))
-            self._invalidate_anchor(
-                'odometry publisher restarted (%s -> %s)' % (recorded, now))
+            # GID 变化本身不是断代的证据（任何进程重启都会换 GID）。
+            # 默认要求数值证据；真正的归零/跳变另有 _odom_callback 兜底。
+            if not self.odom_epoch_require_value_discontinuity:
+                self.get_logger().error(
+                    'Odometry publisher changed (%s -> %s): treating the odometry '
+                    'session as restarted (value check disabled).' % (recorded, now))
+                self._invalidate_anchor(
+                    'odometry publisher restarted (%s -> %s)' % (recorded, now))
+                return
+            reference_discontinuity = self._odom_value_discontinuity()
+            if reference_discontinuity:
+                self.get_logger().error(
+                    'Odometry publisher changed (%s -> %s) AND the odometry value '
+                    'discontinuity confirms a restart (%s): the stored odom<->map '
+                    'correspondence is void.' % (recorded, now,
+                                                reference_discontinuity))
+                self._invalidate_anchor(
+                    'odometry publisher restarted (%s -> %s); %s'
+                    % (recorded, now, reference_discontinuity))
+                return
+            self.get_logger().info(
+                'Odometry publisher changed (%s -> %s) but the odometry value is '
+                'continuous; keeping the anchor valid.' % (recorded, now))
+        elif recorded_gids:
+            # 记录中的发布者都还在：里程计会话未变，锚点保持有效。
+            self._odom_epoch_gids = current
+
+    def _odom_value_discontinuity(self):
+        """Return a description when the odometry value itself shows a restart.
+
+        2026-10-10: GID 只说明发布者进程换了，不说明里程计归零。这里用与
+        _check_anchor_epoch 相同的阈值复核数值，只有数值也断代才算断代。
+        返回 '' 表示数值连续（或证据不足，此时保守地不判无效）。
+        """
+        reference = self._anchor_odom_reference()
+        if reference is None:
+            return ''
+        odom = self._odom
+        if odom is None:
+            return ''
+        anchor_norm = math.hypot(reference[0], reference[1])
+        odom_norm = math.hypot(odom[0], odom[1])
+        if anchor_norm < self.odom_restart_min_anchor_m:
+            return ''                   # 锚点太靠近原点，分辨不出
+        if odom_norm <= self.odom_restart_radius_m:
+            return ('|odom| was %.2fm at the anchor and is %.2fm now'
+                    % (anchor_norm, odom_norm))
+        return ''
 
     def _map_callback(self, msg):
         self._map_msg = msg
@@ -917,13 +1062,20 @@ class VoiceRechargeBridge(Node):
         Returns a reason string when the seed must be refused, else None.
         """
         if self.seed_dock_consistency_enabled and self._has_recent_dock_evidence():
-            limit = self.seed_dock_max_distance_m + max(
-                self.dock_offset_distance_m, self.undock_min_travel_m)
-            away = math.hypot(x - self.recharge_point[0], y - self.recharge_point[1])
-            if away > limit:
-                return ('dock/charging evidence says the robot is on the charger '
-                        '(within %.2fm of the recharge point) but the candidate seed '
-                        '(%.2f, %.2f) is %.2fm away' % (limit, x, y, away))
+            # 2026-10-12 N-4b 方案2：先判断"是否还该用桩证据"。
+            # 离回充点超过 seed_dock_evidence_max_away_m 时，机器人显然已
+            # 不在桩上，桩证据不再适用 —— 直接放行后续地图检查，
+            # 而不是继续用 0.97m 这个"还贴在桩上"的限值否决播种。
+            away = math.hypot(x - self.recharge_point[0],
+                              y - self.recharge_point[1])
+            if away <= self.seed_dock_evidence_max_away_m:
+                limit = self.seed_dock_max_distance_m + max(
+                    self.dock_offset_distance_m, self.undock_min_travel_m)
+                if away > limit:
+                    return ('dock/charging evidence says the robot is on the '
+                            'charger (within %.2fm of the recharge point) but the '
+                            'candidate seed (%.2f, %.2f) is %.2fm away'
+                            % (limit, x, y, away))
         if not self.seed_map_check_enabled:
             return None
         if self._map_msg is None:
@@ -963,6 +1115,8 @@ class VoiceRechargeBridge(Node):
                 'on its own.')
             self._seed_msg = None
             self._seed_applied = True
+            self._set_seed_status('applied', '',
+                                   'AMCL adopted the initial pose; converging on its own.')
             self._auto_seed_done_for_instance = True
             self._auto_seed_active = False
         self._record_seed_estimate(msg)
@@ -980,6 +1134,8 @@ class VoiceRechargeBridge(Node):
             if not self._seed_accepted:
                 self._seed_accepted = True
                 self._seed_accept_elapsed_s = elapsed
+                self._set_seed_status('accepted', '',
+                                       'AMCL converged onto the seeded pose.')
                 self.get_logger().info(
                     'Seed accepted: AMCL pose (%.3f, %.3f) is %.3fm from the seeded pose '
                     '(tolerance %.2fm) after %.1fs.'
@@ -997,6 +1153,11 @@ class VoiceRechargeBridge(Node):
         if elapsed < self.seed_accept_timeout_s:
             return
         self._seed_accepted = True     # one-shot: stop re-checking this seed
+        self._set_seed_status(
+            'refused', 'seed_acceptance_timeout',
+            'Seed acceptance failed: AMCL did not converge onto the seeded pose within '
+            '%.1fs. Localization did not start where the anchor predicted.'
+            % self.seed_accept_timeout_s, sticky=True)
         self._seed_failures += 1
         self.get_logger().error(
             'Seed acceptance failed: no /amcl_pose within %.1fs of the seeded pose '
@@ -1160,6 +1321,7 @@ class VoiceRechargeBridge(Node):
         if x is None:
             self.get_logger().error(
                 'Refusing to seed localization (%s): %s' % (label, source))
+            self._set_seed_status('refused', 'seed_refused', str(source), sticky=True)
             return False
         msg = PoseWithCovarianceStamped()
         msg.header.frame_id = 'map'
@@ -1182,6 +1344,8 @@ class VoiceRechargeBridge(Node):
         self.get_logger().info(
             'Localization seed prepared (%s): x=%.3f y=%.3f yaw=%.1fdeg sigma=%.3f/%.3f (%s)'
             % (label, x, y, math.degrees(yaw), sigma_xy, sigma_yaw, source))
+        self._set_seed_status('prepared', '',
+                               'Published an initial pose; waiting for AMCL to adopt it.')
         self._publish_seed_now()
         return True
 
@@ -1244,6 +1408,7 @@ class VoiceRechargeBridge(Node):
             return True
         _, _, _, _, _, source = self._compute_seed_pose()
         detail = ('本地化初值不可信：%s；请先让小车在充电桩上（充电接触）再开启导航' % source)
+        self._set_seed_status('refused', 'seed_untrusted', detail, sticky=True)
         self.get_logger().error(detail)
         self._publish_navigation_start_rejection(generation, detail)
         return False

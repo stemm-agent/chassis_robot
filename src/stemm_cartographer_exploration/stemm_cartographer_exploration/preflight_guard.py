@@ -12,6 +12,8 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
+import math
+
 from sensor_msgs.msg import Imu, LaserScan
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -135,17 +137,25 @@ class PreflightGuard(Node):
         self.declare_parameter('timeout_sec', 5.0)
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('expected_imu_frame', 'gyro_link')
+        # 2026-10-09 (operator): warn when the robot starts a mapping session closer than this
+        # to an obstacle in FRONT.  The mapping origin becomes the return-home target, so a tight
+        # start makes the origin fail the return-home clearance check (see P0-a).
+        self.declare_parameter('start_clearance_warn_m', 0.25)
 
         self.phase = self.get_parameter('phase').value
         self.timeout_sec = float(self.get_parameter('timeout_sec').value)
         self.base_frame = str(self.get_parameter('base_frame').value)
         self.expected_imu_frame = str(
             self.get_parameter('expected_imu_frame').value)
+        self.start_clearance_warn_m = max(
+            0.0, float(self.get_parameter('start_clearance_warn_m').value))
 
         self.first_stamps = {}
         self.last_stamps = {}
         self.message_counts = {'scan': 0, 'odom': 0, 'imu': 0}
         self.scan_frame = ''
+        self.scan_front_min = None
+        self.start_clearance_warned = False
         self.imu_frame = ''
         self.tf_buffer = None
         self.tf_listener = None
@@ -175,8 +185,28 @@ class PreflightGuard(Node):
         self.last_stamps[key] = stamp
         if key == 'scan':
             self.scan_frame = msg.header.frame_id
+            self._record_scan_front_min(msg)
         elif key == 'imu':
             self.imu_frame = msg.header.frame_id
+
+    def _record_scan_front_min(self, msg) -> None:
+        """2026-10-09 (operator): nearest valid return in the FRONT +/-30 deg sector.
+
+        Only used for the start-clearance warning below; the mapping origin becomes the
+        return-home target, so this number predicts whether return-home can stand there.
+        """
+        if not msg.ranges:
+            return
+        span = math.radians(30.0)
+        angle = msg.angle_min
+        best = None
+        for r in msg.ranges:
+            if math.isfinite(r) and msg.range_min <= r <= msg.range_max:
+                if -span <= angle <= span and (best is None or r < best):
+                    best = r
+            angle += msg.angle_increment
+        if best is not None:
+            self.scan_front_min = best
 
     def check_system(self) -> tuple[bool, str]:
         if not _service_is_active('wheeltec-robot.service'):
@@ -209,6 +239,17 @@ class PreflightGuard(Node):
             return False, (
                 f'IMU frame is {self.imu_frame!r}, expected '
                 f'{self.expected_imu_frame!r}')
+        if (not self.start_clearance_warned
+                and self.start_clearance_warn_m > 0.0
+                and self.scan_front_min is not None
+                and self.scan_front_min < self.start_clearance_warn_m):
+            self.start_clearance_warned = True
+            self.get_logger().warn(
+                'MAPPING START CLEARANCE LOW: nearest front obstacle is %.2f m '
+                '(threshold %.2f m). The mapping origin becomes the return-home target, so a '
+                'tight start makes return-home harder -- the manager will relocate the target '
+                'to the nearest stand point, but moving the robot to open space first is safer.'
+                % (self.scan_front_min, self.start_clearance_warn_m))
 
         publishers = self.get_publishers_info_by_topic('/scan')
         if len(publishers) != 1:

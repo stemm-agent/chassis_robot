@@ -21,6 +21,20 @@ INNER_LAUNCH = (
     'ros2', 'launch', 'stemm_cartographer_exploration',
     'stemm_cartographer_auto_mapping.launch.py',
 )
+
+# 2026-10-10: 允许用环境变量选择前沿点来源，便于用 systemd 启动建图会话
+# （命令行手工启动会打断收尾流程，且日志不进 journal）。
+# 未设置时不追加任何参数，行为与既有完全一致（走 launch 的默认值 rrt）。
+def _frontier_source_launch_args():
+    value = os.getenv('STEMM_FRONTIER_SOURCE', '').strip().lower()
+    if value in ('rrt', 'grid'):
+        return ['frontier_source:=%s' % value]
+    if value:
+        print(
+            '[WARN] ignoring STEMM_FRONTIER_SOURCE=%r '
+            '(expected rrt or grid)' % value,
+            file=sys.stderr, flush=True)
+    return []
 STATE_HOME = Path(os.getenv(
     'XDG_STATE_HOME', Path.home() / '.local' / 'state')).expanduser()
 SESSION_STATUS_PATH = Path(os.getenv(
@@ -71,6 +85,65 @@ try:
 except (TypeError, ValueError):
     NAVIGATION_RELEASE_TIMEOUT_SEC = 60.0
 NAVIGATION_RELEASE_POLL_SEC = 0.5
+# 2026-10-13 (P23): the release above must have a matching restore.  The
+# session stops `wheeltec_nav2` so it cannot collide with this session's
+# root-namespace Nav2 nodes; nothing put it back, so map-mode navigation
+# stayed down after every session.
+NAVIGATION_RESTORE_ENABLED = os.getenv(
+    'STEMM_CARTOGRAPHER_NAVIGATION_RESTORE_ENABLED', '1').strip().lower() \
+    not in {'0', 'false', 'no', 'off'}
+try:
+    NAVIGATION_RESTORE_TIMEOUT_SEC = max(
+        10.0,
+        float(os.getenv(
+            'STEMM_CARTOGRAPHER_NAVIGATION_RESTORE_TIMEOUT_SEC', '25')),
+    )
+except (TypeError, ValueError):
+    NAVIGATION_RESTORE_TIMEOUT_SEC = 25.0
+# The functional-service restore starts the follow stack
+# (bodyfollow-nav2 + /nofmap) first.  Starting `wheeltec_nav2` immediately
+# afterwards made both fight over root-namespace / RTPS shared-memory ports
+# (measured 2026-10-13 16:11:38: "[RTPS_TRANSPORT_SHM Error] Failed
+# init_port fastrtps_port7423: open_and_lock_file failed"), so settle first.
+try:
+    NAVIGATION_RESTORE_SETTLE_SEC = max(
+        0.0,
+        float(os.getenv(
+            'STEMM_CARTOGRAPHER_NAVIGATION_RESTORE_SETTLE_SEC', '5')),
+    )
+except (TypeError, ValueError):
+    NAVIGATION_RESTORE_SETTLE_SEC = 5.0
+NAVIGATION_RESTORE_POLL_SEC = 2.0
+# 2026-10-13 (P29): the helper must NOT inherit this process's stdout/stderr.
+# The runner is spawned by `ros2 launch`, so its fd 1/2 are the launch's pipe;
+# once the runner exits, launch closes the read end and the helper dies on its
+# first print (BrokenPipeError/SIGPIPE) before writing a single line -- measured
+# 17:58: helper spawned, zero [nav-restore] output, navigation never restored.
+NAVIGATION_RESTORE_LOG_PATH = os.getenv(
+    'STEMM_CARTOGRAPHER_NAV_RESTORE_LOG',
+    os.path.expanduser('~/.local/state/stemm-nav-restore.log'),
+).strip()
+# 2026-10-13 (P24): a restore request can be accepted by the 3000 Node API
+# (HTTP 200) and still never reach a running stack, because the MQTT bridge
+# refuses `start_launch` while `mapping_owns_vehicle()` is still true
+# (launch_mqtt_bridge.py:3751) -- it only observes the release on its next
+# periodic probe.  Measured 17:32: the request at 17:32:28 was dropped and the
+# bridge's own hook succeeded at 17:34:04 (96 s later).  So retry instead of
+# waiting out one long timeout.
+try:
+    NAVIGATION_RESTORE_ATTEMPTS = max(
+        1, int(os.getenv(
+            'STEMM_CARTOGRAPHER_NAVIGATION_RESTORE_ATTEMPTS', '4')))
+except (TypeError, ValueError):
+    NAVIGATION_RESTORE_ATTEMPTS = 4
+try:
+    NAVIGATION_RESTORE_RETRY_SEC = max(
+        0.0,
+        float(os.getenv(
+            'STEMM_CARTOGRAPHER_NAVIGATION_RESTORE_RETRY_SEC', '12')),
+    )
+except (TypeError, ValueError):
+    NAVIGATION_RESTORE_RETRY_SEC = 12.0
 # 2026-09-17: bounded grace after a finished mapping session so the finally block
 # (service restore + terminal status) always runs even if the inner launch lingers.
 try:
@@ -78,6 +151,12 @@ try:
         5.0, float(os.getenv('STEMM_CARTOGRAPHER_INNER_LAUNCH_EXIT_GRACE_SEC', '60')))
 except (TypeError, ValueError):
     INNER_LAUNCH_EXIT_GRACE_SEC = 60.0
+
+# P0a-20261014: 首次观察到子进程后，至少经过这么久才允许把"无子进程"
+# 判成僵尸。取值需大于 `ros2 launch` 启动期的子进程抖动窗口，远小于
+# INNER_LAUNCH_EXIT_GRACE_SEC —— 它只推迟判定，不缩短收尾宽限。
+INNER_LAUNCH_ORPHAN_MIN_OBSERVE_SEC = max(
+    1.0, float(os.getenv('STEMM_CARTOGRAPHER_ORPHAN_MIN_OBSERVE_SEC', '15')))
 # 2026-09-24: mirrors the guard's STOP_ORDER allowlist.  Used only as a second
 # opinion after a non-zero `stop` result: the runner verifies that the vehicle is
 # actually free instead of trusting the guard helper's exit code.
@@ -118,6 +197,13 @@ class SessionRunner:
         self.session_task_id = ''
         self.mqtt_launch = False
         self.process_termination_failed = False
+        # P0a-20261014: inner-launch startup-window guard state.
+        self.inner_launch_children_seen = False
+        self.inner_launch_first_child_at = None
+        self.inner_launch_childless_logged = False
+        # 2026-10-13 (P23): map-mode navigation restore outcome.
+        self.navigation_restore_failed = False
+        self.navigation_restore_reason = ''
         self.session_started_at_epoch_ms = 0
         try:
             timeout_sec = float(os.getenv(
@@ -309,6 +395,200 @@ class SessionRunner:
             'map-mode navigation did not stop within %.0fs'
             % NAVIGATION_RELEASE_TIMEOUT_SEC)
 
+    def _spawn_navigation_restore_helper(self) -> bool:
+        """Start the detached restore helper; do not wait for it (P25).
+
+        The helper is a separate module (`nav_restore`) launched with
+        start_new_session=True, so it survives this runner's exit and starts
+        only after the bridge can see the session as released.
+        """
+        if not NAVIGATION_RESTORE_ENABLED:
+            print('[INFO] Map-mode navigation restore is disabled.',
+                  flush=True)
+            return True
+        if self._navigation_launch_running():
+            print('[INFO] Map-mode navigation is already running; '
+                  'nothing to restore.', flush=True)
+            return True
+        # 2026-10-13 (P32): run the helper as a systemd transient unit.
+        # `Popen(start_new_session=True)` was not enough: measured 18:04 the
+        # helper wrote its first line and then died inside the 8 s settle
+        # window (no further lines, navigation never restored, one orphan
+        # nav2_lifecycle_manager left behind) -- teardown runs several
+        # cleanup/restart paths at once and only a systemd-managed unit is
+        # fully outside their reach.
+        unit = 'stemm-nav-restore-%d' % int(time.time())
+        pythonpath = os.environ.get('PYTHONPATH', '')
+        command = [
+            'sudo', '-n', 'systemd-run',
+            '--unit=%s' % unit,
+            '--collect',
+            '--description=STEMM map-mode navigation restore helper',
+        ]
+        if pythonpath:
+            # systemd-run starts with a clean environment; without this the
+            # helper cannot import stemm_cartographer_exploration at all.
+            command.append('--setenv=PYTHONPATH=%s' % pythonpath)
+        command += [sys.executable, '-m',
+                    'stemm_cartographer_exploration.nav_restore']
+        try:
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20.0,
+                check=False,
+            )
+            output = (completed.stdout or '').strip().splitlines()
+            output = output[-1] if output else ''
+            if completed.returncode == 0:
+                print('[INFO] Detached navigation restore helper started as '
+                      'systemd unit %s (journalctl -u %s); this session exits '
+                      'now and the helper retries on its own.'
+                      % (unit, unit), flush=True)
+                return True
+            print('[WARNING] systemd-run refused the navigation restore '
+                  'helper (rc=%s): %s; falling back to a plain detached '
+                  'process.' % (completed.returncode, output),
+                  file=sys.stderr, flush=True)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print('[WARNING] could not start the navigation restore helper '
+                  'via systemd-run: %s; falling back to a plain detached '
+                  'process.' % exc, file=sys.stderr, flush=True)
+        # --- 降级路径：P29 的独立日志文件 + 脱离进程组 ---
+        fallback = [sys.executable, '-m',
+                    'stemm_cartographer_exploration.nav_restore']
+        helper_log = None
+        try:
+            os.makedirs(os.path.dirname(NAVIGATION_RESTORE_LOG_PATH),
+                        mode=0o700, exist_ok=True)
+            helper_log = open(NAVIGATION_RESTORE_LOG_PATH, 'ab', buffering=0)
+        except OSError as exc:
+            print('[WARNING] could not open the navigation restore log %s: %s'
+                  % (NAVIGATION_RESTORE_LOG_PATH, exc),
+                  file=sys.stderr, flush=True)
+        try:
+            handle = subprocess.Popen(
+                fallback,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=helper_log if helper_log is not None else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if helper_log is not None else subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            if helper_log is not None:
+                try:
+                    helper_log.close()
+                except OSError:
+                    pass
+            print('[WARNING] could not start the navigation restore helper: '
+                  '%s' % exc, file=sys.stderr, flush=True)
+            return False
+        if helper_log is not None:
+            try:
+                helper_log.close()
+            except OSError:
+                pass
+        print('[INFO] Navigation restore helper started as a fallback detached '
+              'process (pid=%s, log=%s); this session exits now.'
+              % (getattr(handle, 'pid', '?'), NAVIGATION_RESTORE_LOG_PATH),
+              flush=True)
+        return True
+
+    def _restore_map_navigation(self) -> bool:
+        """Restore the map-mode navigation stack after a session (P23).
+
+        Added 2026-10-13.  Pairs with _release_map_navigation(): because the
+        session stops `wheeltec_nav2` before mapping takes over motion, the
+        session must put it back when it is done.
+
+        Why the session owns this instead of launch-mqtt-bridge: the bridge
+        has an `auto-navigation` hook, but it keeps its armed task in process
+        memory and has a silent failure path (not armed -> bare return, no
+        log).  Measured 2026-10-13: it armed only for the 09:53 and 11:24
+        sessions, then went silent for the remaining 16 -- leaving
+        `wheeltec_nav2` down, `amcl_odom_limiter` stuck on "Waiting for an
+        AMCL pose" and targetNavigation.state pinned to 'unknown'.  A restore
+        that always reports its outcome is the fix.
+
+        Returns True when the stack is (or already was) running.
+        """
+        if not NAVIGATION_RESTORE_ENABLED:
+            print('[INFO] Map-mode navigation restore is disabled.',
+                  flush=True)
+            return True
+        if self._navigation_launch_running():
+            print('[INFO] Map-mode navigation is already running; '
+                  'nothing to restore.', flush=True)
+            return True
+        if NAVIGATION_RESTORE_SETTLE_SEC > 0.0:
+            print('[INFO] Waiting %.0fs for the restored functional services '
+                  'to settle before starting map-mode navigation.'
+                  % NAVIGATION_RESTORE_SETTLE_SEC, flush=True)
+            time.sleep(NAVIGATION_RESTORE_SETTLE_SEC)
+            if self._navigation_launch_running():
+                print('[INFO] Map-mode navigation came back on its own '
+                      'during the settle window.', flush=True)
+                return True
+        # P24: retry -- an HTTP 200 only means the 3000 Node API queued the
+        # command; the bridge can still refuse it while it believes mapping
+        # owns vehicle motion, and it only notices the release on a later
+        # probe.  Each attempt arms a fresh request and waits briefly.
+        for attempt in range(1, NAVIGATION_RESTORE_ATTEMPTS + 1):
+            if self._navigation_launch_running():
+                print('[INFO] Map-mode navigation restored (attempt %d).'
+                      % attempt, flush=True)
+                return True
+            request_id = 'restore-nav-%d-%d' % (attempt, int(time.time() * 1000))
+            payload = json.dumps({
+                'action': 'start_launch',
+                'package': NAVIGATION_LAUNCH_PACKAGE,
+                'launchFile': NAVIGATION_LAUNCH_FILE,
+                'requestId': request_id,
+            }).encode('utf-8')
+            print('[INFO] Requesting map-mode navigation restore '
+                  '(%s/%s) attempt %d/%d.'
+                  % (NAVIGATION_LAUNCH_PACKAGE, NAVIGATION_LAUNCH_FILE,
+                     attempt, NAVIGATION_RESTORE_ATTEMPTS), flush=True)
+            try:
+                request = Request(
+                    NAVIGATION_COMMAND_URL,
+                    data=payload,
+                    headers={'Content-Type': 'application/json'},
+                    method='POST',
+                )
+                with urlopen(request, timeout=10.0) as response:
+                    status = getattr(response, 'status', 'ok')
+                print('[INFO] Navigation restore request accepted: HTTP %s'
+                      % status, flush=True)
+            except (HTTPError, URLError, OSError, ValueError) as exc:
+                print('[WARNING] Navigation restore request failed: %s' % exc,
+                      file=sys.stderr, flush=True)
+            deadline = time.monotonic() + NAVIGATION_RESTORE_TIMEOUT_SEC
+            while time.monotonic() < deadline:
+                if self._navigation_launch_running():
+                    print('[INFO] Map-mode navigation restored (attempt %d).'
+                          % attempt, flush=True)
+                    return True
+                time.sleep(NAVIGATION_RESTORE_POLL_SEC)
+            if attempt < NAVIGATION_RESTORE_ATTEMPTS:
+                print('[WARNING] Map-mode navigation did not come up within '
+                      '%.0fs (attempt %d/%d); retrying in %.0fs.'
+                      % (NAVIGATION_RESTORE_TIMEOUT_SEC, attempt,
+                         NAVIGATION_RESTORE_ATTEMPTS,
+                         NAVIGATION_RESTORE_RETRY_SEC),
+                      file=sys.stderr, flush=True)
+                time.sleep(NAVIGATION_RESTORE_RETRY_SEC)
+        print('[WARNING] Map-mode navigation did not come up after %d '
+              'attempts; map-mode navigation (AMCL + map_server) stays '
+              'unavailable until it is started manually.'
+              % NAVIGATION_RESTORE_ATTEMPTS,
+              file=sys.stderr, flush=True)
+        return False
+
     def _write_navigation_release_failure_status(self) -> None:
         """Close only this task; no functional service has been stopped yet."""
         if not self.session_task_id:
@@ -494,15 +774,87 @@ class SessionRunner:
                     self.process_termination_failed = True
 
     def _mapping_finished(self) -> bool:
-        """True once the session file records a finished mapping result."""
+        """True once the session file records a finished mapping result.
+
+        2026-10-13 (P35): the taskId check must NOT be a hard gate when this
+        runner never captured an identity.  _capture_session_identity()
+        leaves session_task_id empty for direct/manual launches whose
+        task.json is not fresh (it prints 'task identity is unavailable or
+        stale' and returns).  Comparing the session file's real taskId
+        against that empty string made this predicate permanently False,
+        which in turn disabled the grace fallback in
+        _wait_for_inner_launch(): measured 18:23, all twelve child
+        processes exited at 18:25:44 while `ros2 launch` itself hung in
+        ep_poll, so the whole teardown blocked forever (phase stuck at
+        finalizing, functional services down, navigation never restored).
+        With an empty identity we simply skip the comparison and rely on
+        the mapping result fields alone.
+        """
         session = _read_json_object(SESSION_STATUS_PATH)
-        if str(session.get('taskId') or '').strip() != self.session_task_id:
-            return False
+        if self.session_task_id:
+            if str(session.get('taskId') or '').strip() != self.session_task_id:
+                return False
         return bool(
             session.get('mappingDone') is True
             and session.get('finalMapSaved') is True
             and str(session.get('terminationReason') or '').strip()
         )
+
+    def _inner_launch_orphaned(self) -> bool:
+        """P35: inner launch has no child processes left, so it is a zombie.
+
+P0a-20261014 —— 启动窗口保护。
+  实测（2026-10-14 09:34:03）：`ros2 launch` 刚 fork 出来、子进程尚未创建的
+  几秒窗口里，`pgrep -P` 返回"无子进程"，于是被判成僵尸；而该次会话随后
+  正常拉起了 23 个子进程并完整跑完建图。`pgrep -P` 只能证明"此刻没有子进程"，
+  无法区分"从未有过"与"已全部退出"。
+  修法：必须**先观察到过子进程**，且距首次观察超过
+  INNER_LAUNCH_ORPHAN_MIN_OBSERVE_SEC，才允许判 orphan。
+  该保护只会让判定更保守（更晚）—— P35 的"僵尸看门狗"语义不变。
+
+        `ros2 launch` occasionally fails to exit after every managed node has
+        gone away (measured 18:25:44: twelve nodes printed 'process has
+        finished cleanly', yet the launch process stayed in ep_poll with zero
+        children).  Such a launch can never do useful work again, so it should
+        start the same grace countdown as a finished mapping run -- this layer
+        does not depend on the session file at all.
+        """
+        if self.child is None or self.child.poll() is not None:
+            return False
+        try:
+            probe = subprocess.run(
+                ['pgrep', '-P', str(self.child.pid)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if probe.returncode == 0:
+            # P0a-20261014: 至少出现过一次子进程 —— 之后才允许谈"孤儿"。
+            self.inner_launch_children_seen = True
+            if self.inner_launch_first_child_at is None:
+                self.inner_launch_first_child_at = time.monotonic()
+            return False
+        # pgrep exits 1 when nothing matched -> no children left.
+        if not getattr(self, 'inner_launch_children_seen', False):
+            # 从未见到子进程：这更可能是"launch 还在启动"而不是僵尸。
+            if not getattr(self, 'inner_launch_childless_logged', False):
+                self.inner_launch_childless_logged = True
+                print(
+                    '[INFO] Inner launch has no child processes yet; '
+                    'treating it as still starting (startup-window guard).',
+                    flush=True)
+            return False
+        first_seen = getattr(self, 'inner_launch_first_child_at', None)
+        if first_seen is not None:
+            observed_for = time.monotonic() - first_seen
+            if observed_for < INNER_LAUNCH_ORPHAN_MIN_OBSERVE_SEC:
+                # 刚看到子进程全部退出，可能只是启动期的抖动。
+                return False
+        return True
 
     def _wait_for_inner_launch(self) -> int:
         if self.child is None:
@@ -514,11 +866,18 @@ class SessionRunner:
                     self.process_termination_failed = True
                     return 1
                 return self.child.returncode if self.child.returncode is not None else 0
-            if self._mapping_finished():
+            # 2026-10-13 (P35): also treat a childless launch as "done" -- it can
+            # never do useful work again, and waiting on it blocks teardown forever.
+            mapping_done = self._mapping_finished()
+            orphaned = False if mapping_done else self._inner_launch_orphaned()
+            if mapping_done or orphaned:
                 if finished_since is None:
                     finished_since = time.monotonic()
-                    print('[INFO] Mapping finished; waiting up to %.0fs for the inner '
-                          'launch to exit on its own.' % INNER_LAUNCH_EXIT_GRACE_SEC,
+                    print('[INFO] %s; waiting up to %.0fs for the inner launch to '
+                          'exit on its own.'
+                          % ('Mapping finished' if mapping_done
+                             else 'Inner launch has no child processes left',
+                             INNER_LAUNCH_EXIT_GRACE_SEC),
                           flush=True)
                 elif time.monotonic() - finished_since > INNER_LAUNCH_EXIT_GRACE_SEC:
                     print('[WARN] Inner launch did not exit within the grace window; '
@@ -763,12 +1122,26 @@ class SessionRunner:
         # launch may not, but the live manager's status file remains the exact
         # same session after its timestamp guard below is satisfied.
         session_task_id = self.session_task_id
+        requested_task_id = str(session.get('taskId') or '').strip()
         if not session_task_id:
-            candidate = session.get('taskId')
-            session_task_id = candidate.strip() if isinstance(candidate, str) else ''
+            session_task_id = requested_task_id
         if not session_task_id:
-            return
-        if str(session.get('taskId') or '') != session_task_id:
+            # 2026-10-13: 任务身份缺失时**不再放弃写终态**。
+            # 实测（10-13 两轮）：task.json 被清成 {"taskId":"","status":"idle"}
+            # 之后，runner 因身份为空直接 return，会话状态永久停在
+            # phase=finalizing / terminal=false，小程序卡在"正在核验建图服务状态"，
+            # 只能人工置终态。这里合成一个可追溯的 ID 继续写：
+            # 会话文件此刻已是本次会话写的（下面还有 updatedAtEpochMs 与
+            # process_exited/restore_succeeded 三重守卫），因此不会掩盖活跃会话。
+            session_task_id = 'task-recovered-%s' % time.strftime('%Y%m%d-%H%M%S')
+            print(
+                '[WARNING] Cartographer session task identity is missing; '
+                'publishing the terminal state under a synthesized task id '
+                '(%s) so the mini program can unlock.' % session_task_id,
+                file=sys.stderr,
+                flush=True,
+            )
+        if requested_task_id and requested_task_id != session_task_id:
             print(
                 '[WARNING] Cartographer session task ID changed; refusing to '
                 'overwrite another session status.',
@@ -957,7 +1330,11 @@ class SessionRunner:
                         # start-confirmation timeout fired during service shutdown.
                         session_return_code = 0
                     else:
-                        command = [*INNER_LAUNCH, *launch_args]
+                        command = [
+                            *INNER_LAUNCH,
+                            *_frontier_source_launch_args(),
+                            *launch_args,
+                        ]
                         print(f'[INFO] Starting isolated mapping session: {command}',
                               flush=True)
                         self.child = subprocess.Popen(command, start_new_session=True)
@@ -1007,6 +1384,43 @@ class SessionRunner:
                     self._write_navigation_release_failure_status()
                 else:
                     self._write_final_session_status(restore_succeeded)
+                # 2026-10-13 (P24): restore map-mode navigation AFTER the
+                # terminal state is on disk.  The restore waits for a settle
+                # window plus a bounded poll, so doing it first kept the
+                # session in `finalizing` for up to ~100 s -- which the mini
+                # program surfaces as a failed return home (measured 17:32:
+                # return home had already settled at 0.243 m).  A restore
+                # failure is reported but deliberately does NOT clear
+                # restore_succeeded: the functional services (follow /
+                # recharge) are already back and the vehicle is usable, so
+                # degrading the session into recovery_required would only
+                # stall the mini program.
+                if self.stop_attempted and not self.process_termination_failed:
+                    # 2026-10-13 (P25): hand the restore to a DETACHED helper
+                    # instead of waiting for it here.  The bridge refuses
+                    # `start_launch` while it still considers this mapping
+                    # session to own vehicle motion, and it only observes the
+                    # release after this runner (and the launch it owns) has
+                    # exited -- so waiting deadlocks.  Measured 17:45: all four
+                    # in-runner attempts were refused, the session stayed at
+                    # mappingSession='stopping', map-mode navigation never came
+                    # up, and the runner blocked for ~150 s while the mini
+                    # program sat on "finishing".
+                    self.navigation_restore_failed = False
+                    self.navigation_restore_reason = ''
+                    try:
+                        if not self._spawn_navigation_restore_helper():
+                            self.navigation_restore_failed = True
+                            self.navigation_restore_reason = (
+                                'could not spawn the detached navigation '
+                                'restore helper')
+                    except Exception as exc:  # noqa: BLE001 - 绝不阻断收尾
+                        self.navigation_restore_failed = True
+                        self.navigation_restore_reason = str(exc)
+                        print(
+                            f'[WARNING] Map-mode navigation restore helper '
+                            f'could not be spawned: {exc}',
+                            file=sys.stderr, flush=True)
             return session_return_code if restore_succeeded else 1
 
 

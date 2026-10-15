@@ -271,11 +271,42 @@ def generate_launch_description():
                 'registered_depth_topic': '/camera/depth/image_raw',
                 'camera_info_topic': '/camera/color/camera_info',
                 'mode_topic': '/mode',
+                # 2026-10-09: the temporary observation-test override (2 -> 1) has been REVERTED.
+                # It existed because follow mode was blocked outright by the localisation safety
+                # guard and by voice_summon_coordinator_bearing_nav's 'correct_unexpected_mode'
+                # rule; required_mode=1 let the detector infer while follow stayed off.
+                # DO NOT leave this at 1: with required_mode=1, enabling follow mode (mode=2) makes
+                # the detector SILENTLY STOP (current_mode 2 != required_mode 1) instead of failing
+                # loudly, and follow would appear broken for no visible reason.
                 'required_mode': 2,
                 'initial_mode': 1,
-                'max_inference_hz': 10.0,   # 回滚到 14:30
+                # 2026-10-09 (operator, item 4a): 10.0 -> 15.0 (the limit is exactly 15).
+                # The node's own source comment above lock_min_hits records the same finding:
+                # 'at 10 Hz the tracker only accumulated 2-3 hits per attempt, so the lock fell
+                #  back to the relaxed path almost every time (识别不稳定). Default raised to
+                #  15 Hz' -- but this launch had it overridden back to 10.0 ('回滚到 14:30'),
+                # i.e. the fix was never active.  More inference frames per second means more
+                # hits accumulate before a track breaks, so lock_min_hits=4 is reached sooner and
+                # the lock stops flapping.  Measured detector cost at 10 Hz was only ~13% CPU on
+                # a 16-thread i7-13620H, so there is ample headroom.
+                'max_inference_hz': 15.0,   # 回滚到 14:30
                 'onnx_intra_op_threads': 4,   # 回退到 14:30   # 2026-10-06: 4 -> 6（CPU 有余量）
-                'confidence_threshold': 0.50,   # 回滚到 14:30
+                # 2026-10-09 (operator, recognition attempt 1): 0.50 -> 0.30.
+                # Rationale (measured 2026-10-08 18:44-18:46, 1035 inference frames, always-on
+                # diag logger at /var/log/stemm-perception-diag.log):
+                #   valid (lock_status=2)  539 = 52.1 %
+                #   no_detection           486 = 47.0 %   <- zero person boxes AFTER filtering
+                #   lock_unconfirmed         2 =  0.2 %   (so lock_min_hits is not the problem)
+                #   depth rejections         0           (depth pipeline healthy:
+                #                                          depth_age=165 ms, skew=116 ms,
+                #                                          roi_valid_px=9788)
+                # "no_detection" counts only boxes that already passed confidence_threshold and
+                # min_box_area_px, so it is partly a CODE threshold rather than pure model recall.
+                # 0.50 is high for a YOLO11n at 1-3 m; 0.30 is the first thing to try.
+                # min_box_area_px 600 stays as a false-positive guard (a person at 3 m is
+                # ~27000 px, so the area gate is not the binding constraint).
+                # Verify with: python3 /home/hnh/perception-diag-summary.py --last
+                'confidence_threshold': 0.30,   # 回滚到 14:30
                 'nms_iou_threshold': 0.45,
                 'max_detections': 12,
                 'min_box_area_px': 600.0,
@@ -367,16 +398,54 @@ def generate_launch_description():
                 {'camera_offset_z_m': 0.0},
                 {'camera_yaw_offset_rad': 0.0},
 
-                {'follow_distance_m': 1.5},
+                { 'follow_distance_m': 1.55 },   # 2026-10-09 (operator, parameter set)
+                # CURRENT derived envelope (measured on the running node, see the banner line
+                # "Human-approach retreat threshold = ..."):
+                #   forward trigger   1.55 + 0.12 (visual_distance_deadband_mm 120) = 1.67 m
+                #   hold band         1.43 .. 1.67 m
+                #   visual reverse    1.55 - 0.12                                   = 1.43 m
+                #   retreat trigger   1.55 - 0.12 (hold_distance_band_m)             = 1.43 m
+                #   safety gate too_close                                            = 1.43 m
+                # KEY: because visual_distance_deadband_mm now equals hold_distance_band_m
+                # (both 0.12), the reverse engagement, the retreat trigger AND the hold release
+                # all sit at 1.43 m.  The previous inconsistency -- the state said "reverse"
+                # while the command was pinned at 0.000 inside the hold band (measured over
+                # filt_z 1.23-1.47 m, 23/23 frames) -- therefore disappears.
+                # Independent and unchanged: takeover_person_depth_min_m 2.00, hard close 0.90,
+                # avoidance retreat floor 1.00, and every body-loss grace value.
+                # (The note directly below describes the superseded 1.35 m envelope.)
+                # History: 1.50 (trigger 1.58) -> 1.20 on 2026-10-08 (-30 cm) -> 1.35 on 2026-10-09
+                # (+15 cm), i.e. 15 cm earlier than the original 1.58 m.
+                # NOTE: this value IS the desired following distance as well, so the whole
+                # close-range envelope moves with it (measured on the running node):
+                #   forward trigger   1.35 + 0.08 (visual_distance_deadband_mm)  = 1.43 m
+                #   hold band         1.27 .. 1.43 m
+                #   visual reverse    1.35 - 0.08                                = 1.27 m
+                #   retreat trigger   1.35 - 0.12 (hold_distance_band_m) + 0.00  = 1.23 m
+                #   safety gate too_close                                        = 1.23 m
+                # Independent of it: takeover_person_depth_min_m 2.00, hard close 0.90,
+                # avoidance retreat floor 1.00.
                 {'hold_distance_band_m': 0.12},   # 回滚到 14:30 较稳定版本
-                {'human_retreat_trigger_extra_m': 0.50},   # 回滚到 14:30（后退阈值 1.88m）
-                {'human_retreat_exit_hysteresis_m': 0.20},   # 回滚到 14:30
+                # 2026-10-07（方案 X，用户决定）：后退只负责 < 1.38 m，其余距离交回视觉直控
+                # （前进或保持）。触发 = follow(1.50) - hold_band(0.12) + extra(0.0) = 1.38 m；
+                # 仍保留 0.20 m 退出滞回（释放于 1.58 m），避免阈值上逐拍翻转。
+                # 原值 0.50（触发 1.88 m）会让后退抢占 1.62-2.08 m 这段"PD 认为该前进"的
+                # 区间，实测该状态 82 条指令里 46 条是前进，是撞障的直接来源。
+                {'human_retreat_trigger_extra_m': 0.0},
+                {'human_retreat_exit_hysteresis_m': 0.20},   # 方案 X：滞回保留
+                # 2026-10-07：① 的"后退态禁止前进"已不需要（触发降到 1.38 后后退不再进入
+                # 前进区），保留反而会造成"人未离开 2 m 车就不跟"，故置 false。
+                {'retreat_no_forward': False},
+                # 2026-10-07：③ 前进需激光许可，保持开启（两次撞障的激光读数 0.163 / 0.341 m）。
+                {'visual_forward_obstacle_clearance_m': 0.35},
                 {'min_goal_distance_m': 0.15},
                 {'goal_update_period_s': 0.8},
                 {'goal_position_tolerance_m': 0.25},
                 {'goal_yaw_tolerance_rad': 0.15},
                 {'lost_timeout_s': 1.5},
-                {'body_invalid_grace_s': 0.80},
+                # 2026-10-07（实测）：感知精确观测出现 0.80-0.86 s 的空档就停车。
+                # 放宽到 2.0 s，让 1-2 s 的闪断不再触发 body_lost_memory_expired。
+                {'body_invalid_grace_s': 2.00},
                 {'tf_timeout_s': 0.20},
                 {'enable_retreat_goal': False},
                 {'max_retreat_goal_m': 0.8},
@@ -434,7 +503,37 @@ def generate_launch_description():
                 # by G2 while Nav2 is still progressing. 1.2 s keeps a nearly-finished push
                 # intact but stops the handback from waiting for the whole detour; 999 restores
                 # the old always-protect behaviour.
-                {'avoid_goal_protect_clear_grace_s': 1.2},
+                # 2026-10-07（用户决定 P0-B）：净空连续确认 0.5 s 即交回视觉控制。
+                # 原 1.2 s 因宽限期被反复清零而永远到不了，导致绕障后视觉接管失效。
+                {'avoid_goal_protect_clear_grace_s': 0.5},
+                # 2026-10-08 (operator principle: each accumulator is cleared only by
+                # its OWN condition).  The 2026-09-28 'let the grace mature' intent was
+                # implemented but left disabled by this default: with it true,
+                # avoid_clear_preempt_since_ is zeroed on every tick where
+                # visual_clear_takeover_confirmed() returns false -- which it does on any
+                # tick without a new scan generation (src line 3511), on a D8 block, during
+                # the cooldown and at the attempt cap.  The loop and the lidar are both
+                # ~10 Hz and not in lockstep, so the grace was zeroed essentially every
+                # tick and never reached 0.50 s.
+                # Field proof 2026-10-08 17:46: every suppression line read
+                # 'clear handback confirmed 0.00/0.50s', 'Physical-clear takeover candidate'
+                # re-fired every ~0.3 s, and the handback waited 4.4-6.4 s for Nav2 to run
+                # the whole detour instead of ~0.5 s.
+                # G2 itself, stall_ticks=15 and the 0.50 s requirement are all unchanged.
+                {'avoid_clear_grace_restart_on_gate_loss': False},
+                # 2026-10-08 (operator, option 1): raise the D8 handback depth gate from
+                # 1.38 m to 2.00 m.  D8 was self-defeating once the drain was measured at
+                # 1.6 s: it held the handback until the person walked inside 1.38 m, and by
+                # the time the cancel+drain finished the person had reached the 0.90 m hard
+                # close, so the retreat (priority 2) cancelled the handback.
+                # Evidence 2026-10-08 18:33-18:35: D8 blocked 7x with the person at
+                # 1.38/1.60/1.77/2.22/2.49/2.65/2.65 m; the 7 retreats that followed fired at
+                # 0.83/0.88/0.90/0.96/0.97/1.03/1.03 m -- all inside the retreat band.
+                # Starting the handback while the person is still farther out lets the 1.6 s
+                # drain elapse before they arrive, so visual control takes over with the
+                # distance still manageable instead of arriving inside the hard close.
+                # Live-tunable: ros2 param set /body_nav2_follower takeover_person_depth_min_m <m>
+                {'takeover_person_depth_min_m': 2.0},
                 {'visual_safety_release_confirm_frames': 2},
                 {'visual_safety_min_finite_rays_per_sector': 1},
                 {'nav_takeover_child_capture_slop_s': 0.10},
@@ -456,19 +555,60 @@ def generate_launch_description():
                 {'visual_z_d': 0.30},   # 回滚到 14:30 较稳定版本   # 2026-10-06: 0.30 -> 0.60 阻尼翻倍，治过冲（越过人体中心）
                 {'visual_filter_alpha': 0.62},   # 回滚到 14:30   # 2026-10-06: 0.62 -> 0.75 滤波时间常数 107ms -> 67ms
                 {'visual_angle_deadband': 0.015},   # 回滚到 14:30   # 2026-10-06: 0.015 -> 0.008（1.55m 处 23mm -> 12mm 才响应）
-                {'visual_distance_deadband_mm': 80.0},
+                # 2026-10-09 (parameter set): 80 -> 120, deliberately equal to
+                # hold_distance_band_m so that "reverse allowed" and "hold released" happen at
+                # the SAME distance instead of 1.27 m vs 1.23 m.
+                {'visual_distance_deadband_mm': 120.0},
                 # 2026-09-28: forward follow ceiling raised by request; reverse stays at
                 # its previous value (forward*1.00 == 0.75) so the reverse/retreat path
                 # is unchanged.
-                {'visual_max_linear_mps': 0.80},
+                # 2026-10-09 (parameter set): 0.80 -> 0.60.  Braking distance scales with
+                # v^2, so the measured 0.36 m of travel while braking drops to about 0.20 m.
+                {'visual_max_linear_mps': 0.60},
+                # 2026-10-09 (operator, plan A): the proportional-law steepness.  It was the
+                # compile-time constant BODY_NAV2_VISUAL_FULL_SPEED_ERROR_M (0.40), which made
+                # the car reach full speed only once the person was 1.95 m away -- the person had
+                # to walk 40 cm past follow_distance before the car matched their speed.  0.22
+                # gives 3.1x the response at small errors and full speed at 1.77 m, WITHOUT
+                # moving any threshold (forward trigger 1.67 m, hold band, reverse 1.43 m are
+                # set by visual_distance_deadband_mm / hold_distance_band_m).
+                # Hot-tunable; set 0.40 to restore the old feel, 0.30 if a steeper gain oscillates.
+                {'visual_full_speed_error_m': 0.22},
+                # 2026-10-09 (operator): 1.0 -> 2.5.  The motion-intent watchdog must not fire
+                # in the MIDDLE of a Nav2 retry backoff (nav2_retry_backoff_s = 1.5), otherwise
+                # it steals the motion from the visual controller and the command has to ramp up
+                # from zero again -- measured 18 ownership_lost_resume_visual events in one test
+                # window, including inside reverse runs.  Keep this strictly greater than
+                # nav2_retry_backoff_s.  Hot-tunable (read every tick).
+                {'ownership_lost_timeout_s': 2.5},
                 # 2026-09-28: operator request -- reverse ceiling lowered from 0.75 to
                 # 0.50 m/s. Reverse is measured to reach exactly this value on the live
                 # trace, so it is applied independently of the forward ceiling; the
                 # human-approach retreat is distance-proportional and is capped by it too.
-                {'visual_max_reverse_mps': 0.50},
+                # 2026-10-09 (operator): 0.50 -> 0.60.  Measured on the robot the 0.50 ceiling was
+                # the real cap (12 samples of linear=-0.500 in the 2026-10-08 journal, with a
+                # slew-limited tail at -0.498/-0.495/...).  Applies to the human-approach retreat
+                # too, which uses the same reverse path.  Source clamp: control_loop
+                # clamp_value(desired.linear.x, -max_reverse_mps, visual_max_linear_mps_).
+                {'visual_max_reverse_mps': 0.60},
                 {'visual_max_angular_rps': 1.15},
-                {'visual_linear_accel_limit': 0.90},
+                # 2026-10-09 (parameter set): 0.90 -> 1.80.  NOTE this is the value that
+                # actually limits forward BRAKING on the visual path (publish_visual_follow_cmd
+                # passes it as decel_limit_override); visual_linear_decel_limit is NOT used
+                # there.  Effect: stopping from 0.80 m/s goes 0.89 s -> 0.44 s.
+                # Side effect to be aware of: forward acceleration is also crisper.
+                {'visual_linear_accel_limit': 1.80},
                 {'visual_reverse_accel_limit': 1.80},
+                # 2026-10-09 (operator): the forward->reverse through-zero pass.  It used to run
+                # on visual_linear_decel_limit (0.35) while the reverse itself is allowed 1.80, so
+                # from +0.8 m/s the car kept advancing for 2.3 s before any reverse began
+                # ("reverse is very unresponsive"; log: state=visual_reverse_follow at 948 mm with
+                # linear=+0.127).  Only that pass is affected -- set 0.35 to restore the old feel.
+                {'visual_direction_change_limit_mps2': 1.80},
+                # 2026-10-09 (housekeeping): this override was accidentally dropped when the line
+                # above was inserted (that patch's replacement text did not re-include it).  The
+                # value equals the node default, so nothing changed in behaviour -- verified live
+                # at 0.35 -- but it is restored so the launch stays the single source of truth.
                 {'visual_linear_decel_limit': 0.35},
                 {'visual_angular_accel_limit': 2.2},
                 {'visual_allow_reverse': True},

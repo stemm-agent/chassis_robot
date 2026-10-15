@@ -90,7 +90,14 @@ class AmclOdomLimiter(Node):
         self.declare_parameter('max_yaw_rate', 0.35)
         # 2026-09-28: raised from 2.0; the stale-pose refresh keeps the age in the
         # 0.5-5 s band, so 2 s produced false alarms on a healthy system.
-        self.declare_parameter('warn_pose_age_sec', 8.0)
+        # 2026-10-12 B：8.0 -> 15.0。AMCL 静止时没有内部定时发布
+        # （publishAmclPose 只由 resampled/force_publication 触发），
+        # 实测 /amcl_pose 周期恒为 5.08~5.17 s，对 8.0 s 只剩约 2.9 s
+        # 余量；17:37 那轮 AMCL 稍慢即被判 stale，进而让 adaptor 锁死
+        # interlock、有图导航栈 navigation_health_timeout 后被清掉。
+        # 这里与 launch（wheeltec_nav2.launch.py）保持一致，
+        # 避免 launch 传参丢失时退回边沿竞态。
+        self.declare_parameter('warn_pose_age_sec', 15.0)
         self.declare_parameter('status_topic', '~/status')
         self.declare_parameter('nomotion_update_service', '/request_nomotion_update')
         self.declare_parameter('nomotion_first_delay_sec', 1.0)
@@ -101,7 +108,10 @@ class AmclOdomLimiter(Node):
         # 2026-09-28: the budget is no longer a one-shot allowance.
         self.declare_parameter('nomotion_rearm_sec', 10.0)
         # 2026-09-28: ask for a refresh when the last pose is older than this.
-        self.declare_parameter('nomotion_request_age_sec', 5.0)
+        # 2026-10-12 B：5.0 -> 1.5。实测把本节点看到的 pose_age 从
+        # 3~5 s 压到 2.0~2.4 s（运行时改参实测，随后恢复）。
+        # 与 launch 保持一致。
+        self.declare_parameter('nomotion_request_age_sec', 1.5)
         self.declare_parameter('amcl_node_name', 'amcl')
         self.declare_parameter('amcl_absence_shutdown_sec', 15.0)
 

@@ -1,3 +1,5 @@
+import math
+import time
 from types import SimpleNamespace
 from threading import RLock
 
@@ -664,6 +666,91 @@ def test_pose_stall_window_resets_after_small_but_real_translation(
     assert manager.current_goal_handle.cancel_count == 1
 
 
+def test_pose_stall_ignores_pure_in_place_rotation(monkeypatch):
+    """2026-10-12: 原地纯旋转不是停滞。
+
+    实测（run-1113）：Nav2 按控制器指令原地转向时位移恒为 0，
+    角速度可达 0.61~1.01 rad/s；原判据只看位移，把这类正常转向
+    整段算作"停滞"，7s 后误取消目标（9 次停滞中 6 次如此）。
+    本用例锁定：只要朝向在变，就不判停滞。
+    """
+    now = [10.0]
+    position = [0.0, 0.0]
+    yaw = [0.0]
+
+    def pose_with_yaw():
+        pose = make_pose(*position)
+        pose.pose.orientation.z = math.sin(yaw[0] / 2.0)
+        pose.pose.orientation.w = math.cos(yaw[0] / 2.0)
+        return pose
+
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    manager._active_goal_kind = 'exploration_manager'
+    manager._active_goal_generation = 11
+    manager.nav_goal_active = True
+    manager.current_goal_handle = FakeGoalHandle()
+    manager._distance_source = 'feedback'
+    manager._latest_feedback_distance = 2.0
+    manager.exploration_watchdog = ExplorationProgressWatchdog(
+        100.0, 0.12, 200.0)
+    manager.exploration_watchdog.reset(now[0])
+    manager.update_pose = pose_with_yaw
+
+    manager._progress_watchdog_callback_impl()
+    # 位置完全不动，但朝向持续变化（模拟原地旋转 1.0 rad/s）
+    for step in range(1, 21):
+        now[0] = 10.0 + step * 0.5
+        yaw[0] = 0.5 * step
+        manager._progress_watchdog_callback_impl()
+        assert manager.current_goal_handle.cancel_count == 0, (
+            'yaw=%.2f 时不应判停滞' % yaw[0])
+    # 20 步 × 0.5s = 10s > 7s 判据；若判据只看位移，这里早就取消了
+    assert not manager._stall_cancel_requested
+    assert now[0] - 10.0 > manager.exploration_pose_stall_timeout_sec
+
+
+def test_pose_stall_still_fires_when_translation_and_yaw_are_both_static(
+        monkeypatch):
+    """2026-10-12: 位移与朝向都静止时，停滞判据必须仍然生效。
+
+    这是加入 yaw 维度后的"不能过度放宽"护栏：
+    真正卡死（连转都不转）不再被放过。
+    """
+    now = [10.0]
+    position = [0.0, 0.0]
+
+    def static_pose():
+        pose = make_pose(*position)
+        pose.pose.orientation.w = 1.0
+        return pose
+
+    monkeypatch.setattr(manager_module.time, 'monotonic', lambda: now[0])
+    manager = make_manager()
+    manager._active_goal_kind = 'exploration_manager'
+    manager._active_goal_generation = 12
+    manager.nav_goal_active = True
+    manager.current_goal_handle = FakeGoalHandle()
+    manager._distance_source = 'feedback'
+    manager._latest_feedback_distance = 2.0
+    manager.exploration_watchdog = ExplorationProgressWatchdog(
+        100.0, 0.12, 200.0)
+    manager.exploration_watchdog.reset(now[0])
+    manager.update_pose = static_pose
+    manager.remember_failed_goal = lambda: None
+    manager.remember_blocked_place = lambda: None
+
+    manager._progress_watchdog_callback_impl()
+    now[0] = 16.999
+    manager._progress_watchdog_callback_impl()
+    assert manager.current_goal_handle.cancel_count == 0
+
+    now[0] = 17.0
+    manager._progress_watchdog_callback_impl()
+    assert manager.current_goal_handle.cancel_count == 1
+    assert manager._stall_cancel_requested
+
+
 def test_pose_stall_does_not_abandon_goal_inside_terminal_tolerance(
         monkeypatch):
     now = [10.0]
@@ -1049,6 +1136,163 @@ def test_sync_goal_response_keeps_source_and_exploration_bt(monkeypatch):
     assert manager._active_goal_generation == 1
     assert manager._pending_goal_generation is None
     assert manager.nav_goal_active
+
+
+def _prepare_dispatch_harness(manager, heading=None):
+    """ManagerHarness 不走真实 __init__，需补齐 send_nav_goal 前置检查用到的属性。
+
+    取值照抄 test_sync_goal_response_keeps_source_and_exploration_bt 等既有用例。
+    """
+    manager.last_explore_heading = heading
+    manager.last_pose = make_pose(0.0, 0.0)
+    manager.return_home_requested = False
+    manager.front_blocked = False
+    manager.front_min_range = 2.0
+    manager.mode = 'mapping'
+    manager.navigation_state = 'idle'
+    manager.mapping_done = False
+    manager.auto_explore = True
+    manager.shutdown_started = False
+    manager._mapping_cancel_requested = False
+    manager._mapping_timeout_failure_kind = ''
+    manager._return_home_xy_finalizing = False
+    manager._spin_phase = 'idle'
+    manager.goal_clearance = 0.50
+    manager.return_home_goal_clearance = 0.35
+    manager.goal_yaw_mode = 'tangent'
+    return manager
+
+
+def _dispatch_exploration_goal(monkeypatch, manager, kind, x=1.0, y=2.0):
+    """按 test_sync_goal_response_keeps_source_and_exploration_bt 的模式派发一个目标。"""
+    def fake_base_response(self, future):
+        self.goal_send_future = None
+        goal_handle = future.result()
+        self.current_goal_handle = goal_handle
+        self.nav_goal_active = True
+        self.reset_progress_watchdog()
+        self.navigation_state = 'executing'
+        self.goal_result_future = goal_handle.get_result_async()
+
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager, 'goal_response_callback',
+        fake_base_response)
+    monkeypatch.setattr(
+        manager_module.StemmNav2Manager, 'reset_progress_watchdog',
+        lambda _self: None)
+    goal_handle = FakeGoalHandle()
+    manager.nav_client = FakeNavClient(goal_handle)
+    pose = PoseStamped()
+    pose.header.frame_id = 'map'
+    pose.pose.position.x = x
+    pose.pose.position.y = y
+    manager._run_with_goal_kind(kind, manager.send_nav_goal, pose, False, False)
+
+
+def _goal_yaw(manager):
+    """从最近发送的目标里取出朝向（弧度）。
+
+    FakeNavClient.send_goal_async 里存的是 (goal, feedback_callback)，
+    goal 为 nav2_msgs/NavigateToPose.Goal，其 .pose 是 PoseStamped，
+    因此朝向位于 goal.pose.pose.orientation。
+    """
+    goal = manager.nav_client.sent_goals[-1][0]
+    q = goal.pose.pose.orientation
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def test_approach_mode_sets_goal_yaw_to_travel_direction(monkeypatch):
+    """2026-10-12: approach 模式下目标朝向 = 指向目标的方位角（= 抵达时的行进方向）。
+
+    原 'tangent' 模式写入「派发那一刻的车头朝向」，而那一刻机器人还没转
+    （run-1316 实测 turn 平均 85°、最大 162°），抵达时朝向已变成行进方向，
+    两者差 109°/147°。Nav2 用 SimpleGoalChecker(yaw=0.25rad) 把目标朝向
+    当作「抵达时必须满足」的约束，机器人因此必须在终点再转回去。
+    """
+    manager = _prepare_dispatch_harness(make_manager(), heading=0.0)
+    manager.goal_yaw_mode = 'approach'
+    # 目标在正前方偏左：方位 = atan2(2, 1)
+    _dispatch_exploration_goal(monkeypatch, manager, 'exploration_manager',
+                               x=1.0, y=2.0)
+    expected = math.atan2(2.0 - 0.0, 1.0 - 0.0)
+    got = _goal_yaw(manager)
+    assert abs(got - expected) < 1e-6, (
+        'approach 模式朝向应等于指向目标的方位角: %.4f vs %.4f'
+        % (got, expected))
+
+
+def test_approach_mode_applies_to_rrt_goals_too(monkeypatch):
+    """RRT 探索目标也必须走同一条朝向逻辑（原条件写死 exploration_manager）。"""
+    manager = _prepare_dispatch_harness(make_manager(), heading=0.0)
+    manager.goal_yaw_mode = 'approach'
+    _dispatch_exploration_goal(monkeypatch, manager, 'exploration_rrt',
+                               x=0.0, y=3.0)
+    expected = math.atan2(3.0 - 0.0, 0.0 - 0.0)   # = pi/2
+    got = _goal_yaw(manager)
+    assert abs(got - expected) < 1e-6, (
+        'RRT 目标未使用 approach 逻辑: %.4f vs %.4f' % (got, expected))
+
+
+def test_tangent_mode_still_available_for_rollback(monkeypatch):
+    """tangent 模式保留可用，便于一键回退。"""
+    manager = _prepare_dispatch_harness(make_manager(), heading=0.0)
+    manager.goal_yaw_mode = 'tangent'
+    _dispatch_exploration_goal(monkeypatch, manager, 'exploration_manager',
+                               x=1.0, y=2.0)
+    # 车头为 0 → tangent 写入 0
+    assert abs(_goal_yaw(manager) - 0.0) < 1e-6
+
+
+def test_keep_mode_does_not_rewrite_goal_yaw(monkeypatch):
+    """keep 模式不改写朝向，应保留调用方传入的值。"""
+    manager = _prepare_dispatch_harness(make_manager(), heading=0.0)
+    manager.goal_yaw_mode = 'keep'
+    _dispatch_exploration_goal(monkeypatch, manager, 'exploration_manager',
+                               x=1.0, y=2.0)
+    # 调用方传入的 PoseStamped 朝向为默认（w=1 → yaw 0），keep 应保持
+    assert abs(_goal_yaw(manager) - 0.0) < 1e-6
+
+
+def test_rrt_dispatch_updates_explore_heading(monkeypatch):
+    """2026-10-12: RRT 目标也必须更新方向持续基准。
+
+    原条件写死 kind == 'exploration_manager'，而 RRT 目标的 kind 是
+    'exploration_rrt'（frontier_goal_callback -> _run_with_goal_kind），
+    于是基准在 RRT 派发后完全不更新：机器人已被 RRT 转到新朝向，
+    基准却停在旧方位，下一次 fallback 选点必然大掉头。
+    实测（run-1146）8 目标序列里出发大转(>120度) 3/7 次。
+    """
+    manager = _prepare_dispatch_harness(make_manager(), heading=None)
+    _dispatch_exploration_goal(monkeypatch, manager, 'exploration_rrt')
+
+    assert manager._active_goal_kind == 'exploration_rrt'
+    expected = math.atan2(2.0 - 0.0, 1.0 - 0.0)
+    assert manager.last_explore_heading is not None, (
+        'RRT dispatch left last_explore_heading as None')
+    assert abs(manager.last_explore_heading - expected) < 1e-6, (
+        'heading not pointing at goal: %.4f vs %.4f'
+        % (manager.last_explore_heading, expected))
+
+
+def test_manager_dispatch_still_updates_explore_heading(monkeypatch):
+    """exploration_manager 的行为不能被这次修改破坏。"""
+    manager = _prepare_dispatch_harness(make_manager(), heading=None)
+    _dispatch_exploration_goal(monkeypatch, manager, 'exploration_manager')
+
+    assert manager._active_goal_kind == 'exploration_manager'
+    assert manager.last_explore_heading is not None
+    assert abs(manager.last_explore_heading - math.atan2(2.0, 1.0)) < 1e-6
+
+
+def test_return_home_dispatch_does_not_touch_explore_heading(monkeypatch):
+    """返航/手动目标不得更新探索方向基准，保持原有语义。"""
+    sentinel = 1.234
+    manager = _prepare_dispatch_harness(make_manager(), heading=sentinel)
+    _dispatch_exploration_goal(monkeypatch, manager, 'home')
+
+    assert manager.last_explore_heading == sentinel, (
+        'home goal must not touch the exploration heading')
 
 
 def test_distant_goal_zero_bootstrap_feedback_is_ignored(monkeypatch):
@@ -3046,3 +3290,677 @@ def test_return_home_setup_failures_are_retried_before_manual_takeover(
     assert not manager.pending_home_goal
     assert manager.mode == 'stopped'
     assert manager.navigation_state == 'return_home_failed_waiting_manual'
+
+def _make_grid_map(cells):
+    """cells: list of rows, each a list of 0(自由)/100(占用)。"""
+    from nav_msgs.msg import OccupancyGrid, MapMetaData
+    from geometry_msgs.msg import Pose as _Pose, Quaternion as _Quat
+
+    grid = OccupancyGrid()
+    info = MapMetaData()
+    info.resolution = 0.05
+    info.width = len(cells[0])
+    info.height = len(cells)
+    info.origin = _Pose()
+    info.origin.orientation = _Quat(w=1.0)
+    grid.info = info
+    # OccupancyGrid 行序：第 0 行在 map y 最小处
+    data = []
+    for row in cells:
+        data.extend(row)
+    grid.data = data
+    return grid
+
+
+def _connected_gate_manager(monkeypatch, cells, robot_xy):
+    """构造一个能跑真实 BFS 的 manager（合成地图 + 桩位姿）。"""
+    from geometry_msgs.msg import PoseStamped
+
+    manager = _prepare_dispatch_harness(make_manager())
+    monkeypatch.setattr(manager, 'update_pose',
+                        lambda: make_pose(robot_xy[0], robot_xy[1]))
+    manager.last_map = _make_grid_map(cells)
+    return manager
+
+
+def test_connectivity_gate_rejects_walled_off_goal(monkeypatch):
+    """2026-10-12 E-1 核心行为：被不连续障碍隔断的已知区域必须被拒。
+
+    左半区与右半区之间是一道完整竖墙，机器人在左、目标在右。
+    这正是 run-1402 的实测场景（目标派发到被隔断的已知区域，
+    Nav2 反复 no valid path found / exceeded maximum iterations 直到 50s 超时）。
+    """
+    # 9 行 × 11 列，0.05m => 0.45m × 0.55m；第 5 列整列为墙
+    cells = [[0] * 11 for _ in range(9)]
+    for r in range(9):
+        cells[r][5] = 100
+    manager = _connected_gate_manager(monkeypatch, cells, (0.05, 0.20))
+
+    left_goal = make_pose(0.10, 0.25)    # 与机器人同侧
+    right_goal = make_pose(0.30, 0.25)   # 墙的另一侧（x=0.25 是墙）
+
+    assert manager._explore_target_is_connected(left_goal) is True, \
+        '同侧目标必须放行'
+    assert manager._explore_target_is_connected(right_goal) is False, \
+        '被墙隔断的目标必须判为不可达'
+
+
+def test_connectivity_gate_passes_when_map_is_absent(monkeypatch):
+    """没有 /map 时必须放行（三态兜底），绝不能阻断探索。"""
+    manager = _prepare_dispatch_harness(make_manager())
+    monkeypatch.setattr(manager, 'update_pose',
+                        lambda: make_pose(0.0, 0.0))
+    manager.last_map = None
+    assert manager._explore_target_is_connected(make_pose(1.0, 1.0)) is None
+
+
+def test_connectivity_gate_passes_when_robot_cell_is_occupied(monkeypatch):
+    """机器人在占用格上时无权判定 -> None（放行），交给既有闸门。"""
+    cells = [[0] * 5 for _ in range(5)]
+    cells[2][2] = 100
+    manager = _connected_gate_manager(monkeypatch, cells, (0.10, 0.10))
+    assert manager._explore_target_is_connected(make_pose(0.05, 0.05)) is None
+
+
+def test_connectivity_gate_passes_when_goal_cell_is_occupied(monkeypatch):
+    """目标格被占时 -> None（放行），不抢 R1d/goal_is_traversable 的判定权。"""
+    cells = [[0] * 5 for _ in range(5)]
+    cells[0][0] = 100
+    manager = _connected_gate_manager(monkeypatch, cells, (0.10, 0.10))
+    assert manager._explore_target_is_connected(make_pose(0.00, 0.00)) is None
+
+
+def test_connectivity_gate_reuses_cache_within_same_cell(monkeypatch):
+    """同一格内重复判定必须复用缓存（性能前提，避免每拍全图 BFS）。"""
+    cells = [[0] * 21 for _ in range(21)]
+    for r in range(21):
+        cells[r][10] = 100
+    manager = _connected_gate_manager(monkeypatch, cells, (0.10, 0.20))
+
+    first = manager._reachable_free_cells()
+    assert first and len(first) > 1, 'BFS 应至少覆盖机器人所在连通域'
+    cached = manager._explore_reach_cache
+    assert cached is not None, '必须写入缓存'
+    second = manager._reachable_free_cells()
+    assert second is first, '同一格内必须复用同一集合对象'
+    assert manager._explore_reach_cache is cached, '缓存不得被重算覆盖'
+
+def _map_with_size(width, height):
+    from nav_msgs.msg import OccupancyGrid, MapMetaData
+    from geometry_msgs.msg import Pose as _Pose, Quaternion as _Quat
+    grid = OccupancyGrid()
+    info = MapMetaData()
+    info.resolution = 0.05
+    info.width = width
+    info.height = height
+    info.origin = _Pose()
+    info.origin.orientation = _Quat(w=1.0)
+    grid.info = info
+    grid.data = [0] * (width * height)
+    return grid
+
+
+def test_final_map_timeout_falls_back_to_cached_map(monkeypatch, tmp_path):
+    """2026-10-12 N-3：finish 后等不到新栅格时，必须退回保存缓存地图。
+
+    实测 14:41 那轮：revision 停在 62（62->62），
+    而 map_present=True、last_map_age=6.74s，缓存地图完全可用，
+    但旧实现判定 save failed 并放弃 —— 整轮建图成果丢失、
+    finalMapSaved=False、磁盘上仍是上一轮产物。
+    """
+    manager = _prepare_dispatch_harness(make_manager())
+    manager._final_map_saved = False
+    manager._final_map_saved_fallback = False
+    manager._final_map_save_attempted = False
+    manager._final_map_save_error = ''
+    manager._final_map_saved_at = ''
+    manager._final_map_wait_started_at = 0.0
+    manager._final_map_wait_deadline = 0.0
+    manager._final_map_wait_revision = 0
+    manager._final_map_finish_revision = 62
+    manager._map_revision = 62          # 关键：revision 不再推进
+    manager.last_map = _map_with_size(20, 16)
+    manager.last_map_time = time.monotonic()
+    manager.map_save_path = str(tmp_path / 'map')
+    manager.final_map_wait_timeout_sec = 0.0      # 立即判定超时
+    manager.final_map_grace_after_growth_sec = 0.0
+    manager.final_map_save_fallback_on_timeout = True
+
+    saved, message = manager._save_final_map_before_return()
+
+    assert saved is True, '超时也必须继续返航（saved=True）'
+    assert manager._final_map_saved is True, '缓存地图必须被保存'
+    assert manager._final_map_saved_fallback is True, '必须标注为兜底保存'
+    import os
+    assert os.path.exists(str(tmp_path / 'map.pgm')), 'pgm 必须落盘'
+    assert os.path.exists(str(tmp_path / 'map.yaml')), 'yaml 必须落盘'
+
+
+def test_final_map_timeout_fallback_can_be_disabled(monkeypatch, tmp_path):
+    """把 final_map_save_fallback_on_timeout 关掉时，恢复旧的丢弃行为。"""
+    manager = _prepare_dispatch_harness(make_manager())
+    for attr in ('_final_map_saved', '_final_map_saved_fallback',
+                 '_final_map_save_attempted'):
+        setattr(manager, attr, False)
+    manager._final_map_save_error = ''
+    manager._final_map_saved_at = ''
+    manager._final_map_wait_started_at = 0.0
+    manager._final_map_wait_deadline = 0.0
+    manager._final_map_wait_revision = 0
+    manager._final_map_finish_revision = 62
+    manager._map_revision = 62
+    manager.last_map = _map_with_size(20, 16)
+    manager.last_map_time = time.monotonic()
+    manager.map_save_path = str(tmp_path / 'map')
+    manager.final_map_wait_timeout_sec = 0.0
+    manager.final_map_grace_after_growth_sec = 0.0
+    manager.final_map_save_fallback_on_timeout = False
+
+    import os
+    saved, _ = manager._save_final_map_before_return()
+    assert saved is True
+    assert manager._final_map_saved is False, '关掉兜底后不应保存'
+    assert not os.path.exists(str(tmp_path / 'map.pgm')), '不应落盘'
+
+
+def test_final_map_fallback_rejects_invalid_cached_map(monkeypatch, tmp_path):
+    """缓存地图尺寸异常时，兜底也必须拒绝保存（不能写出坏地图）。"""
+    manager = _prepare_dispatch_harness(make_manager())
+    for attr in ('_final_map_saved', '_final_map_saved_fallback',
+                 '_final_map_save_attempted'):
+        setattr(manager, attr, False)
+    manager._final_map_save_error = ''
+    manager._final_map_saved_at = ''
+    manager._final_map_wait_started_at = 0.0
+    manager._final_map_wait_deadline = 0.0
+    manager._final_map_wait_revision = 0
+    manager._final_map_finish_revision = 62
+    manager._map_revision = 62
+    bad = _map_with_size(20, 16)
+    bad.data = [0] * 10                 # 与 20x16 不符
+    manager.last_map = bad
+    manager.last_map_time = time.monotonic()
+    manager.map_save_path = str(tmp_path / 'map')
+    manager.final_map_wait_timeout_sec = 0.0
+    manager.final_map_grace_after_growth_sec = 0.0
+    manager.final_map_save_fallback_on_timeout = True
+
+    import os
+    saved, message = manager._save_final_map_before_return()
+    assert saved is True, '仍应继续返航'
+    assert manager._final_map_saved is False, '坏地图不得标记为已保存'
+    assert not os.path.exists(str(tmp_path / 'map.pgm')), '坏地图不得落盘'
+    assert 'fallback save also failed' in (manager.last_error or '')
+
+
+def test_final_map_prefers_post_finish_grid(monkeypatch, tmp_path):
+    """revision 推进时必须走主路径（保存真正的最终栅格），且不标 fallback。"""
+    manager = _prepare_dispatch_harness(make_manager())
+    for attr in ('_final_map_saved', '_final_map_saved_fallback',
+                 '_final_map_save_attempted'):
+        setattr(manager, attr, False)
+    manager._final_map_save_error = ''
+    manager._final_map_saved_at = ''
+    manager._final_map_wait_started_at = 0.0
+    manager._final_map_wait_deadline = 0.0
+    manager._final_map_wait_revision = 0
+    manager._final_map_finish_revision = 62
+    manager._map_revision = 63          # 关键：新栅格已到
+    manager.last_map = _map_with_size(20, 16)
+    manager.last_map_time = time.monotonic()
+    manager.map_save_path = str(tmp_path / 'map')
+    manager.final_map_wait_timeout_sec = 45.0
+    manager.final_map_grace_after_growth_sec = 6.0
+    manager.final_map_save_fallback_on_timeout = True
+
+    import os
+    saved, _ = manager._save_final_map_before_return()
+    assert saved is True
+    assert manager._final_map_saved is True
+    assert manager._final_map_saved_fallback is False, '主路径不应标 fallback'
+    assert os.path.exists(str(tmp_path / 'map.pgm'))
+
+def test_escape_requires_cost_improvement_before_release():
+    """2026-10-12 E-2: escape 释放必须以"代价真的改善"为前提。
+
+    原条件 `cost < LETHAL_OBSTACLE(254)` 对 wedge 路径恒成立（武装时就是
+    253 内切膨胀环），于是转够 min_steps 就撒手。实测 15:42 那轮 8 次释放里
+    7 次是 `armed_cost=253 -> release_cost=253`，代价毫无改善，
+    arm_cooldown 后在同一位置重新武装 —— 起点附近高频掉头。
+    """
+    import re
+    from pathlib import Path
+
+    root = (Path(__file__).resolve().parents[1]
+            / 'stemm_cartographer_exploration')
+    text = (root / 'escape_controller.py').read_text(encoding='utf-8')
+
+    m = re.search(
+        r"declare_parameter\('escape_require_cost_improvement',\s*(True|False)\)",
+        text)
+    assert m, '未找到 escape_require_cost_improvement 参数'
+    assert m.group(1) == 'True', '代价改善判据必须默认开启'
+
+    assert '_cost_improved = float(cost) < float(self._armed_cost)' in text, \
+        '缺少"代价必须低于武装时"的判据'
+    assert 'and _cost_improved):' in text, '判据未接入释放条件'
+    assert 'improved_from_%.0f' in text, '释放日志未带代价对（回归无法核对）'
+
+    # cooldown 必须缩短：既然没改善不放行，长等无意义
+    m2 = re.search(r"declare_parameter\('arm_cooldown_sec',\s*([0-9.]+)\)", text)
+    assert m2, '未找到 arm_cooldown_sec'
+    assert float(m2.group(1)) <= 4.0, \
+        'arm_cooldown 仍为 %ss，未改善时不放行 + 长冷却会拖慢脱困' % m2.group(1)
+
+def test_exploration_gate_uses_nav2_costmap():
+    """2026-10-12 N-9: 探索目标可达性必须用 Nav2 权威 costmap 判据（cost<253）。
+
+    根因（15:54 轮实测）：E-1 的 _reachable_free_cells() 只用地图占用
+    （data<50）做 BFS，完全不含 Nav2 膨胀层。于是"地图本体自由、但被膨胀
+    隔断"的目标被放行 —— 实测三个目标
+      (1.48,-2.82) / (-0.43,-2.45) / (0.57,-4.51)
+    地图本体全自由、单格 BFS 可达，但沿直线的 global_costmap cost 全部穿过
+    253 带（inflation_radius=0.4 / cost_scaling=3.0 / inscribed=0.328），
+    结果是 3/3 规划失败（exceeded max iterations / no valid path），
+    每个耗满 50s 硬上限。
+    """
+    import re
+    from pathlib import Path
+
+    root = (Path(__file__).resolve().parents[1]
+            / 'stemm_cartographer_exploration')
+    text = (root / 'cartographer_manager.py').read_text(encoding='utf-8')
+
+    # 1) 开关默认开启
+    m = re.search(
+        r"declare_parameter\('exploration_costmap_gate',\s*(True|False)\)", text)
+    assert m, '未找到 exploration_costmap_gate 参数'
+    assert m.group(1) == 'True', 'costmap 闸门必须默认开启'
+
+    # 2) 判据来源必须是 Nav2 costmap 服务，而不是自算膨胀
+    m2 = re.search(
+        r"declare_parameter\(\s*'exploration_costmap_service',\s*'([^']+)'\)",
+        text)
+    assert m2, '未找到 exploration_costmap_service 参数'
+    assert m2.group(1).startswith('/global_costmap'), \
+        '判据必须取自 Nav2 全局 costmap，实际为 %s' % m2.group(1)
+    assert 'GetCostmap' in text, '必须用 nav2_msgs/GetCostmap 取权威代价地图'
+
+    # 3) 与 SmacPlannerHybrid 同判据：cost >= 253 视为不可通行
+    m3 = re.search(
+        r"declare_parameter\('exploration_costmap_lethal_cost',\s*(\d+)\)", text)
+    assert m3, '未找到 exploration_costmap_lethal_cost'
+    assert int(m3.group(1)) == 253, \
+        '不可通行阈值应为 253 (INSCRIBED_INFLATED_OBSTACLE)，实际 %s' % m3.group(1)
+
+    # 4) 未知格(255)必须判为可通行，与规划器 allow_unknown: true 一致；
+    #    否则建图期会把大量正常前沿点一并毙掉
+    assert 'if cost == 255:' in text, '未知代价必须单列处理'
+    assert 'NO_INFORMATION' in text, '未知代价的处理需要注释说明依据'
+
+    # 5) costmap 不可用时必须回退到地图占用判据（不得因服务未就绪而阻断探索）
+    assert 'if int(data[ncell]) < 50:' in text, '地图占用回退路径必须保留'
+    assert 'costmap_cells = self._reachable_costmap_cells()' in text, \
+        '未在 _reachable_free_cells 中优先使用 costmap 判据'
+
+    # 6) 拒绝原因必须可区分（便于回归核对是"隔断"还是"不同域"）
+    assert 'def _explore_target_reject_reason' in text
+    assert 'cut off by inflation' in text, '缺少"被膨胀隔断"这一可识别原因'
+    assert 'is not traversable on the' in text, '缺少"目标本身不可通行"这一原因'
+
+def test_pose_stall_treats_missing_yaw_anchor_as_motion():
+    """2026-10-12 N-10a: 朝向锚点缺失时不得跳过"朝向也是在动"的保护。
+
+    实测 16:26 轮：
+        pose_stalled ctx: pose=(0.00,-0.01) remaining=6.19m front_blocked=False
+                          recovery_active=False nav_state=executing
+                          cmd_vel=(0.000, -0.476)   <- 正在原地旋转
+                          pose_stall[yaw_delta=none yaw_rad=0.15]
+    锚点 yaw 为 None 时原实现整段跳过朝向判据，直接落到"超时即停滞"，
+    7.0s 后取消目标并黑名单 -> "取消 -> 自转恢复(失败) -> 换目标" 循环。
+    """
+    from pathlib import Path
+
+    root = (Path(__file__).resolve().parents[1]
+            / 'stemm_cartographer_exploration')
+    text = (root / 'cartographer_manager.py').read_text(encoding='utf-8')
+
+    # 必须有"锚点缺失 -> 按在动处理"的分支
+    assert 'if anchor_yaw is None:' in text, '缺少锚点缺失分支'
+    idx = text.index('if anchor_yaw is None:')
+    body = text[idx:idx + 900]
+    assert 'return False' in body, '锚点缺失时必须判定"未停滞"'
+    assert '_reset_pose_stall_anchor_locked(now, x, y, yaw)' in body, \
+        '锚点缺失时应补上朝向锚点'
+
+    # 不得再用 None 覆盖有效的朝向锚点
+    assert 'if yaw is not None:\n            self._pose_stall_anchor_yaw = yaw' in text, \
+        'yaw 为 None 时不得覆盖已有朝向锚点'
+
+    # 原有朝向判据必须保留
+    assert '_stall_yaw_threshold()' in text
+    assert 'math.atan2(math.sin(yaw - anchor_yaw)' in text
+
+
+def test_fallback_picker_skips_unreachable_candidate():
+    """2026-10-12 N-11: 兜底采样器必须跳过"可证明不可达"的候选。
+
+    实测 17:16 轮（task-mv51c9s1-010）：10 次派发 8 次失败，逐条追来源发现
+    失败目标几乎全部来自 `_pick_fallback_goal`（不是前沿点）：
+
+        RRT frontier rejected: no safe known-free projection within 1.00m
+        projection_reject_stats: total=336 ... clearance=329
+        fallback pick: window=preferred candidates=243 rejected(clearance=15
+                       path=10%=0) chosen=(0.77, -4.34)
+        no frontiers available; fallback goal: 0.77, -4.34
+
+    旧实现的候选过滤只有"净空"与"直线通畅"两条，从不问"能不能规划过去"，
+    于是绕过了 N-9 闸门，每个目标耗满 50s 硬上限。
+
+    本测试**直接驱动 `_pick_fallback_goal`**：用假 map 造出候选场景，
+    令近处候选被判不可达，断言它被跳过、且开关关闭时判定不再被调用。
+    """
+    import math
+    from pathlib import Path
+
+    root = (Path(__file__).resolve().parents[1]
+            / 'stemm_cartographer_exploration')
+    text = (root / 'cartographer_manager.py').read_text(encoding='utf-8')
+
+    # ---------- 源码契约 ----------
+    import re
+    m = re.search(
+        r"declare_parameter\(\s*'exploration_fallback_require_reachable',"
+        r"\s*(True|False)\)", text)
+    assert m, '未找到 exploration_fallback_require_reachable 参数'
+    assert m.group(1) == 'True', '兜底可达性判据必须默认开启'
+
+    assert 'def _explore_cell_is_reachable(self, x, y):' in text, \
+        '缺少布尔可达性判定，或签名未用世界坐标'
+    # ★ 世界坐标入参：/map 与 costmap 的 origin 不同，格号不可互换
+    assert 'lambda: self._explore_cell_is_reachable(x, y), None)' in text, \
+        '候选调用必须传世界坐标 (x, y)，不能传 /map 的格号 (mx, my)'
+    assert 'cell = self._costmap_cell_index(info, tx, ty)' in text, \
+        'costmap 侧必须用 _costmap_cell_index 换算'
+    assert 'cell = self._map_cell_index(tx, ty)' in text, \
+        '地图回退侧必须用 _map_cell_index 换算'
+    assert 'rejected_unreachable' in text, '缺少不可达拒绝计数'
+    assert 'unreachable=' in text, '日志未带 unreachable 计数'
+    assert 'if _reach is False:' in text, '必须是"仅 False 才拒"，None 放行'
+    assert 'if _require_reach:' in text, '缺少开关判断（现场无法回退）'
+
+    i_clear = text.index('if not self._fallback_cell_has_clearance(mx, my):')
+    i_path = text.index('if self.path_blocked_ratio(cx, cy, x, y) >= 0.10:')
+    i_reach = text.index(
+        'lambda: self._explore_cell_is_reachable(x, y), None)')
+    i_bearing = text.index('bearing = math.atan2(y - cy, x - cx)')
+    assert i_clear < i_path < i_reach < i_bearing, \
+        '可达性检查必须位于净空/直线检查之后、选中之前'
+
+    # ---------- 功能性：直接驱动 _pick_fallback_goal ----------
+    manager = make_manager()
+    _RES = 0.10
+    _W = _H = 40                             # 4m x 4m 假地图
+
+    class _Info:
+        resolution = _RES
+        width = _W
+        height = _H
+
+        class origin:
+            class position:
+                x = 0.0
+                y = 0.0
+    class _Map:
+        info = _Info()
+        data = [0] * (_W * _H)               # 全自由
+    class _Pt:
+        x = 0.0
+        y = 0.0
+    class _Pose:
+        class pose:
+            position = _Pt()
+
+    manager.last_map = _Map()
+    manager.update_pose = lambda: _Pose()
+    manager.goal_clearance = 0.0
+    manager.fallback_min_distance_m = 0.5
+    manager.fallback_max_distance_m = 6.0
+    manager.fallback_wide_min_distance_m = 0.5
+    manager.fallback_wide_max_distance_m = 6.0
+    manager.last_explore_heading = None
+    # ManagerHarness 不调用真实 __init__，get_parameter 不可用；这里桩成固定值
+    class _Param:
+        def __init__(self, v):
+            self.value = v
+    manager.get_parameter = lambda name: _Param(
+        0.0 if name == 'fallback_heading_weight' else None)
+    manager._fallback_cell_has_clearance = lambda mx, my, clearance=None: True
+    manager.path_blocked_ratio = lambda *a, **k: 0.0
+    manager.goal_recently_failed = lambda x, y: False
+    manager._note_goal_bearing = lambda *a, **k: None
+    manager.make_pose_goal = lambda x, y, b: ('GOAL', round(x, 3), round(y, 3))
+
+    seen = []
+
+    def fake_reach(x, y):
+        seen.append((round(x, 3), round(y, 3)))
+        if math.hypot(x, y) < 1.5:
+            return False            # 近处候选判为不可达
+        return True
+
+    # (a) 开关开启：近处候选必须被跳过
+    manager.exploration_fallback_require_reachable = True
+    manager._explore_cell_is_reachable = fake_reach
+    goal = manager._pick_fallback_goal()
+    assert goal is not None, '应能选出一个可达候选'
+    assert goal[0] == 'GOAL', '返回值形态异常: %r' % (goal,)
+    chosen_r = math.hypot(goal[1], goal[2])
+    assert chosen_r >= 1.5, (
+        '选中的候选距机器人 %.2fm，落在被拒的 <1.5m 内 —— 不可达候选没被跳过'
+        % chosen_r)
+    assert seen, '可达性判定完全没被调用'
+
+    # (b) 开关关闭：判定不得被调用（现场可回退）
+    seen.clear()
+    manager.exploration_fallback_require_reachable = False
+    goal2 = manager._pick_fallback_goal()
+    assert goal2 is not None
+    assert not seen, '开关关闭后仍调用了可达性判定，现场无法回退'
+
+
+def test_planner_prevalidation_gates_fallback_dispatch():
+    """2026-10-12 A: 兜底候选派发前必须用规划器验证一次路径。
+
+    实测（17:34 轮 task-mv51xlza-017）：30 次派发仅 4 次到达（13%），
+    规划超限 33、50s 硬上限 10、无有效路径 7。而兜底采样器
+    `_pick_fallback_goal` 的过滤只有"净空 + 直线通畅"，从不问"能不能规划过去"。
+
+    先前的 N-9/N-11 都是代理判据（BFS + costmap 阈值），两轮拒发计数均为 0 ——
+    代理判据与规划器不一致。A 直接调 `compute_path_to_pose`。
+
+    本测试同时验证**非阻塞**：三拍状态机每拍只查 done()，
+    绝不能在 send_goal_async 之后直接调 result()（那会阻塞单线程执行器）。
+    """
+    from pathlib import Path
+
+    mgr = (Path(__file__).resolve().parents[2]
+           / 'stemm_nav2_manager' / 'stemm_nav2_manager' / 'manager.py')
+    assert mgr.is_file(), '未找到 %s' % mgr
+    text = mgr.read_text(encoding='utf-8')
+
+    # ---- 源码契约 ----
+    assert 'from nav2_msgs.action import ComputePathToPose, NavigateToPose' in text, \
+        '未导入 ComputePathToPose'
+    import re
+    m = re.search(
+        r"declare_parameter\('explore_prevalidate_planner',\s*(True|False)\)", text)
+    assert m, '未找到 explore_prevalidate_planner 参数'
+    assert m.group(1) == 'True', '规划器预验证必须默认开启'
+    assert '_planner_client = ActionClient(' in text, '未建立 planner ActionClient'
+    assert "'compute_path_to_pose'" in text, '必须调用 compute_path_to_pose'
+    assert 'def _prevalidate_poll(self):' in text, '缺少预验证轮询'
+    assert 'def _prevalidate_dispatch_next(self):' in text, '缺少候选派发'
+    assert 'def _fallback_goal_for(self, x, y):' in text, '缺少已验证目标的构造'
+    m_id = re.search(
+        r"declare_parameter\('explore_prevalidate_planner_id',\s*'([^']*)'\)", text)
+    assert m_id, '未找到 explore_prevalidate_planner_id'
+    assert m_id.group(1).strip() != '', \
+        'planner_id 为空 —— compute_path_to_pose 将无法选中规划器'
+    m_to = re.search(
+        r"declare_parameter\('explore_prevalidate_timeout_sec',\s*([0-9.]+)\)", text)
+    assert m_to, '未找到 explore_prevalidate_timeout_sec'
+    assert float(m_to.group(1)) > 0.0, \
+        '预验证超时必须 > 0（fail-open 的时间上界）'
+    # 三拍语义
+    assert "self._prevalidate_phase = 'accept'" in text, '缺少 accept 拍'
+    assert "self._prevalidate_phase = 'result'" in text, '缺少 result 拍'
+    assert 'get_result_async()' in text, '必须先取 result future 再轮询'
+
+    # ---- 非阻塞契约：result() 只能在 done() 守卫之后 ----
+    i = text.index('def _prevalidate_poll(self):')
+    seg = text[i:i + 4200]
+    for mt in re.finditer(r'\.result\(\)', seg):
+        pre = seg[max(0, mt.start() - 320):mt.start()]
+        assert 'done()' in pre, \
+            '_prevalidate_poll 里出现无 done() 守卫的 .result()（会阻塞执行器）'
+    assert not re.search(
+        r'send_goal_async\([^)]*\)\s*\n\s*\S*\.result\(\)', seg), \
+        'send_goal_async 之后直接调 result()（会阻塞执行器）'
+
+    # ---- 调用点契约：兜底派发必须过预验证闸门 ----
+    assert 'planner-validated fallback goal' in text, '缺少"已验证后派发"的分支'
+    assert 'has no planner ' in text, '缺少"规划器否决后跳过"的分支'
+    # 超时分支必须真实存在且**依据 explore_prevalidate_timeout_sec**
+    assert 'self.explore_prevalidate_timeout_sec):' in text, \
+        '缺少 fail-open 超时分支（超时后必须放行）'
+    assert "self._prevalidate_result_future = goal_handle.get_result_async()" in text, \
+        '缺少 accept 拍里的 get_result_async（三拍会断裂）'
+    assert "self._prevalidate_phase = 'idle'" in text, \
+        '缺少状态复位（复位后 fail-open 才能继续）'
+
+    # ---- 功能性：三拍状态机（不依赖 ROS）----
+    class _Fut:
+        def __init__(self, value=None, done=False, raise_exc=None):
+            self._v = value
+            self._d = done
+            self._e = raise_exc
+            self.result_calls = 0
+        def done(self):
+            return self._d
+        def result(self):
+            self.result_calls += 1
+            if self._e is not None:
+                raise self._e
+            return self._v
+
+    class _GH:
+        def __init__(self, accepted, result_fut):
+            self.accepted = accepted
+            self._rf = result_fut
+        def get_result_async(self):
+            return self._rf
+
+    class _Path:
+        def __init__(self, poses):
+            self.poses = poses
+    class _Res:
+        def __init__(self, poses):
+            self.path = _Path(poses)
+    class _Wrapped:
+        def __init__(self, poses):
+            self.result = _Res(poses)
+
+    class _Harness:
+        explore_prevalidate_timeout_sec = 6.0
+        _prevalidate_phase = 'idle'
+        _prevalidate_future = None
+        _prevalidate_result_future = None
+        _prevalidate_started_at = 0.0
+        _prevalidate_candidate = None
+        _prevalidate_rejected = {}
+        last_map = None
+        _prevalidate_map_signature = (
+            lambda self: (10, 10, 50000))
+        warn = staticmethod(lambda *a, **k: None)
+        _log_recovery_event = staticmethod(lambda *a, **k: None)
+
+        class _L:
+            @staticmethod
+            def warn(*a, **k):
+                pass
+        get_logger = staticmethod(lambda: _Harness._L())
+        _prevalidate_reset =             lambda self: StemmCartographerNav2Manager._prevalidate_reset(self)
+        _prevalidate_poll =             lambda self: StemmCartographerNav2Manager._prevalidate_poll(self)
+
+    import math  # noqa: F401
+    import time
+
+    h = _Harness()
+    StemmCartographerNav2Manager = _load_manager_class()
+
+    # 1) idle → None
+    assert h._prevalidate_poll() is None
+
+    # 2) accept 拍：future 未完成 → None，且不得调用 result()
+    f = _Fut(done=False)
+    h._prevalidate_phase = 'accept'
+    h._prevalidate_future = f
+    h._prevalidate_started_at = time.monotonic()
+    assert h._prevalidate_poll() is None
+    assert f.result_calls == 0, '未完成时不得调用 result()（会阻塞）'
+
+    # 3) accept 拍完成但被规划器拒绝 → 'rejected'，且不碰 result future
+    h._prevalidate_phase = 'accept'
+    h._prevalidate_future = _Fut(value=_GH(accepted=False, result_fut=None),
+                                 done=True)
+    h._prevalidate_started_at = time.monotonic()
+    assert h._prevalidate_poll() == 'rejected'
+
+    # 4) accept 拍接受 → 进入 result 拍，返回 None
+    rf = _Fut(done=False)
+    h._prevalidate_phase = 'accept'
+    h._prevalidate_future = _Fut(value=_GH(True, rf), done=True)
+    h._prevalidate_started_at = time.monotonic()
+    assert h._prevalidate_poll() is None
+    assert h._prevalidate_phase == 'result'
+
+    # 5) result 拍：路径有 poses → 'ok'
+    h._prevalidate_phase = 'result'
+    h._prevalidate_result_future = _Fut(value=_Wrapped([1, 2, 3]), done=True)
+    h._prevalidate_started_at = time.monotonic()
+    assert h._prevalidate_poll() == 'ok'
+
+    # 6) result 拍：路径为空 → 'rejected'
+    h._prevalidate_phase = 'result'
+    h._prevalidate_result_future = _Fut(value=_Wrapped([]), done=True)
+    h._prevalidate_started_at = time.monotonic()
+    assert h._prevalidate_poll() == 'rejected'
+
+    # 7) fail-open：超时 → None（放行），且状态复位
+    h._prevalidate_phase = 'accept'
+    h._prevalidate_future = _Fut(done=False)
+    h._prevalidate_started_at = time.monotonic() - 999.0
+    assert h._prevalidate_poll() is None
+    assert h._prevalidate_phase == 'idle', '超时后必须复位（fail-open 放行）'
+
+    # 7b) fail-open 的边界：恰好未超时不得放行（否则超时形同虚设）
+    h._prevalidate_phase = 'accept'
+    h._prevalidate_future = _Fut(done=False)
+    h._prevalidate_started_at = time.monotonic()
+    assert h._prevalidate_poll() is None
+    assert h._prevalidate_phase == 'accept', \
+        '未超时就必须仍在验证中（不能提前放行）'
+
+    # 8) fail-open：result() 抛异常 → None
+    h._prevalidate_phase = 'result'
+    h._prevalidate_result_future = _Fut(done=True, raise_exc=RuntimeError('x'))
+    h._prevalidate_started_at = time.monotonic()
+    assert h._prevalidate_poll() is None
+
+
+def _load_manager_class():
+    """取 StemmCartographerNav2Manager 类（供上面的功能性测试调用其方法）。"""
+    from stemm_nav2_manager.manager import StemmNav2Manager  # noqa: F401
+    import stemm_cartographer_exploration.cartographer_manager as cm
+    return cm.StemmCartographerNav2Manager

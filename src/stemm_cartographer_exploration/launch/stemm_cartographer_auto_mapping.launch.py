@@ -14,6 +14,7 @@ from launch.actions import (
     TimerAction,
 )
 from launch.conditions import IfCondition
+from launch.substitutions import PythonExpression
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -26,6 +27,14 @@ from stemm_nav2_manager.paths import map_basename
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     auto_explore = LaunchConfiguration('auto_explore', default='true')
+    # 2026-10-10: 前沿点来源。'rrt' = 现有随机采样链（默认，保持现状）；
+    # 'grid' = stemm_frontier_explorer 的栅格穷举 + 聚类 + 距离场打分。
+    # 两者都发布 /assigned_frontier_goal (PoseStamped)，下游零改动。
+    frontier_source = LaunchConfiguration('frontier_source', default='rrt')
+
+    # 2026-10-10: 卡死脱困控制器开关（默认关闭）。
+    escape_controller = LaunchConfiguration(
+        'escape_controller', default='true')
 
     package_dir = get_package_share_directory(
         'stemm_cartographer_exploration')
@@ -222,6 +231,26 @@ def generate_launch_description():
             # 现场事实：雷达因安装角度看不到后方，返航倒车等于盲倒，已于 2026-10-07 13:38 撞障，
             # 因此返航倒车默认关闭；探索期脱困保持开启（上一版误将其一并关停）。
             'exploration_retreat_enabled': True,
+            # 2026-10-13 P12-#1：escape 无效旋转换向（同一位置同方向失败过就反向）。
+            'escape_flip_after_failed_budget': True,
+            'escape_flip_max_per_spot': 2,
+            'escape_flip_spot_radius_m': 0.30,
+            # 2026-10-13 P11 方案4：探索专用后退参数（与返航解耦）。
+            # 此前探索共用 return_home_retreat_*（max_dist=0.90）导致探测深度
+            # probe = 0.90+0.25 = 1.15m，后方这么长的带状区内任一点被占即判
+            # rear-blocked，实测频繁误判（14:03 轮 4 次后退里 2 次失败）。
+            # 现探索用 0.35m/0.10m/s：probe 降到 0.60m，更短更慢但更可行。
+            'exploration_retreat_speed_mps': 0.10,
+            'exploration_retreat_max_distance_m': 0.35,
+            'exploration_retreat_max_sec': 3.0,
+            'exploration_retreat_rear_margin_m': 0.25,
+            # 2026-10-13 P11 方案1：连续 rear-blocked >=2 次后原地转向 90 度。
+            # 转向方向 = 让车头背离上次失败目标的方位（不再往同一扇区派发）。
+            # 护栏：最多 2 次、累计 <=180 度，防止变成新的自转循环。
+            'exploration_blocked_turn_deg': 90.0,
+            'exploration_blocked_turn_max_tries': 2,
+            'exploration_blocked_turn_total_limit_deg': 180.0,
+            'exploration_blocked_turn_speed_radps': 0.40,
             'return_home_retreat_enabled': False,
             'return_home_retreat_speed_mps': 0.15,
             # 2026-10-06: 0.60 -> 0.90。返航失败常见形态是起点被近处障碍夹住
@@ -245,7 +274,27 @@ def generate_launch_description():
             'frontier_pullback_m': 0.0,   # 2026-09-29: 0 = no pull-back.  1.0 m biased every frontier
                                         # goal back into KNOWN space (fired 135x in one run)
                                         # and made exploration hug known areas.
-            'approach_probe_m': 1.2,
+            # 2026-10-09 (operator): 1.2 -> 0.2.  This is the B approach-corridor probe:
+            # the manager walks `approach_probe_m` metres from the robot toward the goal
+            # (sampling -0.35 / 0 / +0.35 m laterally) and refuses the goal if ANY sampled
+            # cell is occupied (>=50).  At 1.2 m x 0.7 m it vetoed almost everything in a
+            # cramped area: on 2026-10-09 the map was saved fine at 11:43:28, but the
+            # return-home goal was refused 4x in a row
+            #   'B approach corridor rejected: obstacle within 0.94 m of the start'
+            # and the run ended with 'return-home failed after 3 retries'.
+            # NOTE the '0.73 m' printed in that message is NOT the threshold -- it is
+            # front_stop_distance(0.65)+blocked_clearance_hysteresis_m(0.08), i.e. the front
+            # gate band; the threshold is this probe length.  At 0.2 m the check is shorter
+            # than the front gate itself, so it effectively no longer fires and Nav2 plus the
+            # front gate take over.  Hot-tunable during a session:
+            #   ros2 param set /stemm_cartographer_nav2_manager approach_probe_m 0.2
+            # See also: the call site comment claims A/B are exploration-only, but B runs
+            # unconditionally, so it also gates return-home.
+            'approach_probe_m': 0.2,
+            # 2026-10-10 (operator): 黑名单排斥半径 1.5 -> 0.8。
+            # 见 cartographer_manager 中同名参数的说明。
+            'failed_goal_radius': 1.5,
+            'blocked_place_radius': 1.5,
             'return_home_retry_delay_sec': 2.0,
             # 2026-09-28: raised from 90.0 after task-mul2g8y4-002 reported
             # finish_mapping_timeout while the navigation stacks were still being
@@ -260,7 +309,22 @@ def generate_launch_description():
             'return_home_start_clearance': 0.40,
             'home_known_radius': 0.45,
             'front_stop_distance': 0.65,
-            'goal_clearance': 0.50,
+            # 2026-10-09 (operator): return-home target clearance, deliberately SEPARATE from
+            # goal_clearance (0.50).  goal_clearance is shared with the exploration fallback
+            # sampler, so lowering it there would also degrade exploration targets.  The home
+            # target is the map origin == where the robot started, and requiring 0.50 m there
+            # made return-home fail outright when the robot started near an obstacle
+            # (2026-10-09 16:06: "R1d target rejected: less than 0.50 m clearance around
+            # (0.00, 0.00)" x4 with "front obstacle too close: 0.39m").
+            'return_home_goal_clearance': 0.20,
+            # How far to look for a stand point that satisfies the above before giving up.
+            'return_home_target_search_m': 1.5,
+            # 2026-10-13 P9-A：0.50 → 0.35。
+            # 实测：0.50 要求目标周围 1.0m 直径净空，而车足印内切半径 0.328m、
+            # 实测通道仅 0.72~0.81m —— 物理上给不出 → R1d 连续拒发
+            # （60s 窗口 18 次拒发 / 0 次派发）→ 车完全静止。
+            # 0.35 仍大于内切半径 0.328，保留安全余量。回退：改回 0.50。
+            'goal_clearance': 0.35,
             'front_emergency_distance': 0.45,
             'nav_lifecycle_request_timeout_sec': 1.5,
             'nav_lifecycle_retry_delay_sec': 0.5,
@@ -325,6 +389,30 @@ def generate_launch_description():
         }],
     )
 
+    # 2026-10-10: 外层必须用双引号。此前用单引号时，LaunchConfiguration
+    # 求值后的值落进单引号内部，产生 'true'.lower() == ... 这种多余外层引号，
+    # 求值时报 unterminated string literal。该错误只在条件被真正求值
+    # （nav2_ready 事件）时暴露，静态门禁查不出来。
+    # 2026-10-10: 照抄仓库既有可用模式（wheeltec_nav2.launch.py 的
+    # both_publishers_enabled），只把内部字符串换成双引号：
+    #   求值后 -> "true".lower() == "true" and "grid".lower() == "grid"
+    # 用单引号会残留最外层引号（unterminated string literal），
+    # 而丢掉外面那对引号会让 LaunchConfiguration 变成裸标识符（NameError）。
+    rrt_enabled = IfCondition(PythonExpression([
+        '"', auto_explore, '".lower() == "true" and "',
+        frontier_source, '".lower() == "rrt"',
+    ]))
+    grid_enabled = IfCondition(PythonExpression([
+        '"', auto_explore, '".lower() == "true" and "',
+        frontier_source, '".lower() == "grid"',
+    ]))
+
+    # 2026-10-10: 脱困控制器开关，与探索源无关。
+    escape_enabled = IfCondition(PythonExpression([
+        '"', auto_explore, '".lower() == "true" and "',
+        escape_controller, '".lower() == "true"',
+    ]))
+
     rrt_nodes = [
         Node(
             package='wheeltec_robot_rrt',
@@ -332,9 +420,51 @@ def generate_launch_description():
             name=executable,
             output='both',
             parameters=[rrt_params, {'use_sim_time': use_sim_time}],
-            condition=IfCondition(auto_explore),
+            condition=rrt_enabled,
         )
         for executable in ('local_rrt', 'global_rrt', 'filter', 'assigner')
+    ]
+
+    # 2026-10-10: 栅格式前沿点探索（方案切换的另一半）。
+    # 输出契约与 RRT 链的 assigner 相同：/assigned_frontier_goal PoseStamped。
+    grid_nodes = [
+        Node(
+            package='stemm_frontier_explorer',
+            executable='frontier_explorer',
+            name='frontier_explorer',
+            output='both',
+            parameters=[{'use_sim_time': use_sim_time}],
+            condition=grid_enabled,
+        )
+    ]
+
+    # 2026-10-10: 卡死后外部定步长旋转脱困（本包内节点，不改 Nav2 参数）。
+    # 触发与退出都用 Nav2 自己的足印碰撞判定；节点内 enabled 默认 false，
+    # 此处 escape_controller 也默认 'false'，两层闩锁都开才会真正动作。
+    escape_nodes = [
+        Node(
+            package='stemm_cartographer_exploration',
+            executable='stemm_cartographer_escape_controller',
+            name='stemm_escape_controller',
+            output='both',
+            # 2026-10-13 P12-#1：原先只传 use_sim_time，导致 escape 的
+            # direction(默认1.0=固定CCW) 与 escape_flip_* 全部取代码默认值，
+            # 换向逻辑永不生效。此处显式传入。
+            parameters=[{
+                'use_sim_time': use_sim_time,
+                # 2026-10-13 P14：启用自动选向。
+                # direction 默认 1.0 = 固定 CCW，导致 _pick_direction()（按左右各
+                # 10 度探测选代价更低的一侧）从未被调用 —— 实测 4 次 ESCAPE ARMED
+                # 全部 rotating CCW，其中 3 次转满 2.10rad 仍无改善
+                # （armed_cost=253 -> release_cost=253）。设为 0.0 即启用自动选向。
+                # 回退：改回 1.0（固定 CCW）。
+                'direction': 0.0,
+                'escape_flip_after_failed_budget': True,
+                'escape_flip_max_per_spot': 2,
+                'escape_flip_spot_radius_m': 0.30,
+            }],
+            condition=escape_enabled,
+        )
     ]
 
     # 2026-09-16: the LiDAR handover was removed (the resident owner keeps the
@@ -403,7 +533,9 @@ def generate_launch_description():
             # publishes the first frontier goal.
             return [
                 manager,
-                TimerAction(period=1.0, actions=rrt_nodes),
+                TimerAction(period=1.0,
+                            actions=rrt_nodes + grid_nodes
+                            + escape_nodes),
             ]
         return [
             LogInfo(
@@ -414,6 +546,14 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('auto_explore', default_value='true'),
+        # 2026-10-10: 'true' 才启动脱困控制器节点；
+        # 节点内 enabled 参数（默认 false）是第二道闩锁。
+        DeclareLaunchArgument(
+            'escape_controller', default_value='true'),
+        DeclareLaunchArgument(
+            'frontier_source', default_value='rrt',
+            description="frontier goal source: 'rrt' (existing random "
+                        "sampling chain) or 'grid' (stemm_frontier_explorer)"),
         SetEnvironmentVariable('STEMM_AUTO_MAPPING_LAUNCH', '1'),
         RegisterEventHandler(OnProcessExit(
             target_action=system_preflight,

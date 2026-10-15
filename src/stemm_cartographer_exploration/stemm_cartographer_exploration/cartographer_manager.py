@@ -6,6 +6,7 @@ import math
 import os
 import random
 import time
+from collections import deque
 from functools import partial
 from pathlib import Path
 from threading import RLock
@@ -13,7 +14,7 @@ from threading import RLock
 from ament_index_python.packages import get_package_share_directory
 from action_msgs.msg import GoalStatus
 from cartographer_ros_msgs.srv import FinishTrajectory
-from geometry_msgs.msg import TransformStamped, Twist
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.action import NavigateToPose, Spin
@@ -67,18 +68,233 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.session_task_path = str(Path(os.getenv(
             'STEMM_CARTOGRAPHER_TASK_PATH',
             state_home / 'stemm-cartographer-task.json')).expanduser())
+        # 2026-10-09 (operator): return-home uses its own target clearance.  The home target is
+        # the map ORIGIN (where the session started); requiring the exploration-grade 0.50 m disc
+        # there made return-home fail outright when the robot had started near an obstacle
+        # (measured 16:06: origin rejected 4x with "front obstacle too close: 0.39m").
+        # 2026-10-12: 探索目标的连通性闸门。
+        # 原选点只验证「目标格已知自由 + 圆盘净空 + 直线阻塞比」，从不检查
+        # 「从当前位置到目标是否连通」，于是会把目标派发到被不连续障碍隔断的
+        # 已知区域。实测 2026-10-12 14:02：4 个探索目标里 2 个耗满 50s 硬上限
+        # （结束时仍剩 4.5m/8.5m），机器人 6 个位置全在原点 0.7m 内。
+        # 现加连通性闸门：与机器人不同自由连通域的探索目标直接拒发并拉黑。
+        # 无法判定（地图缺失/起点被占/异常）时一律放行，绝不阻断探索。
+        self.declare_parameter('exploration_require_connected_route', True)
+        # BFS 上限：正常地图约 28 万格；设上限防止异常情况下卡死主循环。
+        self.declare_parameter('exploration_reach_max_cells', 400000)
+        # 2026-10-12 N-9：探索目标可达性改用 Nav2 权威 costmap 判据。
+        # E-1 只用地图占用（data<50）做 BFS，不含膨胀层，导致"地图自由但
+        # 被膨胀隔断"的目标被放行（实测 3/3 目标规划失败、各耗满 50s）。
+        self.declare_parameter('exploration_costmap_gate', True)
+        self.declare_parameter(
+            'exploration_costmap_service', '/global_costmap/get_costmap')
+        self.declare_parameter('exploration_costmap_fetch_sec', 1.0)
+        # 与 SmacPlannerHybrid 同判据：cost >= 253 (INSCRIBED_INFLATED_OBSTACLE)
+        # 视为不可通行。
+        self.declare_parameter('exploration_costmap_lethal_cost', 253)
+        # 2026-10-13 P1：可达域判据是否要求"车物理上能过"。
+        # 背景：运行期 /map 是 OccupancyGrid 尺度（-1=未知, 0~64=自由, >=65=占用），
+        # 而旧判据 `value < 50` 会把 -1(未知) 判成自由 -> 可达域 = 整张图
+        # （实测 598.79 m²，真实仅 21.66 m²），连通域闸门因此从不拒发。
+        # True 时改用"已知自由 且 障碍距离 >= 车辆内切半径"判可通行。
+        # 置 False 即回到旧行为（逐位等价）。
+        self.declare_parameter('exploration_reach_respect_map', True)
+        # 2026-10-13 P9-D：探索目标的"最小派发距离"。
+        # 依据：实测派发过 dist=0.27m/turn=96°、dist=0.31m/turn=108° 的目标，
+        # nav2_rotation_shim_controller 判"朝向差超阈值"→ 先原地旋转对准；
+        # 0.3m 走完立刻又派极近目标 → 车原地旋转 60+ 秒
+        # （escape trace 实测 stall_hold 累积到 36.3s，位置仅移动 0.47m）。
+        # 置 0 关闭该过滤。
+        self.declare_parameter('exploration_min_goal_distance_m', 0.6)
+        # 2026-10-13 P21：探索目标的"转角门禁"。
+        # 需求：把"方向粘性取消"的解锁逻辑泛化到全局采样点派发 ——
+        #   未解锁时只放行 |turn| <= max_turn_deg 的目标；
+        #   连续"确定不可达"拒发 >= exploration_direction_flip_after(2) 次
+        #   才解锁，允许大角度转向。
+        # 实测 15:23:45 在未解锁状态下派发了 turn=144° 的目标（车被迫掉头）。
+        # 置 enabled=False 或 max_turn_deg=180 即回到旧行为。
+        self.declare_parameter('exploration_dispatch_max_turn_deg', 80.0)
+        self.declare_parameter('exploration_dispatch_max_turn_enabled', True)
+        # 防死锁宽限：车头朝向不对时可能所有候选都超限 → 永久无候选。
+        # 转角拦截累计超过本值时自动解锁并放行（等价于"小角度已试够"）。
+        self.declare_parameter('exploration_dispatch_max_turn_grace_count', 3)
+        # 2026-10-13 P27（方案A）：把上面的"硬拦截"补成"软约束"。
+        # 在两条选点路径（fallback 采样器 / RRT 前沿投影）的排序里叠加
+        # "相对当前车头的转角"惩罚，让前方候选自然优先，而不是先拦下
+        # 再重选（实测重选还是同一个点，白费 2.2 秒）。
+        # 转角 180° 的等效代价 = turn_penalty_weight_m（米），
+        # 即"宁可多走这么多米也不掉头"。置 0 关闭软约束。
+        self.declare_parameter('exploration_turn_penalty_enabled', True)
+        # 2026-10-13 P31：2.0 -> 4.5。实测 17:55 轮 weight=2.0 时
+        # "后方 2.66m + 惩罚 1.68m = 4.34" 仍优于 "前方 4.5m + 惩罚 0.02m
+        # = 4.52"，于是继续选后方。4.5 使同一组变为 6.43 vs 4.52，前方胜出。
+        self.declare_parameter('exploration_turn_penalty_weight_m', 4.5)
+        # 2026-10-13 P3-1：R1d 拒发的目标点进入"拒发存根"，采样器跳过它们。
+        # 背景：R1d（目标净空/后方空间）在派发侧拒发，但采样器侧的候选过滤
+        # 用的是另一套判据（净空+直线+连通域），两者反馈断裂，导致同一批候选
+        # 被反复选中、反复拒发（实测同一方向连续 10 次拒发）。
+        self.declare_parameter('exploration_r1d_reject_ttl_sec', 60.0)
+        self.declare_parameter('exploration_r1d_reject_radius_m', 1.2)
+        # 2026-10-13 P3-2：连续拒发达阈值后重置方向粘性，并优先转向相对方向。
+        self.declare_parameter('exploration_direction_flip_after', 2)
+        # 2026-10-13 P4：两个标准距离窗都为空时不再停车，改用脱困式放宽窗。
+        # 背景：车停在原点时可达域内所有自由格都 < 1.8m（最小候选窗），
+        # 于是候选恒为 0 → holding position → 车不动 → 地图不扩展 → 死锁
+        # （实测连续 7 秒无目标）。放宽后改为"可达域内最远点"，强制车移动。
+        self.declare_parameter('exploration_fallback_relax_min_m', 0.5)
+        self.declare_parameter('exploration_fallback_relax_enabled', True)
+        # 2026-10-13 P6 缺陷1：放宽（脱困）窗是否忽略"失败记忆"。
+        # 失败记忆半径 failed_goal_radius=1.5m；车停在可达域半径 <1.5m 处时，
+        # 它会滤掉全部候选，使放宽窗也恒空 → 死锁。默认忽略，可置 False 回退。
+        self.declare_parameter('exploration_fallback_relax_ignore_history', True)
+        self.declare_parameter('exploration_direction_flip_hold_rejections', 2)
+        self.declare_parameter('exploration_reach_clearance_m', 0.328)
+        # 2026-10-13 P6 缺陷2：可达域判据的"占用"阈值（OccupancyGrid 概率百分比）。
+        # 运行期 /map：-1=未知, 0~100=占用概率。map_saver trinary 把
+        # p>0.65 判占用、p<0.25 判自由、其余判未知（不确定）。
+        # 采样器 collect 一直用 value < 30（保守）；可达域原先用 < 65，
+        # 把 17.8% 的"不确定"格也算成可通行 → 可达域虚大 70%。
+        # 本参数统一两处口径，默认 30；置 65 即回到旧行为。
+        # 2026-10-13 P9-B（回退缺陷2）：默认 30 → 65。
+        # 实证：30 会把 /map 里 value 30~64 的"不确定格"（实测占 17.8%）当障碍
+        # → 障碍距离场被压缩 → 大量空地格 field < 0.328 → 判"车过不去"
+        # → 8 个探索目标全被拒 → 车完全静止。65 = 与 map_saver 的"非占用"口径一致。
+        self.declare_parameter('exploration_reach_obstacle_cost', 65)
+        # 2026-10-13 P31：采样器的"自由格"阈值（OccupancyGrid 概率百分比）。
+        # 采样器三处（collect 与 RRT 投影两处）长期硬编码 `value >= 30`，
+        # 把 30~64 的"不确定"格当障碍跳过。实测 17:42/17:55 两轮，车所在格
+        # 的值恰为 38 → 三个窗口全空 → "no candidate cell" 连续 8 秒 →
+        # 车原地空转。65 = 与 map_saver 的"非占用"口径一致。
+        # 放宽后的安全性由后续判据把关（净空 / 直线遮挡比 / 可达域连通性）。
+        # 置 30 即回到旧行为。
+        self.declare_parameter('exploration_sampler_free_cost', 65)
+        # 2026-10-12 N-11：兜底采样器也必须过可达性判据。
+        # 实测 17:16 轮 8 个失败目标里 5 个在 costmap 上不可达，而它们
+        # 全部来自 _pick_fallback_goal —— 该函数只查净空与直线通畅，
+        # 从不问"能不能规划过去"，于是绕过了 N-9 闸门、每个耗满 50s 硬上限。
+        self.declare_parameter(
+            'exploration_fallback_require_reachable', True)
+        self.declare_parameter('return_home_goal_clearance', 0.35)
+        self.return_home_goal_clearance = max(
+            0.0, float(self.get_parameter('return_home_goal_clearance').value))
+        self.exploration_require_connected_route = bool(
+            self.get_parameter('exploration_require_connected_route').value)
+        self.exploration_costmap_gate = bool(
+            self.get_parameter('exploration_costmap_gate').value)
+        self.exploration_costmap_service = str(
+            self.get_parameter('exploration_costmap_service').value)
+        self.exploration_costmap_fetch_sec = max(
+            0.2, float(self.get_parameter(
+                'exploration_costmap_fetch_sec').value))
+        self.exploration_costmap_lethal_cost = int(
+            self.get_parameter('exploration_costmap_lethal_cost').value)
+        self.exploration_reach_respect_map = bool(
+            self.get_parameter('exploration_reach_respect_map').value)
+        self.exploration_min_goal_distance_m = max(0.0, float(
+            self.get_parameter('exploration_min_goal_distance_m').value))
+        # 2026-10-13 P21：转角门禁
+        self.exploration_dispatch_max_turn_deg = max(0.0, float(
+            self.get_parameter('exploration_dispatch_max_turn_deg').value))
+        self.exploration_dispatch_max_turn_enabled = bool(
+            self.get_parameter('exploration_dispatch_max_turn_enabled').value)
+        self.exploration_dispatch_max_turn_grace_count = max(0, int(
+            self.get_parameter(
+                'exploration_dispatch_max_turn_grace_count').value))
+        # 2026-10-13 P27（方案A）：转角软约束
+        self.exploration_turn_penalty_enabled = bool(
+            self.get_parameter('exploration_turn_penalty_enabled').value)
+        self.exploration_turn_penalty_weight_m = max(0.0, float(
+            self.get_parameter(
+                'exploration_turn_penalty_weight_m').value))
+        self.exploration_reach_clearance_m = max(0.0, float(
+            self.get_parameter('exploration_reach_clearance_m').value))
+        self.exploration_reach_obstacle_cost = max(1, int(
+            self.get_parameter('exploration_reach_obstacle_cost').value))
+        # 2026-10-13 P31：仅作为兜底缓存；实际取值走 _sampler_free_cost()
+        # 运行时读参数，这样 ros2 param set 能立即生效。
+        self.exploration_sampler_free_cost = max(1, int(
+            self.get_parameter('exploration_sampler_free_cost').value))
+        self.exploration_r1d_reject_ttl_sec = max(1.0, float(
+            self.get_parameter('exploration_r1d_reject_ttl_sec').value))
+        self.exploration_r1d_reject_radius_m = max(0.1, float(
+            self.get_parameter('exploration_r1d_reject_radius_m').value))
+        self.exploration_direction_flip_after = max(1, int(
+            self.get_parameter('exploration_direction_flip_after').value))
+        self.exploration_fallback_relax_min_m = max(0.0, float(
+            self.get_parameter('exploration_fallback_relax_min_m').value))
+        self.exploration_fallback_relax_enabled = bool(
+            self.get_parameter('exploration_fallback_relax_enabled').value)
+        self.exploration_fallback_relax_ignore_history = bool(
+            self.get_parameter('exploration_fallback_relax_ignore_history').value)
+        self.exploration_direction_flip_hold_rejections = max(1, int(
+            self.get_parameter('exploration_direction_flip_hold_rejections').value))
+        self.exploration_fallback_require_reachable = bool(
+            self.get_parameter(
+                'exploration_fallback_require_reachable').value)
+        self._costmap_msg = None
+        self._costmap_at = 0.0
+        self._costmap_client = None
+        self._costmap_future = None
+        self.exploration_reach_max_cells = max(
+            1000, int(self.get_parameter(
+                'exploration_reach_max_cells').value))
+        # 2026-10-09 (operator): how far to look for a stand point that satisfies the above.
+        self.declare_parameter('return_home_target_search_m', 1.5)
+        # 2026-10-10 (operator): 返航派发前核对当前位姿与返航目标是否位于
+        # 同一连通自由区。实测出现过 planner 反复 status 6 且误差越来越大，
+        # 与其游荡 4 分钟不如一次明确拒绝并给出可行动原因。可现场关闭。
+        self.declare_parameter('return_home_require_connected_route', True)
+        self.return_home_require_connected_route = bool(
+            self.get_parameter('return_home_require_connected_route').value)
+        self._home_route_cache = None
+        self._explore_reach_cache = None   # 2026-10-12: 探索目标的连通性闸门 的可达域缓存
+        self._init_exploration_costmap_client()
+        self.return_home_target_search_m = max(
+            0.0, float(self.get_parameter('return_home_target_search_m').value))
         self.declare_parameter('nav_lifecycle_request_timeout_sec', 1.5)
         self.declare_parameter('nav_lifecycle_retry_delay_sec', 0.5)
         self.declare_parameter('nav_lifecycle_retry_max_delay_sec', 2.0)
+        self._watchdog_trace_at = 0.0   # 2026-10-10 诊断 trace 节流
         self.declare_parameter('exploration_no_progress_timeout_sec', 18.0)
         self.declare_parameter('exploration_progress_delta_m', 0.12)
+        # 2026-10-14 D3：进展判据改用“净推进量”而不是“到目标的瞬时距离”。
+        # 实测（探针 probe31-1014-133517）：车在原地绕圈 50s（弧长 6.92m、
+        # 转角 40rad）时，feedback 距离持续变化，stagnant 恒为 0.0，
+        # 18s 看门狗与 7s 姿态停滞全部沉默，只剩 50s 硬上限兜底。
+        # 置 False 即回到旧行为（用 feedback 瞬时距离）。
+        self.declare_parameter('exploration_progress_path_aware', False)
+        # 2026-10-14 D8：独立判据——"车一直在动却没靠近过目标"。
+        # 实测（probe31-1014-133517）：50 秒里 stagnant 恒为 0.0，
+        # 18s 看门狗与 7s 姿态停滞全部沉默，只剩 50s 硬上限；
+        # 而车其实在原地绕圈（弧长 6.92m / 转角 40rad）。
+        # 注意：D7 的"净推进折算"默认关闭——它会打断看门狗的滑动窗口，
+        # 实测导致缓慢推进被误判（见 d3-test T3/T4）。
+        self.declare_parameter('exploration_progress_no_net_timeout', True)
+        self.declare_parameter('exploration_no_net_min_travel_m', 0.50)
+        # 2026-10-14 D12：判据触发后进入短冷却再武装。
+        # manager 的确认逻辑要求"再观察到一次 stalled"才取消
+        # （cartographer_manager.py 的 _stall_confirmation 段），
+        # 若触发后把锚点清空、重新等满 18s，收益会被 50s 硬上限吃掉
+        # （实测 13:51:59 触发 → 13:52:06 仍由硬上限取消）。
+        self.declare_parameter('exploration_no_net_rearm_sec', 3.0)
+        # 锚点位移阈值：车真实移动超过该值后才把锚点前移，
+        # 避免“缓慢绕圈”被误判成进展（默认 0.20 m）。
+        self.declare_parameter('exploration_progress_anchor_m', 0.20)
         self.declare_parameter('exploration_hard_timeout_sec', 50.0)
         self.declare_parameter('exploration_pose_stall_timeout_sec', 7.0)
         self.declare_parameter('exploration_pose_stall_radius_m', 0.10)
         self.declare_parameter(
             'exploration_pose_stall_goal_tolerance_m', 0.30)
+        # 2026-10-12: 停滞判据原先只看位移，把 Nav2 的原地转向（纯旋转、
+        # 位移恒为 0，实测 |wz| 可达 0.61~1.01 rad/s）误判成卡死。
+        # 现在"转了一点"也算在动，锚点随之重置。
+        self.declare_parameter('exploration_pose_stall_yaw_rad', 0.15)
         self.declare_parameter('rrt_fallback_wait_sec', 0.0)
         self.declare_parameter('rrt_projection_radius_m', 1.0)
+        # 2026-10-14 P46-C：单轮投影最多考察多少个候选（<=0 表示不限）。
+        # 实测 999 个候选全部逐个投影会饿死 lifecycle 回调，导致误判
+        # "Nav2 lifecycle is not active yet" 并让车长时间停住。
+        self.declare_parameter('rrt_projection_max_candidates', 200)
         # 2026-10-06: 沿“前沿->小车”方向退让时的步长（米）。
         # 原实现只在以样本为心、半径 rrt_projection_radius_m 的圆内找已知空闲格，
         # 前沿样本位于“已探索/未知”交界，圆内多为未知格或被净空盘否掉，
@@ -95,7 +311,18 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             'cartographer_finish_trajectory_service', '/finish_trajectory')
         self.declare_parameter('cartographer_trajectory_id', 0)
         self.declare_parameter('cartographer_finish_timeout_sec', 10.0)
-        self.declare_parameter('final_map_wait_timeout_sec', 3.0)
+        # 2026-10-10: 3.0 -> 30.0。finish_trajectory 返回 != 轨迹优化完成；
+        # 实测某一轮优化在 finish 受理后 39 秒才开始，3 秒预算必然判失败，
+        # 导致最终地图从未落盘（磁盘上仍是上一轮产物）。
+        # 2026-10-12: 等不到 finish 后的新栅格时，退回保存缓存地图。
+        # 30 -> 45：finish 后的最终优化耗时不确定（实测 1.3s / 6.7s / 39s 都出现过），
+        # 给慢优化更多机会走"保存真正最终栅格"的首选路径。
+        self.declare_parameter('final_map_wait_timeout_sec', 45.0)
+        # 超时兜底：缓存地图合法时照常保存，避免整轮建图成果丢失。
+        self.declare_parameter('final_map_save_fallback_on_timeout', True)
+        # 2026-10-10: 若等待窗口内地图仍在增长，则顺延截止时间，避免
+        # "差一点点就到"时被硬切。
+        self.declare_parameter('final_map_grace_after_growth_sec', 6.0)
         self.declare_parameter(
             'cartographer_finish_tf_translation_tolerance_m', 0.01)
         self.declare_parameter(
@@ -129,6 +356,22 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         # return-home (R1 boxed-in, retry pre-retreat) is off by default because the
         # lidar cannot see behind the robot (field collision on 2026-10-07 13:38).
         self.declare_parameter('exploration_retreat_enabled', True)
+        # 2026-10-13 P11 方案4：探索专用后退参数组。
+        # 此前探索与返航共用 return_home_retreat_*，探索被迫采用返航尺度
+        # （0.90m）导致探测深度 probe=0.90+0.25=1.15m，后方这么长的带状区里
+        # 任一点被占就判 rear-blocked，实测频繁误判（14:03 轮 4 次里 2 次失败）。
+        # 现按 context 分流：探索用本组（更慢更短），返航参数保持不动。
+        self.declare_parameter('exploration_retreat_speed_mps', 0.10)
+        self.declare_parameter('exploration_retreat_max_distance_m', 0.35)
+        self.declare_parameter('exploration_retreat_max_sec', 3.0)
+        self.declare_parameter('exploration_retreat_rear_margin_m', 0.25)
+        # 2026-10-13 P11 方案1：连续 rear-blocked 后的原地转向（打破三向锁死）。
+        # 前进被前向门禁拒、后退被 rear-blocked 拒、自转又 Collision Ahead 失败
+        # 导致车在原地反复重试；改为转向换朝向后重试后退。
+        self.declare_parameter('exploration_blocked_turn_deg', 90.0)
+        self.declare_parameter('exploration_blocked_turn_max_tries', 2)
+        self.declare_parameter('exploration_blocked_turn_total_limit_deg', 180.0)
+        self.declare_parameter('exploration_blocked_turn_speed_radps', 0.40)
         self.declare_parameter('return_home_retreat_enabled', False)
         self.declare_parameter('return_home_retreat_speed_mps', 0.15)   # R1e
         self.declare_parameter('return_home_retreat_max_distance_m', 0.60)   # R1e
@@ -145,15 +388,68 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.declare_parameter('return_home_failure_retreat_enabled', True)
         # A/B (2026-09-29)
         self.declare_parameter('frontier_pullback_m', 1.0)
+        # 2026-10-10: fallback 采样的距离窗与兜转检测。原为硬编码
+        # collect(2.5, 5.5) / collect(1.8, 6.0)。抽成参数以便按探索区域
+        # 实际尺寸调整（小区域里 2.5m 下限必然指向区域外）。
+        self.declare_parameter('fallback_min_distance_m', 2.5)
+        self.declare_parameter('fallback_max_distance_m', 5.5)
+        self.declare_parameter('fallback_wide_min_distance_m', 1.8)
+        self.declare_parameter('fallback_wide_max_distance_m', 6.0)
+        # 连续多少次目标方向反转（>reversal_min_deg）判定为兜转。
+        self.declare_parameter('fallback_reversal_min_deg', 120.0)
+        self.declare_parameter('fallback_reversal_streak_alert', 3)
+        # 2026-10-10: fallback 候选的"方向粘性"权重（弧度）。
+        # 排序键 = 角度差(rad) * 本值 + 距离(m) * (1/fallback_max_distance_m)。
+        # 越大越坚持原方向；0 = 退化为纯距离优先。
+        self.declare_parameter('fallback_heading_weight', 1.0)
+        # 2026-10-10 (operator): 探索目标的 yaw 取法。
+        #   'tangent' = 保持机器人当前朝向（对前向-only 的 DUBIN 平凡可满足）
+        #   'bearing' = 原来的"指向目标"方位角
+        # 实测 'bearing' 会让规划器对近处空旷目标连续 'exceeded maximum
+        # iterations'（30 秒 7 次），故默认改为 'tangent'。
+        #
+        # 2026-10-12: 探索目标朝向改为「抵达时的行进方向」。
+        # 'tangent' 取的是**派发那一刻**的车头朝向，而那一刻机器人还没转
+        # （run-1316 实测 turn 平均 85°、最大 162°），抵达时朝向已变成行进
+        # 方向 → 与写入朝向差 109°/147°。Nav2 用 SimpleGoalChecker
+        # (yaw=0.25rad≈14°) 把目标朝向当作「抵达时必须满足」的约束，
+        # 于是机器人到点后必须再转回去 —— 这是「频繁掉头」的直接来源。
+        #   'approach' = 指向目标的方位角（= 抵达时的行进方向，
+        #                抵达时天然满足，终点无需再转）—— 现为默认。
+        #   'keep'     = 不改写，沿用调用方给的朝向。
+        self.declare_parameter('goal_yaw_mode', 'approach')
         self.declare_parameter('approach_probe_m', 1.2)   # R1e
         self._blocked_retreat_last_at = 0.0
         self._blocked_retreat_count = 0
+        # 2026-10-13 P11 方案1：连续 rear-blocked 与转向预算
+        self._blocked_rear_streak = 0
+        self._blocked_turn_count = 0
+        self._blocked_turn_total_rad = 0.0
+        # 2026-10-13 P21：转角门禁的拦截计数 + 多类型"确定不可达"连续计数。
+        # 注意：'r1d' 复用既有 _r1d_consecutive（不另设平行计数，否则不同步）；
+        # planner/reach 各一个独立计数。异类互相清零 => 不跨类型求和。
+        self._turn_blocked_count = 0
+        self._planner_consecutive = 0
+        self._reach_consecutive = 0
         self._retreat_used_for_attempt = False
         self.declare_parameter('mapping_finish_confirm_timeout_sec', 90.0)
         self.declare_parameter('return_home_hard_timeout_sec', 86400.0)   # 2026-09-29: no timeout
+        # 2026-10-12: 位置容差必须大于 Nav2 的 goal_checker 容差。
+        # 原值 0.15 与 launch 侧 goal_checker.xy_goal_tolerance=0.15 完全相同，
+        # 零余量：Nav2 判到达后停在 0.18m，而本判据要 ≤0.15m，差 3.6cm 永远
+        # 无法满足 —— 实测 2026-10-12 14:02 轮因此刷屏
+        # 'return-home is outside the position-only tolerance: 0.186m > 0.150m'
+        # 并把 returnHomeRetry 顶到 3/3 上限。现放宽到 0.25（比 Nav2 大 0.10m，
+        # 留出停车抖动余量；建图起点的语义只需"回到原点附近"）。
         self.declare_parameter(
-            'return_home_xy_completion_tolerance_m', 0.15)
+            'return_home_xy_completion_tolerance_m', 0.25)
         self.declare_parameter('return_home_orientation_grace_sec', 6.0)
+        # 2026-10-10 (operator): 返航完成判据。位置是唯一前提，朝向不再作为
+        # 完成前提：Nav2 的 stateful goal checker 要求 XY 与 yaw 同时满足，
+        # 而旋转对齐会把位置抖出容差，导致精确到达却一直微调。
+        self.declare_parameter('return_home_completion_requires_orientation', False)
+        self.declare_parameter('return_home_completion_hold_sec', 1.5)
+        self.declare_parameter('return_home_completion_move_epsilon_m', 0.03)
         self.declare_parameter('mapping_timeout_cancel_delay_sec', 5.0)
         self.declare_parameter('manual_takeover_auto_close_enabled', True)
         self.declare_parameter('manual_takeover_auto_close_distance_m', 0.35)
@@ -166,6 +462,12 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self.get_parameter(
                 'nav_lifecycle_retry_max_delay_sec').value,
         )
+        # 2026-10-14 P46-B：容忍瞬时缺失所需的记账（见 _nav2_lifecycle_callback_impl）。
+        # 实测 manager 忙时 GetState 回调会被饿死并误判为超时，若零容忍就会
+        # 直接把 nav2_ready 打成 False 并让车停住。
+        self.nav_lifecycle_missing_streak = {}
+        self.nav_lifecycle_last_active = {}
+        self.nav_lifecycle_missing_tolerance = 3
         self.get_logger().info(
             'Cartographer lifecycle retry enabled: '
             f'timeout={self.nav_lifecycle_retry.request_timeout_sec:.1f}s, '
@@ -185,6 +487,25 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             no_progress_timeout,
             float(self.get_parameter('exploration_hard_timeout_sec').value),
         )
+        # 2026-10-14 D3：净推进判据的开关与锚点状态（见 _path_aware_progress_distance）。
+        self.exploration_progress_path_aware = bool(
+            self.get_parameter('exploration_progress_path_aware').value)
+        self.exploration_progress_anchor_m = max(
+            0.05,
+            float(self.get_parameter(
+                'exploration_progress_anchor_m').value),
+        )
+        self._progress_path_anchor = None
+        self.exploration_progress_no_net_timeout = bool(
+            self.get_parameter('exploration_progress_no_net_timeout').value)
+        self.exploration_no_net_min_travel_m = max(
+            0.0, float(self.get_parameter(
+                'exploration_no_net_min_travel_m').value))
+        self._no_net_anchor = None
+        self.exploration_no_net_rearm_sec = max(
+            0.5, float(self.get_parameter(
+                'exploration_no_net_rearm_sec').value))
+        self._no_net_cooldown_until = 0.0
         self.exploration_pose_stall_timeout_sec = max(
             1.0,
             float(self.get_parameter(
@@ -200,8 +521,15 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             float(self.get_parameter(
                 'exploration_pose_stall_goal_tolerance_m').value),
         )
+        self.exploration_pose_stall_yaw_rad = max(
+            0.0,
+            float(self.get_parameter(
+                'exploration_pose_stall_yaw_rad').value),
+        )
         self.rrt_fallback_wait_sec = max(
             0.0, float(self.get_parameter('rrt_fallback_wait_sec').value))
+        self.rrt_projection_max_candidates = int(
+            self.get_parameter('rrt_projection_max_candidates').value)
         self.rrt_projection_radius_m = max(
             self.goal_clearance,
             float(self.get_parameter('rrt_projection_radius_m').value),
@@ -228,6 +556,12 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.final_map_wait_timeout_sec = max(
             0.0, float(self.get_parameter(
                 'final_map_wait_timeout_sec').value))
+        self.final_map_grace_after_growth_sec = max(
+            0.0, float(self.get_parameter(
+                'final_map_grace_after_growth_sec').value))
+        self.final_map_save_fallback_on_timeout = bool(
+            self.get_parameter(
+                'final_map_save_fallback_on_timeout').value)
         self.cartographer_finish_tf_translation_tolerance_m = max(
             0.0, float(self.get_parameter(
                 'cartographer_finish_tf_translation_tolerance_m').value))
@@ -300,6 +634,33 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.cancel_zero_guard_period_sec = max(
             0.02, float(self.get_parameter(
                 'cancel_zero_guard_period_sec').value))
+        # 2026-10-10: 兜转埋点用到的六个参数必须赋成实例属性。
+        # 事故教训——只 declare_parameter 不赋值，_pick_fallback_goal 会在
+        # 读取 self.fallback_min_distance_m 时抛 AttributeError，导致探索
+        # 回调每拍崩溃、机器人停住不动。
+        self.fallback_min_distance_m = max(
+            0.0, float(self.get_parameter(
+                'fallback_min_distance_m').value))
+        self.fallback_max_distance_m = max(
+            self.fallback_min_distance_m, float(self.get_parameter(
+                'fallback_max_distance_m').value))
+        self.fallback_wide_min_distance_m = max(
+            0.0, float(self.get_parameter(
+                'fallback_wide_min_distance_m').value))
+        self.fallback_wide_max_distance_m = max(
+            self.fallback_wide_min_distance_m, float(self.get_parameter(
+                'fallback_wide_max_distance_m').value))
+        self.fallback_reversal_min_deg = max(
+            0.0, float(self.get_parameter(
+                'fallback_reversal_min_deg').value))
+        self.fallback_reversal_streak_alert = max(
+            0, int(self.get_parameter(
+                'fallback_reversal_streak_alert').value))
+        self.fallback_heading_weight = max(
+            0.0, float(self.get_parameter(
+                'fallback_heading_weight').value))
+        self.goal_yaw_mode = str(
+            self.get_parameter('goal_yaw_mode').value).strip().lower()
         self.mapping_finish_confirm_timeout_sec = max(
             15.0, float(self.get_parameter(
                 'mapping_finish_confirm_timeout_sec').value))
@@ -309,6 +670,15 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.return_home_xy_completion_tolerance_m = max(
             0.01, float(self.get_parameter(
                 'return_home_xy_completion_tolerance_m').value))
+        self.return_home_completion_requires_orientation = bool(
+            self.get_parameter(
+                'return_home_completion_requires_orientation').value)
+        self.return_home_completion_hold_sec = max(
+            0.0, float(self.get_parameter(
+                'return_home_completion_hold_sec').value))
+        self.return_home_completion_move_epsilon_m = max(
+            0.0, float(self.get_parameter(
+                'return_home_completion_move_epsilon_m').value))
         self.return_home_orientation_grace_sec = max(
             0.0, float(self.get_parameter(
                 'return_home_orientation_grace_sec').value))
@@ -344,12 +714,17 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self._return_home_xy_cancel_distance_m = None
         self._return_home_xy_finalizing = False
         self._last_return_home_xy_wait_log = 0.0
+        # 2026-10-10: 位置容差内的累计时长与上一拍距离（判停稳用）。
+        self._return_home_xy_accum_sec = 0.0
+        self._return_home_xy_accum_at = 0.0
+        self._return_home_xy_last_dist = None
         self._latest_feedback_distance = None
         self._distance_source = None
         self._latest_recovery_count = 0
         self._pose_stall_generation = None
         self._pose_stall_anchor_x = None
         self._pose_stall_anchor_y = None
+        self._pose_stall_anchor_yaw = None
         self._pose_stall_anchor_at = 0.0
         self._feedback_state_lock = RLock()
         self._feedback_baseline_generation = None
@@ -425,6 +800,11 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self._final_map_saved = False
         self._final_map_saved_at = ''
         self._final_map_save_error = ''
+        # 2026-10-12: 等不到 finish 后的新栅格时，退回保存缓存地图：是否走了超时兜底保存（供状态文件追溯）。
+        self._final_map_saved_fallback = False
+        # 2026-10-10: 等待最终栅格的顺延截止时间与 revision 观测点。
+        self._final_map_wait_deadline = 0.0
+        self._final_map_wait_revision = 0
         self._cartographer_return_tf_anchor = None
         self._cartographer_return_tf_stable_since = 0.0
         self._last_cartographer_tf_motion_log = 0.0
@@ -453,6 +833,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self._final_map_saved = False
         self._final_map_saved_at = ''
         self._final_map_save_error = ''
+        self._final_map_saved_fallback = False
 
     def _warn_lifecycle_failure(self, node_name, message, now):
         if self.nav_lifecycle_retry.should_warn(node_name, now):
@@ -523,11 +904,33 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 self._record_lifecycle_failure(
                     node_name, f'could not send GetState request: {exc}', now)
 
-        self.nav2_ready = all(
-            self.nav_lifecycle_states.get(node_name)
-            == State.PRIMARY_STATE_ACTIVE
-            for node_name in self.nav_lifecycle_nodes
-        )
+        # 2026-10-14 P46-B：容忍瞬时缺失。
+        # 实测 manager 忙于 RRT 投影（单轮 999 个候选）时，GetState 的响应
+        # 回调会被单线程 executor 饿死，10.7s 后才被判定"超时"，于是
+        # nav_lifecycle_states 被置 None；原来的 all(...) 零容忍判据立刻让
+        # nav2_ready=False -> waiting_for_nav2 -> 不发目标 -> 车停
+        # （实测一次停 228s），而 Nav2 实际是 active[3]、get_state 服务也都在。
+        # 改法：状态拿不到时沿用上次已知状态，只有连续缺失达到容忍次数
+        # 才真正判为不就绪。默认 3 次；置 1 即回到旧的零容忍行为。
+        ready = True
+        for node_name in self.nav_lifecycle_nodes:
+            state = self.nav_lifecycle_states.get(node_name)
+            if state is None:
+                streak = self.nav_lifecycle_missing_streak.get(node_name, 0) + 1
+                self.nav_lifecycle_missing_streak[node_name] = streak
+                if (streak < self.nav_lifecycle_missing_tolerance
+                        and self.nav_lifecycle_last_active.get(node_name)):
+                    continue
+                ready = False
+                break
+            self.nav_lifecycle_missing_streak[node_name] = 0
+            if state == State.PRIMARY_STATE_ACTIVE:
+                self.nav_lifecycle_last_active[node_name] = True
+            else:
+                self.nav_lifecycle_last_active[node_name] = False
+                ready = False
+                break
+        self.nav2_ready = ready
 
     def _run_with_goal_kind(self, kind, callback, *args, **kwargs):
         previous = self._goal_kind_context
@@ -584,6 +987,299 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self._blocked_episode_started_at = None
             self._blocked_episode_attempted = False
 
+    def _record_escape_ineffective_spot(self):
+        """P12-#2：把"escape 转满预算仍无改善"的位置写成卡点。
+
+        复用基类的 blocked_places（manager.py 已有写入语义：
+        同点 0.50m 内则更新时间戳，否则追加）。写入后 goal_recently_failed()
+        会在 failed_goal_ttl(90s) 内不再往该处派目标，避免
+        "同一点反复成为卡点"（实测 (3.26,4.18)/(3.82,3.44) 跨轮重复）。
+        """
+        try:
+            pose = self.update_pose()
+            if pose is None:
+                return False
+            x = float(pose.pose.position.x)
+            y = float(pose.pose.position.y)
+            now = time.monotonic()
+            placed = list(getattr(self, 'blocked_places', []) or [])
+            replaced = False
+            for index, (bx, by, _t) in enumerate(placed):
+                if math.hypot(x - bx, y - by) < 0.50:
+                    placed[index] = (x, y, now)
+                    replaced = True
+                    break
+            if not replaced:
+                placed.append((x, y, now))
+            self.blocked_places = placed
+            self._p1_safe_log(
+                'warn',
+                'P12 stuck-spot recorded: escape rotated with no footprint-cost '
+                'gain at (%.2f, %.2f); blocking it for %.0fs so exploration '
+                'stops re-dispatching into the same deadlock (blocked_places=%d)'
+                % (x, y, float(getattr(self, 'failed_goal_ttl', 90.0)),
+                   len(placed)))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _goal_turn_from_current(self, pose):
+        """P21：目标相对"当前朝向"的转角（弧度 0~pi）。取不到位姿返回 None。"""
+        try:
+            cur = self.update_pose()
+            if cur is None or pose is None:
+                return None
+            dx = pose.pose.position.x - cur.pose.position.x
+            dy = pose.pose.position.y - cur.pose.position.y
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                return 0.0
+            bearing = math.atan2(dy, dx)
+            q = cur.pose.orientation
+            cur_yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            return abs(self._normalize_angle(bearing - cur_yaw))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _sampler_free_cost(self):
+        """P31：运行时读采样器的"自由格"阈值，使 ros2 param set 热调生效。
+
+        采样器三处（collect / RRT 投影两处）原先硬编码 `value >= 30`，
+        会把 OccupancyGrid 里 30~64 的"不确定"格当障碍跳过；车恰好停在这类
+        格子上时（实测 robot_cell_value=38）就会"三个窗口全空"。
+        默认 65 = 与 map_saver 的"非占用"口径一致。
+        """
+        try:
+            return max(1, int(
+                self.get_parameter('exploration_sampler_free_cost').value))
+        except Exception:  # noqa: BLE001
+            return int(getattr(self, 'exploration_sampler_free_cost', 65))
+
+    def _turn_penalty_weight(self):
+        """P31：运行时读转角软约束权重（米），使热调生效。"""
+        try:
+            return max(0.0, float(self.get_parameter(
+                'exploration_turn_penalty_weight_m').value))
+        except Exception:  # noqa: BLE001
+            return float(getattr(
+                self, 'exploration_turn_penalty_weight_m', 4.5))
+
+    def _turn_penalty_on(self):
+        """P31：运行时读转角软约束开关，使热调生效。"""
+        try:
+            return bool(self.get_parameter(
+                'exploration_turn_penalty_enabled').value)
+        except Exception:  # noqa: BLE001
+            return bool(getattr(
+                self, 'exploration_turn_penalty_enabled', True))
+
+    def _turn_from_pose_to(self, cur, x, y):
+        """P27：从给定位姿的车头朝向到 (x, y) 的转角（弧度 0~pi）。
+
+        与 _goal_turn_from_current 同算法，但允许调用方传入已取好的位姿，
+        避免在排序键里对每个候选重复调用 update_pose()。
+        """
+        try:
+            if cur is None:
+                return None
+            dx = float(x) - cur.pose.position.x
+            dy = float(y) - cur.pose.position.y
+            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+                return 0.0
+            bearing = math.atan2(dy, dx)
+            q = cur.pose.orientation
+            cur_yaw = math.atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            return abs(self._normalize_angle(bearing - cur_yaw))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _turn_penalty_m(self, cur, x, y):
+        """P27（方案A）：把"相对车头的转角"折算成等效距离惩罚（米）。
+
+        turn=180° 时返回 exploration_turn_penalty_weight_m（默认 2.0m）。
+        取不到位姿或开关关闭时返回 0.0（等价于关闭软约束）。
+        """
+        if not self._turn_penalty_on():
+            return 0.0
+        weight = self._turn_penalty_weight()
+        if weight <= 0.0:
+            return 0.0
+        turn = self._turn_from_pose_to(cur, x, y)
+        if turn is None:
+            return 0.0
+        return weight * (turn / math.pi)
+
+    def _unlock_direction(self, reason, streak):
+        """P21：进入 flip 模式（清方向粘性 + 丢弃 A 方案缓存队列 + 解锁转角门禁）。
+
+        原逻辑内联在 _r1d_reject_note 里；P21 抽出以便 r1d/planner/reach
+        三条"确定不可达"路径共用。
+        """
+        prev = getattr(self, 'last_explore_heading', None)
+        self._explore_direction_flip = True
+        self.last_explore_heading = None
+        # 2026-10-13 P13：丢弃 A 方案缓存的候选队列（否则翻转被过期队列架空）。
+        try:
+            self._fallback_candidate_order = []
+            self._fallback_candidate_pose = (0.0, 0.0)
+            self._prevalidate_index = 0
+            self._prevalidate_reset()
+        except Exception:  # noqa: BLE001 - 清缓存失败也不能阻断派发
+            pass
+        # 显示名映射：既有测试断言 'after N consecutive R1d rejections'（大写 R1d）
+        _label = 'R1d' if reason == 'r1d' else reason
+        self.get_logger().warn(
+            'direction stickiness reset after %d consecutive %s '
+            'rejections (was heading=%s); fallback will now prefer '
+            'the OPPOSITE direction and the +/-%.0fdeg dispatch turn '
+            'gate is unlocked'
+            % (streak, _label,
+               'None' if prev is None else '%.0fdeg' % math.degrees(prev),
+               float(getattr(self,
+                             'exploration_dispatch_max_turn_deg', 80.0))))
+
+    def _note_unreachable_rejection(self, reason):
+        """P21（丙）：把"确定不可达"的拒发统一计入方向解锁计数。
+
+        reason: 'r1d'（净空不足）/ 'planner'（规划器无路径）/ 'reach'（不同自由域）。
+        计数来源（不设平行计数，避免与既有状态不同步）：
+            'r1d'     -> 读 self._r1d_consecutive（已由 _r1d_reject_note 递增）
+            'planner' -> self._planner_consecutive
+            'reach'   -> self._reach_consecutive
+        规则：**异类互相清零**（不跨类型求和）→ 阈值仍是"连续
+              exploration_direction_flip_after 次"，扩大的是"什么算一次
+              拒发"的口径，而非放松阈值。
+        """
+        try:
+            if reason == 'r1d':
+                streak = int(getattr(self, '_r1d_consecutive', 0))
+                self._planner_consecutive = 0
+                self._reach_consecutive = 0
+            else:
+                attr = '_%s_consecutive' % reason
+                streak = int(getattr(self, attr, 0)) + 1
+                setattr(self, attr, streak)
+                # 异类清零：含 r1d（保证每类都要"连续"达标）
+                self._r1d_consecutive = 0
+                for other in ('planner', 'reach'):
+                    if other != reason:
+                        setattr(self, '_%s_consecutive' % other, 0)
+            threshold = int(getattr(
+                self, 'exploration_direction_flip_after', 2))
+            if streak >= threshold and not getattr(
+                    self, '_explore_direction_flip', False):
+                self._unlock_direction(reason, streak)
+        except Exception:  # noqa: BLE001 - 状态绝不能阻断派发
+            return
+
+    def _prevalidate_remember(self, x, y):
+        """覆盖基类：A 方案预验证否决候选时同步推进方向解锁计数（P21 丙）。
+
+        基类 _prevalidate_poll 在 verdict=='rejected' 时调用本方法。
+        """
+        try:
+            super()._prevalidate_remember(x, y)
+        except Exception:  # noqa: BLE001
+            pass
+        self._note_unreachable_rejection('planner')
+
+    def _normalize_angle(self, angle):
+        """把角度归一化到 (-pi, pi]。P11 方案1 转向用。"""
+        return math.remainder(float(angle), 2.0 * math.pi)
+
+    def _blocked_turn_direction(self, pose):
+        """P11 方案1：选一个让车头"离开上次失败目标方位"的转向方向。
+
+        目的：不再往同一个（不可行的）扇区做无效派发。做法是把车头转向
+        "与上次目标方位夹角 >= 90 度"的那一侧，左右转里取转角较小者。
+        返回 +1（逆时针/左转）或 -1（顺时针/右转）。
+        """
+        try:
+            target_bearing = getattr(self, 'last_explore_heading', None)
+            if target_bearing is None:
+                return 1
+            q = pose.pose.orientation
+            cur_yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+            rel = self._normalize_angle(float(target_bearing) - cur_yaw)
+            if rel == 0.0:
+                return 1
+            # 目标在左侧（rel>0）时左转正好冲向目标，应改右转，使车头背离目标
+            return -1 if rel > 0.0 else 1
+        except Exception:  # noqa: BLE001
+            return 1
+
+    def _rotate_in_place(self, direction, angle_rad, speed_radps):
+        """P11 方案1：原地开环转向（直接发 cmd_vel）。返回实际旋转弧度。
+
+        与 escape_controller 同机制（直接发 Twist），但有明确角度上限，
+        不依赖 Nav2 Spin（实测 Spin 紧贴障碍时必然 Collision Ahead 失败）。
+        """
+        if angle_rad <= 0.0 or speed_radps <= 0.0:
+            return 0.0
+        twist = Twist()
+        twist.angular.z = float(direction) * abs(speed_radps)
+        start = time.monotonic()
+        rotated = 0.0
+        last = start
+        max_sec = angle_rad / abs(speed_radps) + 2.0
+        try:
+            while rotated < angle_rad:
+                now = time.monotonic()
+                self.cmd_vel_pub.publish(twist)
+                dt = max(0.0, now - last)
+                rotated += abs(speed_radps) * dt
+                last = now
+                if (now - start) >= max_sec:
+                    break
+                time.sleep(0.05)
+        finally:
+            self.publish_zero_velocity()
+            time.sleep(0.3)
+        return rotated
+
+    def _turn_after_rear_blocked(self, now):
+        """P11 方案1：连续 rear-blocked 后转向，打破三向锁死。
+
+        触发：连续 rear-blocked >= 2 次（见 _maybe_retreat_when_blocked）。
+        护栏：最多 exploration_blocked_turn_max_tries 次，累计不超过
+              exploration_blocked_turn_total_limit_deg，防止变成新的自转循环。
+        """
+        max_tries = int(self.get_parameter(
+            'exploration_blocked_turn_max_tries').value)
+        if self._blocked_turn_count >= max_tries:
+            return False
+        total_limit = math.radians(abs(float(self.get_parameter(
+            'exploration_blocked_turn_total_limit_deg').value)))
+        angle = math.radians(abs(float(self.get_parameter(
+            'exploration_blocked_turn_deg').value)))
+        speed = abs(float(self.get_parameter(
+            'exploration_blocked_turn_speed_radps').value))
+        if angle <= 0.0 or speed <= 0.0:
+            return False
+        if self._blocked_turn_total_rad + angle > total_limit:
+            angle = total_limit - self._blocked_turn_total_rad
+            if angle < math.radians(30.0):
+                return False
+        pose = self.update_pose()
+        if pose is None:
+            return False
+        direction = self._blocked_turn_direction(pose)
+        rotated = self._rotate_in_place(direction, angle, speed)
+        self._blocked_turn_total_rad += rotated
+        self._blocked_turn_count += 1
+        self.get_logger().warn(
+            'P11 blocked-turn %d/%d: rear stayed blocked, rotating %s %.0fdeg '
+            '(rotated %.0fdeg, total %.0fdeg/%.0fdeg) to leave the failed sector'
+            % (self._blocked_turn_count, max_tries,
+               'CCW' if direction > 0 else 'CW', math.degrees(angle),
+               math.degrees(rotated), math.degrees(self._blocked_turn_total_rad),
+               math.degrees(total_limit)))
+        return True
+
     def _maybe_retreat_when_blocked(self, now):
         """R1b: bounded reverse out of a blocked-clearance deadlock (see the hook above).
 
@@ -614,6 +1310,35 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self.get_logger().warn(
             'R1b blocked-clearance retreat %d/%d: status=%s moved=%.2fm front_before=%.2fm'
             % (self._blocked_retreat_count, max_per_session, status, moved, front))
+        # 2026-10-13 P11 方案1：连续 rear-blocked -> 转向换朝向。
+        # 实测 14:03 轮 4 次后退里 2 次 rear-blocked：前进被前向门禁拒、
+        # 后退被 rear 探测拒、自转又 Collision Ahead 失败，车在原地反复重试。
+        if status == 'rear-blocked':
+            self._blocked_rear_streak += 1
+            if self._blocked_rear_streak >= 2:
+                turned = self._safe_call(
+                    'P11 blocked-turn',
+                    lambda: self._turn_after_rear_blocked(now), False)
+                if turned:
+                    self._blocked_rear_streak = 0
+                else:
+                    self.get_logger().warn(
+                        'P11 blocked-turn exhausted (%d tries, %.0fdeg total); '
+                        'leaving the deadlock for the upper layer to re-plan'
+                        % (self._blocked_turn_count,
+                           math.degrees(self._blocked_turn_total_rad)))
+        elif status == 'moved':
+            # 后退成功 -> 脱困成立，重置连续计数与转向预算
+            self._blocked_rear_streak = 0
+            self._blocked_turn_count = 0
+            self._blocked_turn_total_rad = 0.0
+            # 2026-10-13 P12-#2：后退做过了、前方却仍被挡 => 双向死锁，
+            # 把这个位置写成卡点，避免探索再往同一处派目标
+            # （实测 (3.26,4.18)/(3.82,3.44) 跨轮反复成为卡点）。
+            if self.front_blocked:
+                self._safe_call(
+                    'P12 stuck-spot record',
+                    lambda: self._record_escape_ineffective_spot(), False)
         self._blocked_episode_started_at = None      # re-evaluate the episode from scratch
 
     def _safe_call(self, label, fn, fallback):
@@ -801,6 +1526,10 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
     def _reset_return_home_xy_completion(self, clear_finalizing=True):
         """Forget the one-shot position gate and its exact cancel token."""
         self._return_home_xy_grace_started_at = None
+        # 2026-10-10: 一并清空位置累计器，避免换代际后带着旧累计。
+        self._return_home_xy_accum_sec = 0.0
+        self._return_home_xy_accum_at = 0.0
+        self._return_home_xy_last_dist = None
         self._return_home_xy_grace_generation = None
         self._return_home_xy_cancel_handle = None
         self._return_home_xy_cancel_generation = None
@@ -895,29 +1624,60 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             return False
         now = time.monotonic() if now is None else float(now)
 
-        if self._return_home_xy_grace_started_at is None:
-            if distance_m > self.return_home_xy_completion_tolerance_m:
-                return False
-            self._return_home_xy_grace_started_at = now
-            self._return_home_xy_grace_generation = generation
-            self.get_logger().info(
-                'return-home entered the position-only tolerance: '
-                f'distance={distance_m:.3f}m, allowing '
-                f'{self.return_home_orientation_grace_sec:.1f}s for exact '
-                'orientation')
-
-        elapsed = now - self._return_home_xy_grace_started_at
-        if elapsed < self.return_home_orientation_grace_sec:
-            return False
-        if distance_m > self.return_home_xy_completion_tolerance_m:
-            if now - self._last_return_home_xy_wait_log >= 1.0:
+        tolerance_m = self.return_home_xy_completion_tolerance_m
+        if distance_m > tolerance_m:
+            # 2026-10-10: 超出容差即清空累计器。旧实现在此只打日志，而 grace
+            # 计时器一旦启动就不再复位，于是 6s 后每拍都落在该分支、永远
+            # 等不到重新进入容差，只能无限微调（实测 10:38-10:39）。
+            self._return_home_xy_accum_sec = 0.0
+            self._return_home_xy_accum_at = now
+            self._return_home_xy_last_dist = distance_m
+            if now - self._last_return_home_xy_wait_log >= 2.0:
                 self._last_return_home_xy_wait_log = now
                 self.get_logger().warn(
-                    'return-home orientation grace elapsed, but the robot is '
-                    'outside the position-only tolerance; waiting for '
-                    f're-entry ({distance_m:.3f}m > '
-                    f'{self.return_home_xy_completion_tolerance_m:.3f}m)')
+                    'return-home is outside the position-only tolerance: '
+                    f'{distance_m:.3f}m > {tolerance_m:.3f}m; hold reset')
             return False
+
+        # 位于容差内：若与上一拍相比仍在挪动，累计器清零，确保被认可的是
+        # 停稳而不是恰好路过。
+        previous_distance = self._return_home_xy_last_dist
+        self._return_home_xy_last_dist = distance_m
+        if (previous_distance is not None
+                and abs(previous_distance - distance_m)
+                > self.return_home_completion_move_epsilon_m):
+            self._return_home_xy_accum_sec = 0.0
+            self._return_home_xy_accum_at = now
+            return False
+
+        if self._return_home_xy_accum_at <= 0.0:
+            self._return_home_xy_accum_at = now
+            if self._return_home_xy_grace_started_at is None:
+                self._return_home_xy_grace_started_at = now
+                self._return_home_xy_grace_generation = generation
+            self.get_logger().info(
+                'return-home entered the position-only tolerance: '
+                f'distance={distance_m:.3f}m; holding '
+                f'{self.return_home_completion_hold_sec:.1f}s before '
+                'completing by position')
+            return False
+
+        self._return_home_xy_accum_sec += max(
+            0.0, now - self._return_home_xy_accum_at)
+        self._return_home_xy_accum_at = now
+
+        if (self.return_home_completion_requires_orientation
+                and self._return_home_xy_accum_sec
+                < self.return_home_orientation_grace_sec):
+            return False                   # 兼容开关：回到旧语义
+        if self._return_home_xy_accum_sec < self.return_home_completion_hold_sec:
+            return False
+
+        self.get_logger().info(
+            'return-home position reached and settled: '
+            f'distance={distance_m:.3f}m, held '
+            f'{self._return_home_xy_accum_sec:.2f}s (orientation is not a '
+            'completion prerequisite)')
         if self.goal_result_future.done():
             # The action terminal callback already owns the outcome.
             return False
@@ -990,10 +1750,16 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             return 'already-used', 0.0
         self._retreat_used_for_attempt = True
 
-        speed = abs(float(self.get_parameter('return_home_retreat_speed_mps').value))
-        max_dist = abs(float(self.get_parameter('return_home_retreat_max_distance_m').value))
-        max_sec = abs(float(self.get_parameter('return_home_retreat_max_sec').value))
-        margin = abs(float(self.get_parameter('return_home_retreat_rear_margin_m').value))
+        # 2026-10-13 P11 方案4：探索与返航使用各自的后退参数组。
+        # 此前两者共用 return_home_retreat_*，探索被迫用返航尺度
+        # （max_dist=0.90 -> probe=1.15m），后方稍长一点有障碍就判 rear-blocked。
+        # feature 已在上方由 context 或 _retreat_context() 决定。
+        _pfx = ('exploration_retreat_' if feature == 'exploration'
+                else 'return_home_retreat_')
+        speed = abs(float(self.get_parameter(_pfx + 'speed_mps').value))
+        max_dist = abs(float(self.get_parameter(_pfx + 'max_distance_m').value))
+        max_sec = abs(float(self.get_parameter(_pfx + 'max_sec').value))
+        margin = abs(float(self.get_parameter(_pfx + 'rear_margin_m').value))
         settle = abs(float(self.get_parameter('return_home_retreat_settle_sec').value))
         if speed <= 0.0 or max_dist <= 0.0 or max_sec <= 0.0:
             return 'misconfigured', 0.0
@@ -1375,7 +2141,11 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 pass
             raise
 
-    def _save_cached_final_map(self):
+    def _cached_final_map_msg_or_raise(self):
+        """2026-10-12: 等不到 finish 后的新栅格时，退回保存缓存地图：校验并返回可用的缓存地图。
+
+        主路径与超时兜底共用，保证两者落盘的地图质量判据完全一致。
+        """
         msg = self.last_map
         if msg is None:
             raise RuntimeError('final OccupancyGrid is not available')
@@ -1388,6 +2158,13 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         if len(msg.data) != width * height:
             raise RuntimeError(
                 'final OccupancyGrid cell count does not match its size')
+        return msg
+
+    def _save_cached_final_map(self):
+        msg = self._cached_final_map_msg_or_raise()
+
+        width = int(msg.info.width)
+        height = int(msg.info.height)
 
         pixels = bytearray(width * height)
         for target_row, source_row in enumerate(
@@ -1400,7 +2177,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                     pixel = 205
                 elif value >= 65:
                     pixel = 0
-                elif value <= 25:
+                elif value <= 35:
                     pixel = 254
                 else:
                     pixel = 205
@@ -1473,23 +2250,73 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         elapsed = now - self._final_map_wait_started_at
         final_frame_arrived = (
             self._map_revision > self._final_map_finish_revision)
+        # 2026-10-10: 轨迹优化期间栅格会陆续到达。只要地图还在增长，就把截止
+        # 时间顺延一个 grace 窗口，避免"差一点点就到"被硬切（实测优化可在
+        # finish 受理后 39 秒才开始）。
+        if self._map_revision > self._final_map_wait_revision:
+            self._final_map_wait_revision = self._map_revision
+            self._final_map_wait_deadline = max(
+                self._final_map_wait_deadline,
+                now + self.final_map_grace_after_growth_sec)
+        if self._final_map_wait_deadline <= 0.0:
+            self._final_map_wait_deadline = (
+                self._final_map_wait_started_at
+                + self.final_map_wait_timeout_sec)
         if (
             (self.last_map is None or not final_frame_arrived)
-            and elapsed < self.final_map_wait_timeout_sec
+            and now < self._final_map_wait_deadline
         ):
             self.publish_zero_velocity()
             self.mode = 'finalizing_map'
             self.navigation_state = 'return_home_waiting_final_map'
             return False, (
                 'Cartographer trajectory finished; waiting for the final '
-                f'OccupancyGrid ({elapsed:.1f}/'
-                f'{self.final_map_wait_timeout_sec:.1f}s)')
+                f'OccupancyGrid (elapsed={elapsed:.1f}s, '
+                f'remaining={max(0.0, self._final_map_wait_deadline - now):.1f}s, '
+                f'revision {self._final_map_finish_revision}->'
+                f'{self._map_revision})')
 
         if self.last_map is None or not final_frame_arrived:
-            self._final_map_save_attempted = True
+            wait_age = (
+                None if self.last_map_time is None
+                else round(time.monotonic() - self.last_map_time, 2))
             self._final_map_save_error = (
                 'no post-finish OccupancyGrid arrived within '
-                f'{self.final_map_wait_timeout_sec:.1f}s')
+                f'{self.final_map_wait_timeout_sec:.1f}s '
+                f'(waited={elapsed:.1f}s, revision '
+                f'{self._final_map_finish_revision}->{self._map_revision}, '
+                f'last_map_age={wait_age}s, map_present='
+                f'{self.last_map is not None})')
+            if self.final_map_save_fallback_on_timeout:
+                try:
+                    pgm_path, yaml_path, width, height = (
+                        self._save_cached_final_map())
+                except Exception as exc:  # noqa: BLE001
+                    self._final_map_save_attempted = True
+                    self.last_error = (
+                        'final map save failed before return-home: '
+                        f'{self._final_map_save_error} | fallback save '
+                        f'also failed: {exc}')
+                    self.mode = 'returning_home'
+                    self.navigation_state = 'return_home_map_save_failed'
+                    self.get_logger().error(self.last_error)
+                    return True, self.last_error
+                self._final_map_save_attempted = True
+                self._final_map_saved = True
+                self._final_map_saved_fallback = True
+                self._final_map_saved_at = time.strftime(
+                    '%Y-%m-%dT%H:%M:%S%z')
+                self.mode = 'returning_home'
+                self.navigation_state = 'return_home_final_map_saved'
+                self.get_logger().warn(
+                    'saved final Cartographer map from the cached '
+                    'OccupancyGrid (fallback; no post-finish grid '
+                    f'arrived): {pgm_path}, {yaml_path}, '
+                    f'{width}x{height}; reason={self._final_map_save_error}')
+                return True, (
+                    'final map saved via timeout fallback; '
+                    'return-home may begin')
+            self._final_map_save_attempted = True
             self.last_error = (
                 'final map save failed before return-home: '
                 f'{self._final_map_save_error}')
@@ -1542,6 +2369,37 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         saved, message = self._save_final_map_before_return()
         if not saved:
             return False, message
+        return self._run_with_goal_kind(
+            'home', super()._dispatch_pending_home_goal)
+        # 2026-10-10: 返航起终点连通性门禁。实测 09:36-09:38 四次派发全部
+        # Nav2 status 6 且误差不减（0.706 -> 0.873 m），机器人没朝家走反而
+        # 越走越远，4 分钟预算耗尽。与其如此，不如在派发前用当前 /map 核对
+        # 起点与原点是否属于同一连通自由区，一次性明确拒绝。
+        # 走既有 _fail_return_home_before_dispatch，沿用同一重试预算与
+        # 最终转人工接管的语义；检查本身出错则保守放行。
+        if getattr(self, 'return_home_require_connected_route', False):
+            try:
+                current_pose = self.update_pose()
+                if current_pose is not None and self.last_map is not None:
+                    connected, route_detail = self._safe_call(
+                        'home route connectivity',
+                        lambda: self._home_route_connectivity(current_pose),
+                        (None, {}))
+                    self._log_home_route_evidence(connected, route_detail or {})
+                    if connected is False:
+                        self.publish_zero_velocity()
+                        reason = (
+                            'return-home route is blocked on the saved map: the '
+                            'current pose and the origin are in different free '
+                            'regions (static free cells reachable from here: '
+                            '%s of %s). Drive the robot back manually, or check '
+                            'that the navigation map matches this mapping session.'
+                            % (route_detail.get('reachableCells'),
+                               route_detail.get('totalCells')))
+                        return self._fail_return_home_before_dispatch(reason)
+            except Exception as exc:  # noqa: BLE001 - 绝不因检查本身阻断返航
+                self.get_logger().warn(
+                    'return-home connectivity precheck failed: %s' % exc)
         return self._run_with_goal_kind(
             'home', super()._dispatch_pending_home_goal)
 
@@ -1609,8 +2467,15 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self._rrt_wait_started_at = None
         return result
 
-    def _fallback_cell_has_clearance(self, mx, my):
-        """Cheap target-clearance check before selecting a fallback goal."""
+    def _fallback_cell_has_clearance(self, mx, my, clearance=None):
+        """Cheap target-clearance check before selecting a fallback goal.
+
+        2026-10-09 (operator): `clearance` lets the caller use a different disc radius.  The
+        return-home path passes return_home_goal_clearance; every other caller keeps the
+        exploration-grade self.goal_clearance unchanged.
+        """
+        if clearance is None:
+            clearance = self.goal_clearance
         if self.last_map is None:
             return False
         info = self.last_map.info
@@ -1618,10 +2483,10 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         if resolution <= 0.0:
             return False
         clearance_cells = max(
-            1, int(math.ceil(self.goal_clearance / resolution)))
+            1, int(math.ceil(clearance / resolution)))
         for dy in range(-clearance_cells, clearance_cells + 1):
             for dx in range(-clearance_cells, clearance_cells + 1):
-                if math.hypot(dx * resolution, dy * resolution) > self.goal_clearance:
+                if math.hypot(dx * resolution, dy * resolution) > clearance:
                     continue
                 nx = mx + dx
                 ny = my + dy
@@ -1648,50 +2513,286 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         cy = current.pose.position.y
         step = max(2, min(width, height) // 80)
 
-        def collect(min_distance, max_distance):
+        def collect(min_distance, max_distance, ignore_recent_failed=False):
+            """扫出距离窗内的候选。
+
+            2026-10-13 P6：新增 ignore_recent_failed。
+            为什么需要它：goal_recently_failed 的半径是 failed_goal_radius=1.5m
+            （launch 亦为 1.5），而车停在原点时可达域半径往往 <1.5m ——
+            于是**所有候选都被失败记忆滤掉**，导致 collect() 恒为空、
+            放宽窗也救不回来（实测 no candidate cell 11 次 / holding position 2 次）。
+            放宽窗（脱困路径）必须能看到这些候选，否则就是死锁。
+            """
             cells = []
+            # P31：阈值改为运行时读取的参数（默认 65），热调自下一拍生效。
+            free_cost = self._sampler_free_cost()
             for my in range(2, height - 2, step):
                 row = my * width
                 for mx in range(2, width - 2, step):
                     value = data[row + mx]
-                    if value < 0 or value >= 30:
+                    if value < 0 or value >= free_cost:
                         continue
                     x = origin.x + (mx + 0.5) * resolution
                     y = origin.y + (my + 0.5) * resolution
                     distance = math.hypot(x - cx, y - cy)
                     if distance < min_distance or distance > max_distance:
                         continue
-                    if self.goal_recently_failed(x, y):
+                    if not ignore_recent_failed and self.goal_recently_failed(x, y):
                         continue
                     cells.append((x, y, distance, mx, my))
             return cells
 
-        candidates = collect(2.5, 5.5)
+        # 2026-10-10: 把两个距离窗的候选数记下来，便于判断"区域太小导致
+        # 首选窗为空"还是"候选存在但全被验证拒掉"。
+        window = 'preferred'
+        # 2026-10-13 P4 修正：relax_window 必须在所有分支之前初始化。
+        # 原写法只在"两窗皆空"分支里赋值，正常路径下后面 `if relax_window:`
+        # 会抛 UnboundLocalError，而调用方用 _safe_call 包着 → 异常被吞
+        # → 整个兜底采样静默失效。
+        relax_window = False
+        candidates = collect(self.fallback_min_distance_m,
+                             self.fallback_max_distance_m)
+        preferred_count = len(candidates)
+        wide_count = 0
         if not candidates:
-            candidates = collect(1.8, 6.0)
+            window = 'wide'
+            candidates = collect(self.fallback_wide_min_distance_m,
+                                 self.fallback_wide_max_distance_m)
+            wide_count = len(candidates)
         if not candidates:
-            return None
+            # 2026-10-13 P4：两个标准窗都空 → 不再直接停车（那会造成
+            # "车不动 → 地图不扩展 → 候选仍为 0"的死锁），改用脱困式放宽窗：
+            # 下限降到 exploration_fallback_relax_min_m，上限放开。
+            if bool(getattr(self, 'exploration_fallback_relax_enabled', True)):
+                relax_min = float(getattr(
+                    self, 'exploration_fallback_relax_min_m', 0.5))
+                # 2026-10-13 P6 缺陷1：脱困窗必须忽略失败记忆。
+                # 否则 failed_goal_radius(1.5m) >= 车当前可达半径时，
+                # collect() 恒为空 —— 失败记忆把车锁死在自己附近。
+                _ignore_hist = bool(getattr(
+                    self, 'exploration_fallback_relax_ignore_history', True))
+                # 2026-10-13 P10 诊断：放宽窗为何仍为空？
+                # 已知 no candidate cell 打印在放宽分支之后，说明放宽窗执行过
+                # 但 collect(0.5, inf) 返回空。这里把三个可能的解释一次性打出：
+                #   · relax_enabled / ignore_hist 的实际值
+                #   · 标准窗候选数 vs 放宽窗候选数
+                #   · 车所在格的 /map 值（若为 -1 说明车周围都还是未知）
+                _dbg_exc = None
+                try:
+                    candidates = collect(relax_min, float('inf'),
+                                         ignore_recent_failed=_ignore_hist)
+                except Exception as _e:  # noqa: BLE001
+                    _dbg_exc = repr(_e)
+                    candidates = []
+                # 按"结论"去重：只有结论变化时才打印，既能看趋势又不刷屏。
+                # （_p1_safe_log 的 once 是按实例属性去重，只会打第一条，
+                #   对"想看候选数随地图长大的变化"不够用。）
+                _dbg_key = (bool(getattr(self, 'exploration_fallback_relax_enabled', None)),
+                            _ignore_hist, preferred_count, wide_count,
+                            len(candidates), width, height, _dbg_exc)
+                if getattr(self, '_p10_relax_diag_key', None) != _dbg_key:
+                    try:
+                        self._p10_relax_diag_key = _dbg_key
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._p1_safe_log(
+                        'warn',
+                        'P10 relax diag: enabled=%s ignore_hist=%s relax_min=%.2f '
+                        'preferred=%d wide=%d relax=%d map=%dx%d robot=(%.2f,%.2f) '
+                        'robot_cell_value=%s collect_exc=%s'
+                        % (_dbg_key[0], _ignore_hist, relax_min,
+                           preferred_count, wide_count, len(candidates),
+                           width, height, cx, cy,
+                           self._p4_cell_value(cx, cy), _dbg_exc))
+                if candidates:
+                    if _ignore_hist:
+                        try:
+                            _hist = list(getattr(self, 'failed_goals', [])) + \
+                                list(getattr(self, 'blocked_places', []))
+                            _near = ['(%.2f, %.2f)' % (gx, gy)
+                                     for gx, gy, _t in _hist
+                                     if math.hypot(gx - cx, gy - cy)
+                                     <= float(getattr(self, 'failed_goal_radius', 1.5))]
+                            self._p1_safe_log(
+                                'warn',
+                                'P6 relax window IGNORED %d recent-failure '
+                                'marker(s) near the robot (%s); otherwise every '
+                                'candidate would be filtered out and the robot '
+                                'would be locked in place by its own history'
+                                % (len(_near), ' '.join(_near[:6])),
+                                once='_p6_relax_ignored_logged')
+                        except Exception:  # noqa: BLE001
+                            pass
+                if candidates:
+                    relax_window = True
+                    window = 'relax(%.1f-∞)' % relax_min
+                    _window_desc = (
+                        'preferred %.1f-%.1fm=%d, wide %.1f-%.1fm=%d'
+                        % (self.fallback_min_distance_m,
+                           self.fallback_max_distance_m, preferred_count,
+                           self.fallback_wide_min_distance_m,
+                           self.fallback_wide_max_distance_m, wide_count))
+                    self.get_logger().warn(
+                        'fallback: both standard windows empty (%s) at '
+                        'pose=(%.2f, %.2f); RELAXING to %.1f-infm and '
+                        'heading for the farthest reachable cell to break '
+                        'the standstill deadlock'
+                        % (_window_desc, cx, cy, relax_min))
+            if not candidates:
+                self.get_logger().warn(
+                    'fallback: no candidate cell in either window '
+                    '(preferred %.1f-%.1fm=%d, wide %.1f-%.1fm=%d) at pose=(%.2f, %.2f)'
+                    % (self.fallback_min_distance_m,
+                       self.fallback_max_distance_m, preferred_count,
+                       self.fallback_wide_min_distance_m,
+                       self.fallback_wide_max_distance_m, wide_count,
+                       cx, cy))
+                return None
 
-        # Randomize peers for coverage, then stably move candidates that keep
-        # the current exploration heading to the front of the validation queue.
+        # Randomize first so that equal-scoring candidates stay shuffled (keeps
+        # coverage from collapsing onto one line), then rank by a CONTINUOUS key.
+        #
+        # 2026-10-10: 原实现只把候选分成"角度差<60 度 / >=60 度"两档，同档内
+        # 仍是随机——于是"首选档"里可以出现 120 度扇形内任意方位，取第一个
+        # 通过验证的就成了随机目标，实测 turn 均值 81-95 度、>120 度占 17-44%。
+        # 现改为连续排序键：角度差(rad) * heading_weight + 距离(m) * 距离权重。
+        # 效果是优先"与上次大致同向、且更近"的目标，从机制上压制掉头。
         random.shuffle(candidates)
-        if self.last_explore_heading is not None:
-            def heading_group(candidate):
+        _heading_weight = max(0.0, float(
+            self.get_parameter('fallback_heading_weight').value))
+        if relax_window:
+            # 脱困窗：距离项取负 → 优先"可达域内最远"的点，强制车离开原地
+            _distance_weight = -1.0 / max(1e-3, self.fallback_max_distance_m)
+        else:
+            _distance_weight = (1.0 / max(1e-3, self.fallback_max_distance_m))
+
+        # 2026-10-13 P3-2：连续拒发后优先转向"相对方向"。
+        # 实现方式：把排序基准换成 last_explore_heading + π，原来的
+        # "优先与基准同向" 逻辑即变为 "优先与上次方向相反（角度差接近 180°）"。
+        _rank_basis = self.last_explore_heading
+        if getattr(self, '_explore_direction_flip', False) and _rank_basis is not None:
+            _rank_basis = math.atan2(math.sin(_rank_basis + math.pi),
+                                     math.cos(_rank_basis + math.pi))
+
+        # 2026-10-13 P27（方案A）：转角软约束。
+        # 现有 heading 项用的是 last_explore_heading（**上次探索方向**，
+        # 且 flip 时为 None → 整项失效），与"车现在朝哪"无关；这里补上
+        # "相对当前车头的转角"惩罚。位姿只取一次，避免逐候选重复调用。
+        _turn_cur = self.update_pose()
+        # 惩罚项与距离项同量纲（归一化到 fallback_max_distance_m），
+        # 且**恒为正向**：放宽窗里 _distance_weight 为负（优先最远点），
+        # 若跟着取负会把"大转角"变成优先，反而制造掉头。
+        # P31：每拍读一次参数（不是每个候选读），热调自下一拍生效。
+        _turn_penalty_norm = (
+            self._turn_penalty_weight()
+            / max(1e-3, self.fallback_max_distance_m))
+        if not self._turn_penalty_on():
+            _turn_penalty_norm = 0.0
+
+        def _rank_key(candidate):
+            rank = candidate[2] * _distance_weight
+            if _rank_basis is not None:
                 heading = math.atan2(candidate[1] - cy, candidate[0] - cx)
                 difference = abs(math.atan2(
-                    math.sin(heading - self.last_explore_heading),
-                    math.cos(heading - self.last_explore_heading)))
-                return 0 if difference < 1.05 else 1
-            candidates.sort(key=heading_group)
+                    math.sin(heading - _rank_basis),
+                    math.cos(heading - _rank_basis)))
+                rank += difference * _heading_weight
+            if _turn_penalty_norm > 0.0:
+                _turn = self._turn_from_pose_to(
+                    _turn_cur, candidate[0], candidate[1])
+                if _turn is not None:
+                    rank += (_turn / math.pi) * _turn_penalty_norm
+            return rank
 
+        candidates.sort(key=_rank_key)
+        # 2026-10-12 A：记录本拍排序后的候选，供规划器预验证逐个尝试。
+        # 机制在父类 StemmNav2Manager._prevalidate_*，这里只负责记录。
+        try:
+            self._fallback_candidate_order = [
+                (float(c[0]), float(c[1])) for c in candidates]
+            self._fallback_candidate_pose = (float(cx), float(cy))
+        except Exception:  # noqa: BLE001
+            self._fallback_candidate_order = []
+
+        rejected_clearance = 0
+        rejected_path = 0
+        rejected_unreachable = 0
+        rejected_r1d = 0
+        _require_reach = bool(getattr(
+            self, 'exploration_fallback_require_reachable', True))
         for x, y, _distance, mx, my in candidates:
+            # 2026-10-13 P3-1：跳过近期被 R1d 拒发过的候选（修反馈断裂）
+            if self._r1d_reject_seen(x, y):
+                rejected_r1d += 1
+                continue
             if not self._fallback_cell_has_clearance(mx, my):
+                rejected_clearance += 1
                 continue
             if self.path_blocked_ratio(cx, cy, x, y) >= 0.10:
+                rejected_path += 1
                 continue
-            return self.make_pose_goal(
-                x, y, math.atan2(y - cy, x - cx))
+            # 2026-10-12 N-11：兜底候选同样必须与机器人同属一个可通行连通域。
+            # 实测失败目标几乎全部出自这里 —— 旧实现只查净空与直线
+            # 通畅，于是把"地图自由但被膨胀隔断"的点派了出去，
+            # 每个耗满 50s 硬上限。三态判定：False 才拒，None 放行。
+            if _require_reach:
+                _reach = self._safe_call(
+                    'fallback reachability',
+                    lambda: self._explore_cell_is_reachable(x, y), None)
+                if _reach is False:
+                    rejected_unreachable += 1
+                    continue
+            bearing = math.atan2(y - cy, x - cx)
+            self.get_logger().info(
+                'fallback pick: window=%s candidates=%d (preferred=%d wide=%d) '
+                'rejected(clearance=%d path=%.0f%%=%d unreachable=%d r1d=%d) '
+                'chosen=(%.2f, %.2f) '
+                'dist=%.2fm bearing=%.0fdeg robot=(%.2f, %.2f)%s'
+                % (window, len(candidates), preferred_count, wide_count,
+                   rejected_clearance, 10.0, rejected_path,
+                   rejected_unreachable, rejected_r1d,
+                   x, y, _distance, math.degrees(bearing), cx, cy,
+                   ' [FLIP]' if getattr(self, '_explore_direction_flip', False) else ''))
+            self._note_goal_bearing(bearing, x, y)
+            self._note_explore_dispatch_success()
+            return self.make_pose_goal(x, y, bearing)
+        self.get_logger().warn(
+            'fallback: all %d candidates rejected (clearance=%d, path=%.0f%%=%d), '
+            'window=%s robot=(%.2f, %.2f)'
+            % (len(candidates), rejected_clearance, 10.0, rejected_path,
+               window, cx, cy))
         return None
+
+    def _note_goal_bearing(self, bearing, x, y):
+        """2026-10-10: 兜转检测。连续 N 次目标方位角反转超过阈值即告警。
+
+        这是"小区域内兜转死循环"的核心可观测点：此前日志里只有 target 坐标，
+        没有任何地方显式记录"机器人被反复派往相反方向"。
+        """
+        previous = getattr(self, '_fallback_last_bearing', None)
+        streak = getattr(self, '_fallback_reversal_streak', 0)
+        if previous is not None:
+            delta = abs(math.atan2(math.sin(bearing - previous),
+                                   math.cos(bearing - previous)))
+            threshold = math.radians(
+                float(self.get_parameter('fallback_reversal_min_deg').value))
+            if delta >= threshold:
+                streak += 1
+            else:
+                streak = 0
+        self._fallback_last_bearing = bearing
+        self._fallback_reversal_streak = streak
+        alert_at = int(self.get_parameter(
+            'fallback_reversal_streak_alert').value)
+        if alert_at > 0 and streak >= alert_at:
+            self.get_logger().warn(
+                'fallback THRASHING: %d consecutive goal reversals >= %.0f deg; '
+                'latest target=(%.2f, %.2f). The robot is being sent back and forth '
+                'instead of making progress.'
+                % (streak,
+                   float(self.get_parameter('fallback_reversal_min_deg').value),
+                   x, y))
+            self._fallback_reversal_streak = 0      # 复位，避免刷屏
 
     def _pull_goal_into_known_free(self, pose):
         """A: move a frontier goal back towards the robot while the cells stay known-free.
@@ -1800,8 +2901,958 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                     return False
         return True
 
-    def _goal_target_is_viable(self, pose):
+    def _home_rear_is_clear(self, tx, ty, yaw, rear=0.50):
+        """2026-10-09: the rear-space half of R1d, extracted so the home search can pre-check
+        it; a candidate that fails it would only be rejected later by _goal_target_is_viable."""
+        if self.last_map is None:
+            return True
+        info = self.last_map.info
+        res = info.resolution
+        if res <= 0.0:
+            return True
+        ox, oy = info.origin.position.x, info.origin.position.y
+        bx = tx - rear * math.cos(yaw)
+        by = ty - rear * math.sin(yaw)
+        bmx, bmy = int((bx - ox) / res), int((by - oy) / res)
+        if 0 <= bmx < info.width and 0 <= bmy < info.height:
+            return self.last_map.data[bmy * info.width + bmx] < 50
+        return True
+
+    # ==== 2026-10-10: 返航起终点连通性门禁 + 证据采集 ====
+    def _map_cell_index(self, x, y):
+        """Return the flat index of (x, y) on the current /map, or None."""
+        if self.last_map is None:
+            return None
+        info = self.last_map.info
+        res = float(info.resolution)
+        if res <= 0.0:
+            return None
+        ox = float(info.origin.position.x)
+        oy = float(info.origin.position.y)
+        # 2026-10-10: 用 round 而非 int()。实测 y=0.95 / res=0.05 得到
+        # 18.999999999999996，int() 截断为 18，落进相邻栅格；在一整格边界上
+        # 会系统性偏移一格。round 取最近格，与 Nav2 的 worldToMap 一致。
+        mx = int(round((float(x) - ox) / res))
+        my = int(round((float(y) - oy) / res))
+        if mx < 0 or my < 0 or mx >= info.width or my >= info.height:
+            return None
+        return my * info.width + mx
+
+
+    # ==== 2026-10-12 N-9：探索目标的 Nav2 权威可达性判据 ====
+    def _init_exploration_costmap_client(self):
+        """建立 /global_costmap/get_costmap 客户端（失败不致命，判据会回退）。"""
+        if not getattr(self, 'exploration_costmap_gate', False):
+            return
+        try:
+            from nav2_msgs.srv import GetCostmap  # noqa: F401
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                'exploration costmap gate disabled: nav2_msgs/GetCostmap '
+                'unavailable (%s); falling back to the map-only check' % exc)
+            self.exploration_costmap_gate = False
+            return
+        try:
+            self._costmap_client = self.create_client(
+                GetCostmap, self.exploration_costmap_service)
+            self.create_timer(
+                self.exploration_costmap_fetch_sec, self._costmap_fetch_tick)
+            self.create_timer(0.1, self._costmap_reap_future)
+            self.get_logger().info(
+                'exploration goal gate now uses the Nav2 global costmap via %s '
+                '(traversable = cost < %d)'
+                % (self.exploration_costmap_service,
+                   self.exploration_costmap_lethal_cost))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                'exploration costmap client setup failed (%s); falling back to '
+                'the map-only check' % exc)
+            self._costmap_client = None
+            self.exploration_costmap_gate = False
+
+    def _costmap_reap_future(self):
+        """非阻塞地取回上一拍的服务响应。"""
+        fut = getattr(self, '_costmap_future', None)
+        if fut is None or not fut.done():
+            return
+        self._costmap_future = None
+        try:
+            res = fut.result()
+        except Exception:  # noqa: BLE001 - 判定绝不能阻断探索
+            return
+        msg = getattr(res, 'map', None)
+        if msg is None or not getattr(msg, 'data', None):
+            return
+        self._costmap_msg = msg
+        self._costmap_at = time.monotonic()
+
+    def _costmap_fetch_tick(self):
+        if not getattr(self, 'exploration_costmap_gate', False):
+            return
+        client = getattr(self, '_costmap_client', None)
+        if client is None or getattr(self, '_costmap_future', None) is not None:
+            return
+        try:
+            if not client.service_is_ready():
+                return
+            from nav2_msgs.srv import GetCostmap
+            self._costmap_future = client.call_async(GetCostmap.Request())
+        except Exception:  # noqa: BLE001
+            self._costmap_future = None
+
+    def _costmap_usable(self):
+        """返回可用的 costmap 帧；无则 None（调用方必须回退）。"""
+        if not getattr(self, 'exploration_costmap_gate', False):
+            return None
+        msg = getattr(self, '_costmap_msg', None)
+        if msg is None:
+            return None
+        info = getattr(msg, 'metadata', None)
+        if info is None or int(getattr(info, 'size_x', 0)) <= 0:
+            return None
+        if int(getattr(info, 'size_y', 0)) <= 0:
+            return None
+        if (time.monotonic() - float(getattr(self, '_costmap_at', 0.0))
+                > 5.0 * self.exploration_costmap_fetch_sec):
+            # 太久没刷新：宁可回退，也不要用陈旧代价地图误拒目标
+            return None
+        return msg
+
+    def _costmap_cell_index(self, info, x, y):
+        res = float(info.resolution)
+        if res <= 0.0:
+            return None
+        size_x, size_y = int(info.size_x), int(info.size_y)
+        mx = float(info.origin.position.x)
+        my = float(info.origin.position.y)
+        # nav2_msgs/GetCostmap.metadata 的原点位于左下角，行自下而上
+        col = int((float(x) - mx) / res)
+        row = int((float(y) - my) / res)
+        if col < 0 or row < 0 or col >= size_x or row >= size_y:
+            return None
+        return row * size_x + col
+
+    def _reachable_dist_field(self):
+        """2026-10-13 P1：/map 上每个格到最近占用格的欧氏距离（米）。
+
+        缓存键 = (地图签名, 车辆内切半径)。地图未变时直接复用，
+        避免在 25 Hz 的决策循环里反复做距离变换。
+        异常/无地图一律返回 None（调用方必须放行）。
+        """
+        try:
+            if self.last_map is None:
+                return None
+            info = self.last_map.info
+            data = self.last_map.data
+            width, height = int(info.width), int(info.height)
+            resolution = float(info.resolution)
+            if width <= 0 or height <= 0 or resolution <= 0.0 or not data:
+                return None
+            clearance = float(getattr(
+                self, 'exploration_reach_clearance_m', 0.328))
+            import numpy as _np
+            # 注意：data 是 int8[]，含 -1（未知），**不能**用 bytes(data)——
+            # bytes() 走的是"整数序列"语义，对负数抛 ValueError。
+            # 必须用 ndarray.tobytes() 才能安全地拿字节做签名。
+            arr = _np.asarray(data, dtype=_np.int8)
+            if arr.size < width * height:
+                return None
+            arr = arr[:width * height].reshape(height, width)
+            signature = (width, height, resolution,
+                         int(round(clearance * 1e6)),
+                         int(getattr(self, 'exploration_reach_obstacle_cost', 65)),
+                         hash(arr.tobytes()))
+            cached = getattr(self, '_reach_cache_field', None)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            # 占用/不可通行 = value >= exploration_reach_obstacle_cost
+            # （默认 30，与采样器 collect 的 value<30 口径统一）。
+            # 未知(-1) 不是占用格：它另由 _map_point_passable/passable 排除，
+            # 不应参与距离场（否则未知区会把障碍距离压小）。
+            _obstacle_cost = int(getattr(
+                self, 'exploration_reach_obstacle_cost', 65))
+            occ = (arr >= _obstacle_cost)
+            field = self._exact_edt_cells(occ) * resolution
+            self._reach_cache_field = (signature, field)
+            return field
+        except Exception:  # noqa: BLE001 - 判定绝不能阻断探索
+            return None
+
+    @staticmethod
+    def _exact_edt_cells(occ):
+        """精确欧氏距离变换（返回每个格到最近 True 格的欧氏距离，单位: 格）。
+
+        标准做法：先沿一个轴做 1D DT，再沿另一个轴做 1D DT。
+        纯 numpy，无 scipy 依赖；258k 格约 1 秒，且有缓存。
+        """
+        import numpy as _np
+        height, width = occ.shape
+        big = 10 ** 12
+        # 第 1 遍：沿 width 方向做 1D DT（每次一批行）
+        g = _np.where(occ, 0, big).astype(_np.int64)
+        idx_w = _np.arange(width, dtype=_np.int64)
+        d1 = _np.empty((height, width), dtype=_np.int64)
+        batch = 64
+        for start in range(0, height, batch):
+            block = g[start:start + batch]                 # (b, w)
+            vals = ((idx_w.reshape(1, 1, width)
+                     - idx_w.reshape(1, width, 1)) ** 2) + block[:, None, :]
+            d1[start:start + batch] = vals.min(axis=2)     # (b, w)
+        # 第 2 遍：沿 height 方向做 1D DT（每次一批列）
+        #   d2[r, c] = min_h ( (r-h)^2 + d1[h, c] )
+        idx_h = _np.arange(height, dtype=_np.int64)
+        d2 = _np.empty((height, width), dtype=_np.int64)
+        for cs in range(0, width, batch):
+            block = d1[:, cs:cs + batch]                   # (h, b)
+            # (h, h, 1) 与 (1, h, b) 广播 -> (h, h, b)，对 h 轴取 min
+            vals = ((idx_h.reshape(height, 1, 1)
+                     - idx_h.reshape(1, height, 1)) ** 2) + block[None, :, :]
+            d2[:, cs:cs + batch] = vals.min(axis=1)        # (h, b)
+        out = _np.sqrt(d2.astype(_np.float64))
+        # 饱和：没有障碍时 d2 会保留 big，开方后是 1e6 量级，必须换成 inf
+        out[_np.sqrt(d2) > 1.0e5] = _np.inf
+        return out
+
+    # ==== 2026-10-13 P3：R1d 拒发反馈 + 方向粘性重置 ====
+
+    def _r1d_reject_init(self):
+        """惰性初始化拒发存根与方向状态（避免依赖 __init__ 改动）。"""
+        if not hasattr(self, '_r1d_rejected'):
+            self._r1d_rejected = {}          # key -> monotonic
+            self._r1d_consecutive = 0
+            self._r1d_reject_events = 0      # 本轮累计（诊断）
+            self._explore_direction_flip = False
+
+    def _r1d_reject_note(self, pose, kind):
+        """记录一次 R1d 拒发（只对探索目标），并推进"方向粘性重置"状态机。
+
+        连续拒发达 exploration_direction_flip_after（默认 2）次 → 重置 last_explore_heading
+        并进入 flip 模式；之后每再拒发 exploration_direction_flip_hold_rejections 次
+        仍然维持 flip（持续尝试相对方向），直到成功派发一次才退出。
+        """
+        try:
+            self._r1d_reject_init()
+            if not self._is_exploration_goal(kind):
+                return
+            self._r1d_reject_events += 1
+            try:
+                self._r1d_rejected[
+                    (self._prevalidate_map_signature(),
+                     round(float(pose.pose.position.x), 2),
+                     round(float(pose.pose.position.y), 2))] = time.monotonic()
+            except Exception:  # noqa: BLE001
+                pass
+            self._r1d_consecutive += 1
+            # 2026-10-13 P21（丙）：解锁口径从"仅 R1d"扩为
+            # r1d / planner / reach 三类"确定不可达"（见 _note_unreachable_rejection），
+            # 但**不跨类型求和** —— 阈值仍是连续 2 次。
+            self._note_unreachable_rejection('r1d')
+        except Exception:  # noqa: BLE001 - 诊断/状态绝不能阻断派发
+            return
+
+    def _r1d_reject_seen(self, world_x, world_y):
+        """该候选是否近期被 R1d 拒发过（按地图签名 + 0.25m 网格近似）。"""
+        try:
+            self._r1d_reject_init()
+            if not self._r1d_rejected:
+                return False
+            ttl = getattr(self, 'exploration_r1d_reject_ttl_sec', 60.0)
+            now = time.monotonic()
+            # 先按 TTL 清理
+            if len(self._r1d_rejected) > 4096:
+                self._r1d_rejected = {
+                    k: v for k, v in self._r1d_rejected.items() if now - v <= ttl}
+            sig = self._prevalidate_map_signature()
+            gx = round(float(world_x) * 4.0) / 4.0      # 0.25 m 网格
+            gy = round(float(world_y) * 4.0) / 4.0
+            for dx in (-0.25, 0.0, 0.25):
+                for dy in (-0.25, 0.0, 0.25):
+                    hit = self._r1d_rejected.get(
+                        (sig, round(gx + dx, 2), round(gy + dy, 2)))
+                    if hit is not None and now - hit <= ttl:
+                        return True
+            return False
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _note_explore_dispatch_success(self):
+        """成功派发一次探索目标 → 退出 flip 模式、清空连续拒发计数。"""
+        try:
+            self._r1d_reject_init()
+            self._r1d_consecutive = 0
+            # 2026-10-13 P21：同步清零多类型连续计数与转角拦截计数
+            self._planner_consecutive = 0
+            self._reach_consecutive = 0
+            self._turn_blocked_count = 0
+            if getattr(self, '_explore_direction_flip', False):
+                self._explore_direction_flip = False
+                self.get_logger().info(
+                    'direction flip mode cleared after a successful dispatch')
+        except Exception:  # noqa: BLE001
+            return
+
+    def _p4_cell_value(self, world_x, world_y):
+        """诊断用：读 /map 上该世界坐标的值（未知 -1 / 占用 >=65 / 自由 0~64）。"""
+        try:
+            if self.last_map is None:
+                return 'no-map'
+            info = self.last_map.info
+            res = float(info.resolution)
+            ox = float(info.origin.position.x)
+            oy = float(info.origin.position.y)
+            mx = int((float(world_x) - ox) / res)
+            my = int((float(world_y) - oy) / res)
+            if mx < 0 or my < 0 or mx >= int(info.width) or my >= int(info.height):
+                return 'out-of-map'
+            cell = my * int(info.width) + mx
+            data = self.last_map.data
+            if not (0 <= cell < len(data)):
+                return 'bad-cell'
+            return int(data[cell])
+        except Exception:  # noqa: BLE001
+            return 'err'
+
+    def _map_point_passable(self, world_x, world_y):
+        """2026-10-13 P1：该世界点"车能不能过"（三态）。
+
+        True  = 地图已知自由，且到最近占用格 >= 车辆内切半径
+        False = 未知格 / 占用格 / 离障碍太近
+        None  = 无法判定（无地图/出图/异常）→ 调用方必须放行
+        """
+        try:
+            if self.last_map is None:
+                return None
+            info = self.last_map.info
+            data = self.last_map.data
+            width, height = int(info.width), int(info.height)
+            resolution = float(info.resolution)
+            if width <= 0 or height <= 0 or resolution <= 0.0:
+                return None
+            origin_x = float(info.origin.position.x)
+            origin_y = float(info.origin.position.y)
+            col = int(round((float(world_x) - origin_x) / resolution))
+            row = int(round((float(world_y) - origin_y) / resolution))
+            if col < 0 or row < 0 or col >= width or row >= height:
+                return None
+            cell = row * width + col
+            if not (0 <= cell < len(data)):
+                return None
+            value = int(data[cell])
+            if value < 0:
+                return False                      # 未知：不认（这就是根因所在）
+            if value >= 65:
+                return False                      # 占用
+            field = self._reachable_dist_field()
+            if field is None:
+                return None
+            clearance = float(getattr(
+                self, 'exploration_reach_clearance_m', 0.328))
+            return float(field[row, col]) >= clearance
+        except Exception:  # noqa: BLE001 - 判定绝不能阻断探索
+            return None
+
+    def _costmap_traversable(self, data, cell):
+        """Nav2 全局 costmap 判据（+ 2026-10-13 P1：再要求"车物理上能过"）。
+
+        cost >= lethal(253) -> 不可通行（含 254 LETHAL）
+        cost == 255 (NO_INFORMATION) -> 与 allow_unknown: true 一致，放行
+        其余（含 cost==0）-> 再问 _map_point_passable：
+            未知格 / 占用格 / 离障碍 < 内切半径 一律判不可通行
+        `exploration_reach_respect_map=False` 时跳过第二层（逐位回退旧行为）。
+        """
+        try:
+            cost = int(data[cell])
+        except Exception:  # noqa: BLE001
+            return None
+        lethal = int(getattr(self, 'exploration_costmap_lethal_cost', 253))
+        if cost == 255:
+            # NO_INFORMATION：与 allow_unknown: true 保持一致（可通行）
+            return True
+        if cost >= lethal:
+            return False
+        if not getattr(self, 'exploration_reach_respect_map', True):
+            return True               # 旧行为：仅看 costmap
+        msg = getattr(self, '_costmap_msg', None)
+        info = getattr(msg, 'metadata', None) if msg is not None else None
+        if info is None:
+            return True               # 拿不到 costmap 元数据：fail-open
+        size_x = int(getattr(info, 'size_x', 0))
+        res = float(getattr(info, 'resolution', 0.0))
+        if size_x <= 0 or res <= 0.0:
+            return True
+        row = cell // size_x
+        col = cell - row * size_x
+        world_x = float(info.origin.position.x) + (col + 0.5) * res
+        world_y = float(info.origin.position.y) + (row + 0.5) * res
+        verdict = self._map_point_passable(world_x, world_y)
+        if verdict is None:
+            return True               # 无法判定：fail-open
+        return verdict
+
+    def _reachable_costmap_cells(self):
+        """在 Nav2 全局 costmap 上做 BFS，返回机器人所在可通行连通域的 cell 集合。
+
+        costmap 不可用时返回 None（调用方回退到地图占用判据）。
+        """
+        msg = self._costmap_usable()
+        if msg is None:
+            return None
+        data = msg.data
+        info = msg.metadata
+        size_x, size_y = int(info.size_x), int(info.size_y)
+        if not data or len(data) < size_x * size_y:
+            return None
+        pose = self.update_pose()
+        if pose is None:
+            return None
+        start_cell = self._costmap_cell_index(
+            info, pose.pose.position.x, pose.pose.position.y)
+        if start_cell is None:
+            return None
+        if self._costmap_traversable(data, start_cell) is not True:
+            # 机器人当前格被判不可通行：无权判定，交回既有闸门
+            return None
+        # 注意：costmap data 是 uint8（0~255），bytes() 的"整数序列"重载
+        # 在遇到负值时抛 ValueError；统一走 numpy 的 tobytes()。
+        import numpy as _npc
+        _cm_arr = _npc.asarray(data, dtype=_npc.uint8)
+        signature = (
+            'costmap', size_x, size_y, float(info.resolution),
+            float(info.origin.position.x), float(info.origin.position.y),
+            hash(_cm_arr.tobytes()), start_cell)
+        cached = getattr(self, '_explore_reach_cache', None)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        cells = set()
+        queue = deque([start_cell])
+        seen = bytearray(size_x * size_y)
+        seen[start_cell] = 1
+        limit = max(1000, int(getattr(
+            self, 'exploration_reach_max_cells', 400000)))
+        while queue:
+            cell = queue.popleft()
+            cells.add(cell)
+            if len(cells) >= limit:
+                break
+            row, col = divmod(cell, size_x)
+            for drow, dcol in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nrow, ncol = row + drow, col + dcol
+                if nrow < 0 or ncol < 0 or nrow >= size_y or ncol >= size_x:
+                    continue
+                ncell = nrow * size_x + ncol
+                if seen[ncell]:
+                    continue
+                seen[ncell] = 1
+                if self._costmap_traversable(data, ncell) is True:
+                    queue.append(ncell)
+        self._explore_reach_cache = (signature, cells)
+        return cells
+
+    def _p1_safe_log(self, level, message, once=None):
+        """2026-10-13 P1：诊断日志的安全包装。
+
+        诊断代码绝不能影响判据：任何异常（节点未初始化、logger 不可用等）
+        都必须被吞掉，且不影响调用方的返回值。
+        `once` 给出实例属性名，用于同一条日志只打一次。
+        """
+        try:
+            if once is not None:
+                if getattr(self, once, False):
+                    return
+                try:
+                    setattr(self, once, True)
+                except Exception:  # noqa: BLE001
+                    pass
+            logger = None
+            try:
+                logger = self.get_logger()
+            except Exception:  # noqa: BLE001
+                logger = None
+            if logger is None:
+                return
+            fn = getattr(logger, level, None)
+            if fn is None:
+                return
+            fn(message)
+        except Exception:  # noqa: BLE001 - 诊断绝不能抛出
+            return
+
+    def _reachable_map_cells(self):
+        """2026-10-13 P1：以 /map 障碍距离场为主判据的"机器人可达域"。
+
+        与 _reachable_costmap_cells 的区别：
+          · 只用 /map（不依赖 Nav2 costmap 的轮询新鲜度）；
+          · 通行判据 = 已知自由 且 到最近占用格 >= 车辆内切半径。
+        costmap 判据的致命弱点在 2026-10-13 实测中暴露：global_costmap 建图期
+        持续 resize（546→555→558 X 587），"5 秒未刷新即回退"被频繁触发，
+        而回退路径（value<50）会把未知格(-1)当自由 → 闸门等于失效。
+        返回 None 表示无法判定（调用方必须放行）。
+        """
+        try:
+            if self.last_map is None:
+                return None
+            info = self.last_map.info
+            data = self.last_map.data
+            width, height = int(info.width), int(info.height)
+            resolution = float(info.resolution)
+            if width <= 0 or height <= 0 or resolution <= 0.0 or not data:
+                return None
+            field = self._reachable_dist_field()
+            if field is None:
+                return None
+            clearance = float(getattr(
+                self, 'exploration_reach_clearance_m', 0.328))
+            import numpy as _np
+            arr = _np.asarray(data, dtype=_np.int8)
+            if arr.size < width * height:
+                return None
+            arr = arr[:width * height].reshape(height, width)
+            # 已知自由 = 0 <= value < 65（OccupancyGrid 尺度；-1 是未知，不算）
+            _obstacle_cost = int(getattr(
+                self, 'exploration_reach_obstacle_cost', 65))
+            passable = ((arr >= 0) & (arr < _obstacle_cost)
+                        & (field >= clearance))
+            pose = self.update_pose()
+            if pose is None:
+                return None
+            start_cell = self._map_cell_index(
+                pose.pose.position.x, pose.pose.position.y)
+            if start_cell is None:
+                return None
+            if not (0 <= start_cell < passable.size):
+                return None
+            if not bool(passable.reshape(-1)[start_cell]):
+                # 起点本身不满足判据：无权判定，交给既有闸门
+                self._p1_safe_log(
+                    'warn',
+                    'P1 reach gate: start_cell=%d NOT passable '
+                    '(map=%dx%d value=%d dist=%.3f) -> fall back to '
+                    'costmap/legacy gate'
+                    % (start_cell, width, height,
+                       int(arr.reshape(-1)[start_cell]),
+                       float(field.reshape(-1)[start_cell])),
+                    once='_reach_log_nostart')
+                return None
+            signature = (width, height, resolution,
+                         int(round(clearance * 1e6)),
+                         hash(passable.tobytes()), start_cell)
+            cached = getattr(self, '_explore_reach_cache', None)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            flat = passable.reshape(-1)
+            cells = set()
+            queue = deque([start_cell])
+            seen = bytearray(flat.size)
+            seen[start_cell] = 1
+            limit = max(1000, int(getattr(
+                self, 'exploration_reach_max_cells', 400000)))
+            while queue:
+                cell = queue.popleft()
+                cells.add(cell)
+                if len(cells) >= limit:
+                    break
+                row, col = divmod(cell, width)
+                for drow, dcol in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nrow, ncol = row + drow, col + dcol
+                    if nrow < 0 or ncol < 0 or nrow >= height or ncol >= width:
+                        continue
+                    ncell = nrow * width + ncol
+                    if seen[ncell]:
+                        continue
+                    seen[ncell] = 1
+                    if flat[ncell]:
+                        queue.append(ncell)
+            self._explore_reach_cache = (signature, cells)
+            # 2026-10-13 P1 诊断（只打一次）。★日志绝不能抛异常★：
+            # 否则会被外层 except 吞成 fail-open，等于诊断代码改变了判据行为。
+            self._p1_safe_log(
+                'info',
+                'P1 reach gate ACTIVE (map-based): map=%dx%d clearance=%.3f '
+                'reachable=%d cells (%.2f m2) start_cell=%d'
+                % (width, height, clearance, len(cells),
+                   len(cells) * resolution * resolution, start_cell),
+                once='_reach_log_ok')
+            return cells
+        except Exception as exc:  # noqa: BLE001 - 判定绝不能阻断探索
+            self._p1_safe_log('warn',
+                              'P1 reach gate ERROR -> fail-open: %r' % (exc,),
+                              once='_reach_log_err')
+            return None
+
+    def _reachable_free_cells(self):
+        """2026-10-12: 探索目标的连通性闸门：机器人所在自由连通域。
+
+        2026-10-13 P1 调整判据优先级：
+          1) exploration_reach_respect_map=True（默认）→ 先用 _reachable_map_cells()
+             （地图障碍距离场；与建图进度一致，不依赖 costmap 新鲜度）
+          2) 否则 / 地图判据无法判定时 → 再用 _reachable_costmap_cells()
+          3) 再不行 → 回退到旧的"地图占用 <50"BFS（value<50，会把未知当自由）
+        返回 None 表示无法判定（调用方必须放行）。
+        """
+        try:
+            if getattr(self, 'exploration_reach_respect_map', True):
+                map_cells = self._reachable_map_cells()
+                if map_cells is not None:
+                    return map_cells
+            # 2026-10-12 N-9：再试 Nav2 costmap 判据。
+            costmap_cells = self._reachable_costmap_cells()
+            if costmap_cells is not None:
+                return costmap_cells
+            if self.last_map is None:
+                return None
+            import numpy as _np
+            data = self.last_map.data
+            info = self.last_map.info
+            width, height = int(info.width), int(info.height)
+            if width <= 0 or height <= 0 or not data:
+                return None
+            pose = self.update_pose()
+            if pose is None:
+                return None
+            start_cell = self._map_cell_index(
+                pose.pose.position.x, pose.pose.position.y)
+            if start_cell is None:
+                return None
+            if not (0 <= start_cell < len(data)):
+                return None
+            if int(data[start_cell]) >= 50:
+                # 起点本身是占用格：无权判定，交给既有闸门
+                return None
+            _arr = _np.asarray(data, dtype=_np.int8)[:width * height]
+            signature = (width, height, hash(_arr.tobytes()),
+                         int(float(info.resolution) * 1e6), start_cell)
+            cached = getattr(self, '_explore_reach_cache', None)
+            if cached is not None and cached[0] == signature:
+                return cached[1]
+            cells = set()
+            queue = deque([start_cell])
+            seen = bytearray(len(data))
+            seen[start_cell] = 1
+            limit = max(1000, int(getattr(
+                self, 'exploration_reach_max_cells', 400000)))
+            while queue:
+                cell = queue.popleft()
+                cells.add(cell)
+                if len(cells) >= limit:
+                    break
+                row, col = divmod(cell, width)
+                for drow, dcol in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nrow, ncol = row + drow, col + dcol
+                    if nrow < 0 or ncol < 0 or nrow >= height or ncol >= width:
+                        continue
+                    ncell = nrow * width + ncol
+                    if seen[ncell]:
+                        continue
+                    seen[ncell] = 1
+                    if int(data[ncell]) < 50:
+                        queue.append(ncell)
+            self._explore_reach_cache = (signature, cells)
+            return cells
+        except Exception:  # noqa: BLE001 - 判定绝不能阻断探索
+            return None
+
+    def _explore_cell_is_reachable(self, x, y):
+        """2026-10-12 N-11：兜底采样用的**布尔**可达性判定（**世界坐标**）。
+
+        True  = 与机器人同属一个可通行连通域（放行）
+        False = 可证明不可达（拒发该候选）
+        None  = 无法判定（放行，交给既有闸门）
+
+        ★ 必须传世界坐标：/map 与 global_costmap 的 origin 不同，格号体系
+        不可互换（`_map_cell_index` 用 /map 的 origin，`_costmap_cell_index`
+        用 costmap 的 origin）。这里统一在世界坐标入参，内部各自换算。
+
+        优先用 Nav2 全局 costmap（cost<253，与规划器同判据），costmap 不可用时
+        回退到地图占用判据 —— 与 `_reachable_free_cells()` 同一套判据，
+        不引入新的语义。
+        """
+        try:
+            if x is None or y is None:
+                return None
+            tx = float(x)
+            ty = float(y)
+            cm = self._costmap_usable()
+            if cm is not None:
+                info = cm.metadata
+                cell = self._costmap_cell_index(info, tx, ty)
+                if cell is None:
+                    return None
+                tv = self._costmap_traversable(cm.data, cell)
+                if tv is None:
+                    return None
+                if tv is False:
+                    return False
+                cells = self._reachable_costmap_cells()
+                if cells is None:
+                    return None
+                return cell in cells
+            if self.last_map is None:
+                return None
+            cell = self._map_cell_index(tx, ty)
+            if cell is None:
+                return None
+            data = self.last_map.data
+            if not (0 <= cell < len(data)):
+                return None
+            if int(data[cell]) >= 50:
+                # 目标格被占：交给既有 R1d/goal_is_traversable 判，不抢判定权
+                return None
+            cells = self._reachable_free_cells()
+            if cells is None:
+                return None
+            return cell in cells
+        except Exception:  # noqa: BLE001 - 判定绝不能阻断探索
+            return None
+
+    def _explore_target_reject_reason(self, pose):
+        """2026-10-12 N-9：返回拒绝理由字符串；None 表示放行。
+
+        与 _explore_target_is_connected 等价，但区分"不同自由域"与"Nav2
+        cost 不可通行"，便于回归核对（costmap 判据下二者都表现为不可达）。
+        """
+        try:
+            if pose is None:
+                return None
+            tx = float(pose.pose.position.x)
+            ty = float(pose.pose.position.y)
+            cm = self._costmap_usable()
+            if cm is not None:
+                info = cm.metadata
+                cell = self._costmap_cell_index(info, tx, ty)
+                if cell is None:
+                    return ('target (%.2f, %.2f) is outside the Nav2 global '
+                            'costmap' % (tx, ty))
+                tv = self._costmap_traversable(cm.data, cell)
+                if tv is False:
+                    return ('target (%.2f, %.2f) is not traversable on the '
+                            'Nav2 global costmap (cost=%d >= %d)'
+                            % (tx, ty, int(cm.data[cell]),
+                               int(self.exploration_costmap_lethal_cost)))
+                if tv is None:
+                    return None
+                cells = self._reachable_costmap_cells()
+                if cells is None:
+                    return None
+                if cell not in cells:
+                    return ('target (%.2f, %.2f) is free on the costmap but '
+                            'unreachable from the robot (no traversable '
+                            'route, i.e. cut off by inflation)' % (tx, ty))
+                return None
+            if self.last_map is None:
+                return None
+            return None if self._explore_target_is_connected(pose) is not False \
+                else ('target (%.2f, %.2f) is in a different free region than '
+                      'the robot' % (tx, ty))
+        except Exception:  # noqa: BLE001 - 判定绝不能阻断探索
+            return None
+
+    def _explore_target_is_connected(self, pose):
+        """2026-10-12: 探索目标的连通性闸门：三态判定目标是否与机器人同属一个自由连通域。
+
+        True  = 同域（放行）
+        False = 可证明不同域（拒发并拉黑）
+        None  = 无法判定（放行，交给既有闸门）
+        """
+        try:
+            if pose is None or self.last_map is None:
+                return None
+            goal_cell = self._map_cell_index(
+                pose.pose.position.x, pose.pose.position.y)
+            if goal_cell is None:
+                return None
+            data = self.last_map.data
+            if not (0 <= goal_cell < len(data)):
+                return None
+            if int(data[goal_cell]) >= 50:
+                # 目标格被占：交给既有 R1d/goal_is_traversable 判，不抢判定权
+                return None
+            cells = self._reachable_free_cells()
+            if cells is None:
+                return None
+            return goal_cell in cells
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _home_route_connectivity(self, pose):
+        """Return (verdict, detail) for current-pose vs home-goal connectivity.
+
+        verdict: True  = same free region (dispatch is reasonable)
+                 False = provably different free regions (goal unreachable)
+                 None  = cannot decide (defer to the existing gates)
+        """
+        detail = {}
+        try:
+            if self.last_map is None:
+                return None, {'reason': 'no /map yet'}
+            data = self.last_map.data
+            info = self.last_map.info
+            width, height = int(info.width), int(info.height)
+            if width <= 0 or height <= 0 or not data:
+                return None, {'reason': 'empty /map'}
+
+            detail.update({
+                'mapOriginX': round(float(info.origin.position.x), 3),
+                'mapOriginY': round(float(info.origin.position.y), 3),
+                'mapResolution': round(float(info.resolution), 6),
+                'mapWidth': width,
+                'mapHeight': height,
+                'loadedMapSignature': getattr(
+                    self, '_loaded_map_signature', None),
+            })
+
+            import numpy as _nph
+            _hm_arr = _nph.asarray(data, dtype=_nph.int8)[:width * height]
+            signature = (width, height, hash(_hm_arr.tobytes()),
+                         int(float(info.resolution) * 1e6))
+            if self._home_route_cache is not None \
+                    and self._home_route_cache[0] == signature:
+                cached = self._home_route_cache[1]
+                detail.update(cached['detail'])
+                return cached['verdict'], detail
+
+            start_cell = self._map_cell_index(
+                pose.pose.position.x, pose.pose.position.y)
+            goal_cell = self._map_cell_index(self.home_x, self.home_y)
+            detail['startIndex'] = start_cell
+            detail['goalIndex'] = goal_cell
+            if start_cell is None or goal_cell is None:
+                self._home_route_cache = (signature, {
+                    'verdict': None,
+                    'detail': dict(detail, reason='start or goal outside /map')})
+                return None, detail
+
+            detail['startValue'] = int(data[start_cell])
+            detail['goalValue'] = int(data[goal_cell])
+
+            def is_free(value):
+                return int(value) < 50
+
+            if not is_free(data[start_cell]) or not is_free(data[goal_cell]):
+                # 起点或终点本身是占用格：交给既有 R1c/R1d 判定，
+                # 这里不抢它的判定权。
+                self._home_route_cache = (signature, {
+                    'verdict': None,
+                    'detail': dict(detail, reason='start or goal is occupied')})
+                return None, detail
+
+            visited = bytearray(len(data))
+            queue = deque([start_cell])
+            visited[start_cell] = 1
+            found = False
+            reachable = 0
+            while queue:
+                cell = queue.popleft()
+                reachable += 1
+                if cell == goal_cell:
+                    found = True
+                    break
+                row, col = divmod(cell, width)
+                for drow, dcol in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nrow, ncol = row + drow, col + dcol
+                    if nrow < 0 or ncol < 0 or nrow >= height or ncol >= width:
+                        continue
+                    ncell = nrow * width + ncol
+                    if visited[ncell]:
+                        continue
+                    visited[ncell] = 1
+                    if is_free(data[ncell]):
+                        queue.append(ncell)
+
+            detail['reachableCells'] = reachable
+            detail['totalCells'] = len(data)
+            self._home_route_cache = (signature, {
+                'verdict': bool(found), 'detail': dict(detail)})
+            return bool(found), detail
+        except Exception as exc:  # noqa: BLE001 - 检查本身绝不能阻断返航
+            import traceback as _tb
+            return None, {'reason': 'check failed: %s | %s'
+                          % (exc, _tb.format_exc().splitlines()[-3:])}
+
+    def _log_home_route_evidence(self, verdict, detail):
+        self.get_logger().warn(
+            'return-home route evidence: sameFreeRegion=%s origin=(%.3f,%.3f) '
+            'res=%.3f size=%sx%s startIndex=%s(%s) goalIndex=%s(%s) '
+            'reachable=%s/%s loadedMapSignature=%s extra=%s'
+            % (verdict,
+               float(detail.get('mapOriginX') or 0.0),
+               float(detail.get('mapOriginY') or 0.0),
+               float(detail.get('mapResolution') or 0.0),
+               detail.get('mapWidth'), detail.get('mapHeight'),
+               detail.get('startIndex'), detail.get('startValue'),
+               detail.get('goalIndex'), detail.get('goalValue'),
+               detail.get('reachableCells'), detail.get('totalCells'),
+               detail.get('loadedMapSignature'),
+               detail.get('reason') or '-'))
+
+    def _nearest_viable_home_pose(self, pose, clearance):
+        """2026-10-09 (operator): the nearest stand point near the origin that passes R1d.
+
+        The return-home target is the map-frame origin, i.e. wherever the robot was when the
+        session started.  If it started within the clearance disc of an obstacle the origin can
+        NEVER satisfy R1d, and no reversal can change that: the occupancy around the origin was
+        recorded at start time (measured 16:06: "less than 0.50 m clearance around (0.00, 0.00)"
+        x4 with "front obstacle too close: 0.39m").  Rather than give up, walk outward ring by
+        ring and take the closest cell that satisfies both halves of R1d.  Returns None when
+        nothing qualifies, in which case the caller keeps the original target.
+        """
+        if self.last_map is None:
+            return None
+        info = self.last_map.info
+        res = info.resolution
+        if res <= 0.0:
+            return None
+        ox, oy = info.origin.position.x, info.origin.position.y
+        cx, cy = pose.pose.position.x, pose.pose.position.y
+        cmx, cmy = int((cx - ox) / res), int((cy - oy) / res)
+        q = pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        max_ring = max(1, int(math.ceil(self.return_home_target_search_m / res)))
+        best = None
+        for ring in range(1, max_ring + 1):
+            for dy in range(-ring, ring + 1):
+                for dx in range(-ring, ring + 1):
+                    if max(abs(dx), abs(dy)) != ring:
+                        continue
+                    mx, my = cmx + dx, cmy + dy
+                    if mx < 0 or my < 0 or mx >= info.width or my >= info.height:
+                        continue
+                    if not self._fallback_cell_has_clearance(mx, my, clearance):
+                        continue
+                    wx = ox + (mx + 0.5) * res
+                    wy = oy + (my + 0.5) * res
+                    if not self._home_rear_is_clear(wx, wy, yaw):
+                        continue
+                    dist = math.hypot(wx - cx, wy - cy)
+                    if best is None or dist < best[0]:
+                        best = (dist, wx, wy)
+            if best is not None:
+                break
+        if best is None:
+            self.get_logger().warn(
+                'return-home: no cell within %.2f m of the origin satisfies the %.2f m '
+                'clearance; keeping the original target'
+                % (self.return_home_target_search_m, clearance))
+            return None
+        dist, wx, wy = best
+        shifted = PoseStamped()
+        shifted.header.frame_id = pose.header.frame_id
+        shifted.header.stamp = pose.header.stamp
+        shifted.pose.position.x = wx
+        shifted.pose.position.y = wy
+        shifted.pose.position.z = pose.pose.position.z
+        shifted.pose.orientation = pose.pose.orientation
+        self.get_logger().warn(
+            'return-home target shifted to the nearest stand point (%.2f, %.2f), %.2f m from '
+            'the origin, to satisfy the %.2f m clearance'
+            % (wx, wy, dist, clearance))
+        return shifted
+
+    def _goal_target_is_viable(self, pose, clearance=None):
         """R1d: target clearance + rear space, applied to every goal source.
+
+        2026-10-09 (operator): optional `clearance` so the return-home path can use its own,
+        smaller disc; exploration keeps self.goal_clearance.
 
         * clearance: the same goal_clearance disc the fallback sampler always used;
         * rear space: the vehicle must have room behind it at the target, otherwise it arrives
@@ -1820,10 +3871,13 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         if mx < 0 or my < 0 or mx >= info.width or my >= info.height:
             self.get_logger().warn('R1d target rejected: (%.2f, %.2f) is outside /map' % (tx, ty))
             return False
-        if not self._fallback_cell_has_clearance(mx, my):
+        if clearance is None:
+            clearance = self.goal_clearance
+        if not self._fallback_cell_has_clearance(mx, my, clearance):
+            self._r1d_last_reject = (float(tx), float(ty), 'clearance')
             self.get_logger().warn(
                 'R1d target rejected: less than %.2f m clearance around (%.2f, %.2f)'
-                % (self.goal_clearance, tx, ty))
+                % (clearance, tx, ty))
             return False
         q = pose.pose.orientation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -1899,7 +3953,27 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         # 2026-09-29: A/B are EXPLORATION-only.  Applied to every source they also
         # moved/rejected the return-home target.  home/manual keep the original path.
         pose = self._safe_call('A pull-back', lambda: self._pull_goal_into_known_free(pose), pose)
-        if not self._safe_call('R1d target viability', lambda: self._goal_target_is_viable(pose), True):
+        # 2026-10-09 (operator): the return-home target is the map ORIGIN, so it must not be held
+        # to the exploration-grade clearance disc -- see _nearest_viable_home_pose for the
+        # measured failure.  Home gets its own threshold and, failing that, the nearest stand
+        # point.  Exploration and manual goals take exactly the path they took before.
+        is_home_goal = bool(getattr(self, 'return_home_requested', False)) or (
+            self._goal_kind_context == 'home')
+        r1d_clearance = (
+            self.return_home_goal_clearance if is_home_goal else self.goal_clearance)
+        if is_home_goal:
+            shifted_home = self._safe_call(
+                'R1d home relocalise',
+                lambda: self._nearest_viable_home_pose(pose, r1d_clearance), None)
+            if shifted_home is not None:
+                pose = shifted_home
+        self._r1d_last_reject = None
+        if not self._safe_call(
+                'R1d target viability',
+                lambda: self._goal_target_is_viable(pose, r1d_clearance), True):
+            # 2026-10-13 P3-1：把拒发结果反馈给采样器（只对探索目标）
+            self._r1d_reject_note(
+                pose, 'home' if is_home_goal else (self._goal_kind_context or 'manual'))
             self.publish_zero_velocity()
             return
         # B (2026-09-29): and validate the approach corridor, because a legal target can
@@ -1940,6 +4014,36 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 f'exploration goal from {kind} ignored while exploration is '
                 'disabled')
             return
+        # 2026-10-12: 探索目标的连通性闸门：与机器人不同自由连通域的探索目标直接拒发。
+        # 实测靶点被隔断时 Nav2 会连续报 no valid path found / exceeded
+        # maximum iterations，直到 50s 硬上限才放弃 —— 这是"已知区域死锁"。
+        # getattr 兜底：ManagerHarness 等测试替身不走真实 __init__，缺该属性
+        # 时按"开启"处理（与生产默认一致）；判定本身另有三态兜底，
+        # 属性缺失不会造成误拒。
+        _require_conn = bool(getattr(
+            self, 'exploration_require_connected_route', True))
+        if _require_conn and self._is_exploration_goal(kind):
+            _reason = self._safe_call(
+                'explore connectivity',
+                lambda: self._explore_target_reject_reason(pose), None)
+            if _reason:
+                # 拉黑该目标，使采样器下一拍换点而不是反复选同一死角
+                try:
+                    self.failed_goals.append((
+                        float(pose.pose.position.x),
+                        float(pose.pose.position.y),
+                        time.monotonic()))
+                except Exception:  # noqa: BLE001
+                    pass
+                self.publish_zero_velocity()
+                self.get_logger().warn(
+                    'exploration goal rejected: target (%.2f, %.2f) is '
+                    'unreachable; blacklisting and re-selecting: %s'
+                    % (pose.pose.position.x, pose.pose.position.y,
+                       _reason))
+                # 2026-10-13 P21（丙）：连通域"不可达"也计入方向解锁
+                self._note_unreachable_rejection('reach')
+                return
         if self.base_charging:
             self.pause_for_charging()
             return
@@ -1993,6 +4097,99 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             self.get_logger().info(
                 'navigation goal is current pose; marking as arrived')
             return
+        # 2026-10-13 P9-D：过滤"极近目标"，并埋点记录其来源。
+        # 极近目标会让 nav2_rotation_shim_controller 先原地旋转对准；走完 0.3m
+        # 后立刻再派一个极近目标 → 实测车原地旋转 60+ 秒（stall_hold 36.3s）。
+        # 只对探索目标生效；返航/手动不受影响。被拒目标不写失败记忆
+        # （它是"太近"而不是"去不了"），由候选队列顺序换下一个候选。
+        if (kind != 'home'
+                and self._is_exploration_goal(kind)
+                and getattr(self, 'exploration_min_goal_distance_m', 0.0) > 0.0):
+            _cur = self.update_pose()
+            if _cur is not None:
+                _dmin = float(self.exploration_min_goal_distance_m)
+                # ★入参 `pose` 是 PoseStamped（见 send_nav_goal 签名），
+                # 取位置必须走 pose.pose.position。2026-10-13 修：原写法用
+                # goal.pose.position，而 goal 是后面才构造的 NavigateToPose.Goal，
+                # 此处不存在 → AttributeError: 'PoseStamped' object has no
+                # attribute 'position' → 冒泡到 _auto_explore_callback → 车不动。
+                _d = math.hypot(
+                    pose.pose.position.x - _cur.pose.position.x,
+                    pose.pose.position.y - _cur.pose.position.y)
+                if _d < _dmin:
+                    # 来源埋点：kind / 调用栈 / A 方案上下文，用于定位谁派了极近点
+                    _who = 'unknown'
+                    try:
+                        import inspect as _ins
+                        _fr = _ins.stack()
+                        _callers = [f.function for f in _fr[1:7]]
+                        _who = '<-'.join(_callers)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._p1_safe_log(
+                        'warn',
+                        'exploration goal rejected: target (%.2f, %.2f) is only '
+                        '%.2fm from the robot (< %.2fm minimum); kind=%s '
+                        'prevalidate_phase=%s window=%s caller=%s'
+                        % (pose.pose.position.x, pose.pose.position.y, _d,
+                           _dmin, kind,
+                           getattr(self, '_prevalidate_phase', 'n/a'),
+                           getattr(self, '_fallback_window', 'n/a'),
+                           _who))
+                    self.publish_zero_velocity()
+                    return
+
+        # 2026-10-13 P21：探索目标的"转角门禁"。
+        # 未解锁（_explore_direction_flip=False）时只放行 |turn| <= 上限的目标；
+        # 连续"确定不可达"拒发达 exploration_direction_flip_after(2) 次即解锁。
+        # 防死锁宽限：拦截累计超过 grace_count 时自动解锁并放行（否则车头朝向
+        # 不对会导致"所有候选都被拦 → 车不动 → 朝向不变 → 永远不解锁"）。
+        # ★兜底方向：按 max_turn_deg 是否为正值判定是否启用（与 P9-D 的
+        #   getattr(self, 'exploration_min_goal_distance_m', 0.0) > 0.0 同模式）。
+        #   属性缺失（测试替身不走 __init__）即视为不启用，避免误拦。
+        _turn_limit_deg = float(getattr(
+            self, 'exploration_dispatch_max_turn_deg', 0.0))
+        if (kind != 'home'
+                and self._is_exploration_goal(kind)
+                and _turn_limit_deg > 0.0
+                and bool(getattr(
+                    self, 'exploration_dispatch_max_turn_enabled', True))
+                and not getattr(self, '_explore_direction_flip', False)):
+            _limit = math.radians(abs(_turn_limit_deg))
+            _turn = self._goal_turn_from_current(pose)
+            if _turn is not None and _turn > _limit:
+                _grace = int(getattr(
+                    self, 'exploration_dispatch_max_turn_grace_count', 3))
+                self._turn_blocked_count = int(
+                    getattr(self, '_turn_blocked_count', 0)) + 1
+                if _grace > 0 and self._turn_blocked_count > _grace:
+                    self._unlock_direction('turn_grace',
+                                           self._turn_blocked_count)
+                    self._p1_safe_log(
+                        'warn',
+                        'exploration turn gate: grace exhausted (%d blocks '
+                        '> %d) -> direction unlocked, dispatching target '
+                        '(%.2f, %.2f) with a %.0fdeg turn'
+                        % (self._turn_blocked_count, _grace,
+                           pose.pose.position.x, pose.pose.position.y,
+                           math.degrees(_turn)))
+                else:
+                    self._p1_safe_log(
+                        'warn',
+                        'exploration goal rejected: target (%.2f, %.2f) needs '
+                        'a %.0fdeg turn (> %.0fdeg limit while the direction is '
+                        'locked; turn-blocks %d/%d; unreachable streak r1d=%d '
+                        'planner=%d reach=%d of %d)'
+                        % (pose.pose.position.x, pose.pose.position.y,
+                           math.degrees(_turn), math.degrees(_limit),
+                           self._turn_blocked_count, _grace,
+                           int(getattr(self, '_r1d_consecutive', 0)),
+                           int(getattr(self, '_planner_consecutive', 0)),
+                           int(getattr(self, '_reach_consecutive', 0)),
+                           int(getattr(
+                               self, 'exploration_direction_flip_after', 2))))
+                    self.publish_zero_velocity()
+                    return
 
         if validate_map:
             traversable, reason = self.goal_is_traversable(
@@ -2041,11 +4238,84 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             return
 
         self.goal_send_future = future
-        self.get_logger().info(
-            f'navigation goal dispatched: source={kind}, '
-            f'target=({pose.pose.position.x:.2f}, '
-            f'{pose.pose.position.y:.2f}), '
-            f'bt={goal.behavior_tree or "default"}')
+        # 2026-10-10 (operator): 探索目标的 yaw 改为"保持当前朝向"。
+        # 原实现把 yaw 设为"指向目标"的方位角，对 DUBIN（前向-only）是最难的
+        # 约束：到达该位置时还必须朝向该方位，需要绕出再折回，实测导致
+        # 连续 'exceeded maximum iterations'。只在探索目标上生效，
+        # 返航/手动目标不受影响。
+        if self._is_exploration_goal(kind):
+            _cur = self.update_pose()
+            if _cur is not None:
+                _old_yaw = math.atan2(
+                    2.0 * (pose.pose.orientation.w * pose.pose.orientation.z),
+                    1.0 - 2.0 * (pose.pose.orientation.z ** 2))
+                _new_yaw = None
+                _tag = None
+                if self.goal_yaw_mode == 'tangent':
+                    _new_yaw = self.pose_yaw(_cur)
+                    _tag = 'tangent (dispatch-time heading)'
+                elif self.goal_yaw_mode == 'approach':
+                    _dx = (pose.pose.position.x
+                           - _cur.pose.position.x)
+                    _dy = (pose.pose.position.y
+                           - _cur.pose.position.y)
+                    if math.hypot(_dx, _dy) > 1e-6:
+                        _new_yaw = math.atan2(_dy, _dx)
+                        _tag = 'approach (arrival heading)'
+                # 'keep' 或退化情形（目标与当前位置重合）：不改写
+                if _new_yaw is not None:
+                    pose.pose.orientation.z = math.sin(_new_yaw * 0.5)
+                    pose.pose.orientation.w = math.cos(_new_yaw * 0.5)
+                    self.get_logger().info(
+                        'goal yaw rewritten to %s: %.0fdeg -> %.0fdeg'
+                        % (_tag, math.degrees(_old_yaw),
+                           math.degrees(_new_yaw)))
+
+        # 2026-10-10: 记录派发那一刻的机器人位姿与朝向差。"小区域内兜转"最直接
+        # 的证据就是同一台车被反复派往相反方位；此前日志只记 target 坐标，
+        # 看不出机器人当时在哪、要往哪个方向去。
+        _robot = getattr(self, 'last_pose', None)
+        _bearing = None      # 2026-10-10: 供下方落盘方向持续基准
+        if _robot is not None:
+            _rx = _robot.pose.position.x
+            _ry = _robot.pose.position.y
+            _tx = pose.pose.position.x
+            _ty = pose.pose.position.y
+            _q = _robot.pose.orientation
+            _yaw = math.atan2(2.0 * (_q.w * _q.z + _q.x * _q.y),
+                              1.0 - 2.0 * (_q.y * _q.y + _q.z * _q.z))
+            _bearing = math.atan2(_ty - _ry, _tx - _rx)
+            _delta = abs(math.atan2(math.sin(_bearing - _yaw),
+                                    math.cos(_bearing - _yaw)))
+            self.get_logger().info(
+                'navigation goal dispatched: source=%s, '
+                'target=(%.2f, %.2f), robot=(%.2f, %.2f, yaw=%.0fdeg), '
+                'dist=%.2fm, turn=%.0fdeg, bt=%s'
+                % (kind, _tx, _ty, _rx, _ry, math.degrees(_yaw),
+                   math.hypot(_tx - _rx, _ty - _ry),
+                   math.degrees(_delta),
+                   goal.behavior_tree or 'default'))
+        else:
+            self.get_logger().info(
+                f'navigation goal dispatched: source={kind}, '
+                f'target=({pose.pose.position.x:.2f}, '
+                f'{pose.pose.position.y:.2f}), robot=unknown, '
+                f'bt={goal.behavior_tree or "default"}')
+        # 2026-10-10: 每次派发探索目标时更新方向持续基准。
+        # 原实现只在 STATUS_SUCCEEDED 分支更新（manager.py:915），目标被频繁
+        # 取消时该值长期过期，使方向持续机制在低成功率下失效——实测 turn 序列
+        # 前 7 个 108-175 度，后 3 个连续到达后降到 0-30 度。
+        # 只对探索目标更新，不改返航/手动目标的语义。
+        #
+        # 2026-10-12: 方向持续基准对所有探索目标生效。
+        # 原条件写死 'exploration_manager'，而 RRT 目标的 kind 是
+        # 'exploration_rrt'（frontier_goal_callback → _run_with_goal_kind），
+        # 于是方向基准在 RRT 派发后**完全不更新**：机器人已被 RRT 转到新朝向，
+        # 基准却停留在上一次 fallback 的方位，下一次 fallback 选点必然大掉头。
+        # 实测 8 目标序列里 出发大转(>120°) 3/7 次、走完朝向翻转(>90°) 2/7 次，
+        # 其中『出发 -162° 去 -15° 方位』的 147° 掉头即由此产生。
+        if self._is_exploration_goal(kind) and _bearing is not None:
+            self.last_explore_heading = _bearing
         # The future may already be complete; kind/timing state is deliberately
         # installed before registering this callback.
         future.add_done_callback(self.goal_response_callback)
@@ -2273,7 +4543,38 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         self._pose_stall_generation = None
         self._pose_stall_anchor_x = None
         self._pose_stall_anchor_y = None
+        self._pose_stall_anchor_yaw = None
         self._pose_stall_anchor_at = 0.0
+
+    def _pose_stall_anchor_yaw_value(self):
+        """2026-10-12: 朝向锚点。
+
+        用 getattr 读取，使「不调用真实 __init__ 的最小替身」也能工作
+        （既有单测 ManagerHarness 就是这种替身）。
+        """
+        return getattr(self, '_pose_stall_anchor_yaw', None)
+
+    def _stall_yaw_threshold(self):
+        """2026-10-12: 判定「在转动」所需的朝向变化（弧度）。
+
+        默认 0.15 rad 与 declare_parameter 的默认值一致；
+        用 getattr 读取以兼容最小测试替身。
+        """
+        return float(getattr(self, 'exploration_pose_stall_yaw_rad', 0.15))
+
+    def _reset_pose_stall_anchor_locked(self, now, x, y, yaw):
+        """2026-10-12: 重置停滞锚点（位置 + 朝向 + 时间）。
+
+        位置与朝向**同时**重置：判据要求二者都"没动"才算停滞，
+        所以任何一项发生变化都意味着机器人在动。
+        """
+        self._pose_stall_anchor_x = x
+        self._pose_stall_anchor_y = y
+        # 2026-10-12 N-10a：yaw 为 None 时**保留原锚点朝向**，不要覆盖成 None ——
+        # 否则一次取不到朝向就会让后续所有轮次的朝向判据永久失效。
+        if yaw is not None:
+            self._pose_stall_anchor_yaw = yaw
+        self._pose_stall_anchor_at = now
 
     def _clear_feedback_tracking_locked(self, clear_generation=False):
         if clear_generation:
@@ -2304,6 +4605,10 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
 
             if self._is_exploration_goal(kind):
                 self.exploration_watchdog.reset(now)
+                # 2026-10-14 D3/D8/D12：新目标从当前位置重新立锚点。
+                self._progress_path_anchor = None
+                self._no_net_anchor = None
+                self._no_net_cooldown_until = 0.0
                 self._feedback_baseline_generation = goal_generation
                 self._feedback_baseline_deadline = (
                     now + self.feedback_baseline_settle_sec)
@@ -2478,6 +4783,111 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 return self._latest_feedback_distance
         return self._geometric_distance_to_active_goal(pose)
 
+    def _reset_progress_path_anchor(self, pose):
+        """D3：把净推进锚点移到当前位姿。"""
+        if pose is None:
+            return
+        try:
+            self._progress_path_anchor = (
+                float(pose.pose.position.x),
+                float(pose.pose.position.y),
+                float(self._geometric_distance_to_active_goal(pose)),
+            )
+        except Exception:  # noqa: BLE001 - 锚点绝不能阻断跟踪
+            self._progress_path_anchor = None
+
+    def _path_aware_progress_distance(self, distance, pose):
+        """D3/D7：把"到目标的瞬时距离"折算成"自锚点以来的净推进量"。
+
+        为什么需要它（2026-10-14 探针实测 probe31-1014-133517）：
+          feedback 给的是"当前到目标还有多远"。车一旦开始原地绕圈，
+          这个值每拍都在变，而 ExplorationProgressWatchdog 只看"相对上次
+          最好值是否改善了 min_progress_m"——于是"距离在变"被当成"在前进"，
+          stagnant 永远涨不到 no_progress_timeout_sec，18s 看门狗与 7s 姿态
+          停滞两级软判据全部沉默，唯一兜底只剩 50s 硬上限。
+          实测该轮：弧长 6.92 m / 转角 40 rad（≈6.4 圈）却在原地，
+          watchdog trace 里 stagnant 恒为 0.0。
+
+        语义（D7 修正，d3-test 抓出）：
+          · 车与锚点的距离 < exploration_progress_anchor_m 时，锚点不动，
+            返回 max(0, 锚点处距离 - 当前距离)；
+          · 车移动超过阈值时，只把锚点前移到当前位置，**本身不产生进展**
+            （返回 0.0）。
+          于是：原地绕圈 ⇒ 恒为 0 ⇒ 判停滞；直行推进 ⇒ 每拍返回真实缩短量。
+
+        取不到位姿或拿不到锚点时回退为原始距离（fail-open，绝不误杀）。
+        """
+        if not getattr(self, 'exploration_progress_path_aware', False):
+            return distance
+        if pose is None or distance is None:
+            return distance
+        try:
+            anchor = self._progress_path_anchor
+            cx = float(pose.pose.position.x)
+            cy = float(pose.pose.position.y)
+            if anchor is None:
+                # 第一次观测：在当前位姿立锚点，本拍无进展。
+                self._reset_progress_path_anchor(pose)
+                return 0.0
+            ax, ay, a_dist = anchor
+            if (math.hypot(cx - ax, cy - ay)
+                    >= self.exploration_progress_anchor_m):
+                # 车真的移动了：锚点前移，本拍不产生进展。
+                self._reset_progress_path_anchor(pose)
+                return 0.0
+            return max(0.0, float(a_dist) - float(distance))
+        except Exception:  # noqa: BLE001 - 进展判据绝不能把自己搞崩
+            return distance
+
+    def _no_net_progress_timed_out(self, now, distance, pose):
+        """D8：车"一直在动、却始终没有靠近过目标"时判停滞。
+
+        与 ExplorationProgressWatchdog 的分工：
+          · 看门狗管"到目标的距离有没有改善"——对绕圈太钝（距离一直在变）；
+          · 本判据管"位姿在动、但目标距离没有净改善"，正是原地绕圈的形态。
+        锚点规则：每次真实进展（改善 >= min_progress_m）把锚点重置到当前位姿，
+        因此只有"持续动却没有进展"才会累积，正常推进与真静止都不受影响。
+        """
+        if not getattr(self, 'exploration_progress_no_net_timeout', False):
+            return False
+        if pose is None or distance is None:
+            return False
+        try:
+            cx = float(pose.pose.position.x)
+            cy = float(pose.pose.position.y)
+            d = float(distance)
+            min_progress = float(self.exploration_watchdog.min_progress_m)
+            if now < getattr(self, '_no_net_cooldown_until', 0.0):
+                # D12：刚触发过，冷却期内不重复告警，但计时从当前位姿重起，
+                # 以便冷却结束后能立刻给出第二次观察。
+                self._no_net_anchor = (float(now), cx, cy, d, 0.0)
+                return False
+            anchor = self._no_net_anchor
+            if anchor is None:
+                self._no_net_anchor = (float(now), cx, cy, d, 0.0)
+                return False
+            a_at, ax, ay, a_dist, travel = anchor
+            travel += math.hypot(cx - ax, cy - ay)
+            if a_dist - d >= min_progress:
+                # 真的靠近了：锚点重置，计时与位移清零。
+                self._no_net_anchor = (float(now), cx, cy, d, 0.0)
+                return False
+            self._no_net_anchor = (a_at, cx, cy, a_dist, travel)
+            window = float(self.exploration_watchdog.no_progress_timeout_sec)
+            if (now - a_at) >= window and travel >= self.exploration_no_net_min_travel_m:
+                self.get_logger().warn(
+                    'no net progress for %.1fs while moving %.2fm '
+                    '(remaining=%.2fm) -> treating the goal as stalled'
+                    % (now - a_at, travel, d))
+                # D12：不置空锚点，改为短冷却再武装（见参数说明）。
+                self._no_net_cooldown_until = (
+                    float(now) + float(getattr(self, 'exploration_no_net_rearm_sec', 3.0)))
+                self._no_net_anchor = (float(now), cx, cy, d, 0.0)
+                return True
+            return False
+        except Exception:  # noqa: BLE001 - 判据绝不能把自己搞崩
+            return False
+
     def _observe_exploration_progress(self, now, pose=None):
         with self._feedback_state_lock:
             if (not self.nav_goal_active
@@ -2489,8 +4899,15 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 self._feedback_baseline_locked = True
             if self._distance_source == 'feedback':
                 distance = self._latest_feedback_distance
+                # 2026-10-14 D3：改用净推进量送进看门狗（见
+                # _path_aware_progress_distance 的说明）。
+                distance = self._path_aware_progress_distance(distance, pose)
                 decision = self.exploration_watchdog.observe(
                     now, distance, self._latest_recovery_count)
+                # 2026-10-14 D8：独立判据——"一直在动却没靠近过目标"。
+                if (decision in (None, 'tracking')
+                        and self._no_net_progress_timed_out(now, distance, pose)):
+                    decision = 'stalled'
                 if decision in ('progress', 'recovery_started'):
                     self._feedback_baseline_locked = True
                 return distance, decision
@@ -2510,8 +4927,14 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             if (not self._feedback_baseline_locked
                     and now >= self._feedback_baseline_deadline):
                 self._feedback_baseline_locked = True
+            # 2026-10-14 D3：同上，净推进口径。
+            distance = self._path_aware_progress_distance(distance, pose)
             decision = self.exploration_watchdog.observe(
                 now, distance, self._latest_recovery_count)
+            # 2026-10-14 D8：同上。
+            if (decision in (None, 'tracking')
+                    and self._no_net_progress_timed_out(now, distance, pose)):
+                decision = 'stalled'
             if decision in ('progress', 'recovery_started'):
                 self._feedback_baseline_locked = True
             return distance, decision
@@ -2522,12 +4945,22 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 return 0.0
             return max(0.0, now - self._pose_stall_anchor_at)
 
+    def _pose_stall_yaw_delta(self, yaw):
+        """2026-10-12: 当前朝向与停滞锚点的夹角（仅用于诊断打印）。"""
+        with self._feedback_state_lock:
+            anchor = self._pose_stall_anchor_yaw_value()
+        if anchor is None or yaw is None:
+            return None
+        return abs(math.atan2(math.sin(yaw - anchor),
+                              math.cos(yaw - anchor)))
+
     def _exploration_pose_is_stalled(self, now, distance, pose):
         """Detect a goal that remains inside a small translational bubble."""
         if pose is None:
             return False
         x = pose.pose.position.x
         y = pose.pose.position.y
+        yaw = self.pose_yaw(pose)
 
         with self._feedback_state_lock:
             if (not self.nav_goal_active
@@ -2537,9 +4970,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             generation = self._active_goal_generation
             if self._pose_stall_generation != generation:
                 self._pose_stall_generation = generation
-                self._pose_stall_anchor_x = x
-                self._pose_stall_anchor_y = y
-                self._pose_stall_anchor_at = now
+                self._reset_pose_stall_anchor_locked(now, x, y, yaw)
                 return False
 
             if (distance is not None
@@ -2547,17 +4978,13 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                     <= self.exploration_pose_stall_goal_tolerance_m):
                 # Do not abandon a goal that is already inside its terminal
                 # neighborhood merely because the goal checker is settling.
-                self._pose_stall_anchor_x = x
-                self._pose_stall_anchor_y = y
-                self._pose_stall_anchor_at = now
+                self._reset_pose_stall_anchor_locked(now, x, y, yaw)
                 return False
 
             if (self._pose_stall_anchor_x is None
                     or self._pose_stall_anchor_y is None
                     or self._pose_stall_anchor_at <= 0.0):
-                self._pose_stall_anchor_x = x
-                self._pose_stall_anchor_y = y
-                self._pose_stall_anchor_at = now
+                self._reset_pose_stall_anchor_locked(now, x, y, yaw)
                 return False
 
             displacement = math.hypot(
@@ -2565,9 +4992,34 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 y - self._pose_stall_anchor_y,
             )
             if displacement > self.exploration_pose_stall_radius_m:
-                self._pose_stall_anchor_x = x
-                self._pose_stall_anchor_y = y
-                self._pose_stall_anchor_at = now
+                self._reset_pose_stall_anchor_locked(now, x, y, yaw)
+                return False
+
+            # 2026-10-12: 朝向变化同样是"在动"的证据。
+            # 实测 Nav2 会按控制器指令长期原地纯旋转（|wz| 0.61~1.01 rad/s，
+            # 位移恒为 0），原判据把它整段算作"停滞"，7s 后误取消目标。
+            # 注意：**不设"累计旋转上限"** —— 正常调头可达数弧度，
+            # 设上限会重新引入同类误判。真正卡死（连转都不转）由
+            # 18s 看门狗与 50s 单目标硬上限兜底。
+            anchor_yaw = self._pose_stall_anchor_yaw_value()
+            if anchor_yaw is None:
+                # 2026-10-12 N-10a：朝向锚点缺失。实测此时机器人可能正在原地
+                # 旋转（cmd_vel.z=-0.476、yaw_delta=none、front_blocked=False），
+                # 而原实现在这种情况下**整段跳过**朝向判据，直接落到
+                # "超时即停滞"，7s 后就取消目标并黑名单，形成
+                # "取消 -> 自转恢复(失败) -> 换目标"的循环。
+                # 无法证明它是停着的，就按"在动"处理并补上锚点：
+                # 最坏只是把一次真实停滞延后到 18s 看门狗 / 50s 硬上限兜底。
+                if yaw is not None:
+                    self._reset_pose_stall_anchor_locked(now, x, y, yaw)
+                else:
+                    self._pose_stall_anchor_at = now
+                return False
+            yaw_delta = abs(
+                math.atan2(math.sin(yaw - anchor_yaw),
+                           math.cos(yaw - anchor_yaw)))
+            if yaw_delta > self._stall_yaw_threshold():
+                self._reset_pose_stall_anchor_locked(now, x, y, yaw)
                 return False
 
             return (
@@ -2681,6 +5133,21 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 or not self.nav_goal_active):
             return
         if self.is_recovering():
+            # 2026-10-12: 恢复动作本身要耗时（Nav2 BT 的 Spin + Wait 约 6~7s，
+            # 与 7s 判据几乎重合），且多为纯旋转（位移为 0）。
+            # 原实现只 return、**不重置锚点** —— 于是恢复一结束，
+            # 计时器恰好到期，立刻被判"停滞"并取消目标（问题三根因）。
+            # 这里把锚点推到"现在"，让恢复期间不计入停滞。
+            recovering_pose = self.update_pose()
+            if recovering_pose is not None:
+                with self._feedback_state_lock:
+                    if (self._pose_stall_generation
+                            == self._active_goal_generation):
+                        self._reset_pose_stall_anchor_locked(
+                            now,
+                            recovering_pose.pose.position.x,
+                            recovering_pose.pose.position.y,
+                            self.pose_yaw(recovering_pose))
             return
 
         pose = self.update_pose()
@@ -2688,6 +5155,36 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         if self._exploration_pose_is_stalled(now, distance_hint, pose):
             self._log_exploration_progress(
                 now, 'pose_stalled_switching_goal', distance_hint)
+            # 2026-10-10 诊断：判定"7s 静止"到底由什么造成 ——
+            # 前方闸门切断运动？Nav2 正在恢复？还是真的卡死？
+            self.get_logger().warn(
+                'pose_stalled ctx: pose=(%.2f, %.2f) remaining=%.2fm '
+                'front=%.3f center=%.3f wide=%.3f left=%s right=%s '
+                'front_blocked=%s recovery_active=%s recovery_turn_dir=%.1f '
+                'recovery_clear_count=%d nav_state=%s mode=%s '
+                'watchdog[elapsed=%.1fs stagnant=%.1fs best=%s recov=%d] '
+                'cmd_vel=(%.3f, %.3f) pose_stall[yaw_delta=%s yaw_rad=%.2f]'
+                % (pose.pose.position.x, pose.pose.position.y,
+                   float(distance_hint) if distance_hint is not None else -1.0,
+                   self._as_float(self.front_min_range),
+                   self._as_float(self.front_center_min_range),
+                   self._as_float(self.front_wide_min_range),
+                   self._fmt_opt(self.left_min_range),
+                   self._fmt_opt(self.right_min_range),
+                   bool(self.front_blocked),
+                   bool(self.is_recovering()),
+                   float(getattr(self, 'recovery_turn_direction', 0.0) or 0.0),
+                   int(getattr(self, 'recovery_clear_count', 0) or 0),
+                   self.navigation_state or 'n/a', self.mode or 'n/a',
+                   self.exploration_watchdog.elapsed(now),
+                   self.exploration_watchdog.stagnant_for(now),
+                   self._fmt_opt(self.exploration_watchdog.best_distance),
+                   int(self.exploration_watchdog.recovery_count or 0),
+                   self._as_float(self.last_cmd_vel.linear.x),
+                   self._as_float(self.last_cmd_vel.angular.z),
+                   self._fmt_opt(self._pose_stall_yaw_delta(
+                       self.pose_yaw(pose))),
+                   self._stall_yaw_threshold()))
             self._stall_confirmation_started_at = None
             self._trigger_stalled_exploration_recovery(
                 'exploration goal stayed within '
@@ -2700,6 +5197,25 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
 
         self._rebase_watchdog_from_commanded_pose_progress(now, pose)
         distance, decision = self._observe_exploration_progress(now, pose)
+        # 2026-10-10 诊断：实测 hard_timeout(50s) 触发 89 次而 stalled(18s
+        # 无净改善) 触发 0 次，形态异常。此 1 Hz trace 打印看门狗的全部
+        # 输入量，用于判定是"确实一直在改善"还是"看门狗被反复重置"。
+        if now - getattr(self, '_watchdog_trace_at', 0.0) >= 1.0:
+            self._watchdog_trace_at = now
+            wd = self.exploration_watchdog
+            if wd.active:
+                self.get_logger().info(
+                    'watchdog trace: elapsed=%.1f/%.1f stagnant=%.1f/%.1f '
+                    'best=%s now_dist=%s decision=%s recov=%d '
+                    'confirmation=%s'
+                    % (wd.elapsed(now), wd.hard_timeout_sec,
+                       wd.stagnant_for(now), wd.no_progress_timeout_sec,
+                       self._fmt_opt(wd.best_distance),
+                       self._fmt_opt(distance),
+                       decision or 'none',
+                       int(getattr(wd, 'recovery_count', 0) or 0),
+                       ('pending' if self._stall_confirmation_started_at
+                        else 'no')))
         if decision is None:
             return
         self._log_exploration_progress(now, decision, distance)
@@ -2741,6 +5257,23 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 f'{self.exploration_watchdog.no_progress_timeout_sec:.0f}s')
         self._stall_confirmation_started_at = None
         self._trigger_stalled_exploration_recovery(reason, distance)
+
+    @staticmethod
+    def _as_float(value, default=0.0):
+        """2026-10-10 诊断辅助：None / 非数安全转换（纯读取）。"""
+        try:
+            if value is None:
+                return float(default)
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @classmethod
+    def _fmt_opt(cls, value):
+        """诊断辅助：None 打印为 'none'，否则保留 3 位小数。"""
+        if value is None:
+            return 'none'
+        return '%.3f' % cls._as_float(value)
 
     def _reset_stall_cancel_tracking(self):
         future = getattr(self, '_cancel_response_future', None)
@@ -4095,8 +6628,14 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
         else:
             current_x = None
             current_y = None
+        # 2026-10-13 P27（方案A）：本路径原先**完全没有**转角项，
+        # 而实测那个 turn=99° 的点正来自这里。下面把它折算进
+        # target_distance，使小转角候选自然排到前面。
+        _turn_active = self._turn_penalty_on() and self._turn_penalty_weight() > 0.0
 
         candidates = []
+        # P31：本函数内读一次（不是每个格读），热调自下一拍生效。
+        _free_cost = self._sampler_free_cost()
         min_x = max(0, target_mx - radius_cells)
         max_x = min(info.width - 1, target_mx + radius_cells)
         min_y = max(0, target_my - radius_cells)
@@ -4109,7 +6648,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 if target_distance > self.rrt_projection_radius_m:
                     continue
                 value = self.last_map.data[my * info.width + mx]
-                if value < 0 or value >= 30:
+                if value < 0 or value >= _free_cost:
                     continue
                 unknown_neighbors = 0
                 for dy in range(-2, 3):
@@ -4121,8 +6660,11 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                                 and self.last_map.data[
                                     ny * info.width + nx] < 0):
                             unknown_neighbors += 1
+                _rank_distance = target_distance
+                if _turn_active:
+                    _rank_distance += self._turn_penalty_m(current, x, y)
                 candidates.append((
-                    target_distance,
+                    _rank_distance,
                     -unknown_neighbors,
                     x,
                     y,
@@ -4144,7 +6686,7 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
                 reject['bounds'] += 1
                 return False
             value = self.last_map.data[my * info.width + mx]
-            if value < 0 or value >= 30:
+            if value < 0 or value >= _free_cost:
                 reject['unknown_or_cost'] += 1
                 return False
             if self.goal_recently_failed(x, y):
@@ -4191,7 +6733,14 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
 
         # 兜底：保留原有“圆内最近已知空闲格”搜索，不降低修复前的既有能力。
         if selected is None:
-            for _distance, _unknown_score, x, y, mx, my in candidates:
+            # 2026-10-14 P46-C：只对排序后的前 N 个候选逐个投影。
+            # 实测单轮 total=999 全部逐个投影，耗时足以饿死同 executor 上的
+            # lifecycle 回调（见 P46-B 的现场），进而把车停成 228s。
+            # candidates 已按 (rank_distance, -unknown_neighbors) 排序，
+            # 取前 N 个不损失候选质量。置 0 或负数表示不限制（回到旧行为）。
+            _limit = int(getattr(self, 'rrt_projection_max_candidates', 200))
+            _pool = candidates if _limit <= 0 else candidates[:_limit]
+            for _distance, _unknown_score, x, y, mx, my in _pool:
                 if acceptable(mx, my, x, y):
                     selected = (x, y)
                     break
@@ -4609,6 +7158,8 @@ class StemmCartographerNav2Manager(StemmNav2Manager):
             'returnHomeRequested': bool(self.return_home_requested),
             'finalMapSaved': bool(self._final_map_saved),
             'finalMapSavedAt': self._final_map_saved_at,
+            'finalMapSavedFallback': bool(
+                getattr(self, '_final_map_saved_fallback', False)),
             'finalMapSaveError': self._final_map_save_error,
             'positionErrorMeters': position_error_m,
             'pose': self.pose_to_dict(pose),
@@ -4635,12 +7186,48 @@ def main(args=None):
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except Exception as exc:               # 2026-10-09 (operator): rclpy shutdown race
+        # The operator-cancel path (_maybe_request_mapping_cancel_shutdown ->
+        # request_launch_shutdown) tears the rclpy context down while the executor is BETWEEN
+        # iterations, so the next wait set cannot be built.  Measured 2026-10-09 16:06:59, 16 s
+        # after 'return-home failed ... keeping launch alive for manual takeover':
+        #   RCLError: failed to initialize wait set: the given context is not valid ...
+        # That exception is not covered by the clause above, so the process died with exit 1,
+        # which (a) voided the manual-takeover promise, (b) made the session runner mark the
+        # session terminal and trigger a whole-device restart, and (c) skipped the final
+        # publish_zero_velocity() because rclpy.ok() was already False.  Whether the SIGINT lands
+        # inside rcl_wait (clean) or between iterations (this) is a race: 8 of the 9 recorded
+        # nav2_manager deaths were clean -2; this one was the first 1.
+        # Swallow ONLY this signature -- anything else must still propagate.
+        if 'wait set' in str(exc) and 'not valid' in str(exc):
+            print('shutdown race: rclpy context was torn down mid-spin; exiting cleanly '
+                  'instead of dying with exit 1 (%s)' % exc, flush=True)
+        else:
+            raise
     finally:
-        if rclpy.ok():
-            node.publish_zero_velocity()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        # 2026-10-13: teardown must not turn a successful session into exit 1.
+        # rclpy.ok() only covers the global context; node/publisher-level
+        # contexts can already be invalid, and destroy_node()/shutdown() have
+        # their own races (see the 2026-10-09 'wait set not valid' note above).
+        # Measured 2026-10-13 17:32: a real return-home (0.243 m) was reported
+        # as a failed session purely because of this race.
+        try:
+            if rclpy.ok():
+                node.publish_zero_velocity()
+        except Exception as exc:  # noqa: BLE001 - teardown race
+            print('shutdown race: zero-velocity publish failed during '
+                  'teardown; ignoring (%s)' % exc, flush=True)
+        try:
+            node.destroy_node()
+        except Exception as exc:  # noqa: BLE001 - teardown race
+            print('shutdown race: destroy_node failed during teardown; '
+                  'ignoring (%s)' % exc, flush=True)
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception as exc:  # noqa: BLE001 - teardown race
+            print('shutdown race: rclpy.shutdown failed during teardown; '
+                  'ignoring (%s)' % exc, flush=True)
 
 
 if __name__ == '__main__':

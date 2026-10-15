@@ -33,7 +33,14 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <Spin spin_dist="1.57"/>
+          <!-- 2026-10-12 N-10c：去掉固定 1.57rad 的 BT 自转。实测 12 次 spin
+             失败里 10 次来自这一条（Turning 1.57），且 100% 被 behavior_server
+             以 Collision Ahead 否决；位姿恢复改由 stemm_nav2_manager 负责
+             （更小步长 1.05rad、会交替方向、且有 253 预检），与本文件顶部
+             "Motion recovery is handled by stemm_nav2_manager" 的设计一致。
+             这里补 Wait(2) 而不是直接删节点，避免 RoundRobin 只剩
+             "清代价地图 + Wait 1" 导致清理动作占比过高、重试预算被过快耗尽。 -->
+        <Wait wait_duration="2"/>
           <Wait wait_duration="1"/>
         </RoundRobin>
       </ReactiveFallback>

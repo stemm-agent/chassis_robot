@@ -123,7 +123,11 @@ nofmap:
         change_penalty: 0.3
         cost_penalty: 1.8
         cost_travel_multiplier: 2.0
-        downsample_costmap: true          # 2026-09-28 grp4
+        # 2026-10-09: true -> false, aligned with the map stack.  Downsampling lets a nearby
+        # lethal cell smear onto the robot's own cell; the avoidance trigger here was an
+        # obstacle at 0.31 m, and every plan then failed with
+        # "Starting point in lethal space! Cannot create feasible plan."
+        downsample_costmap: false         # was true (# 2026-09-28 grp4)
         downsampling_factor: 2            # 2026-09-28 grp4
         lookup_table_size: 20.0
         max_iterations: 20000             # 2026-09-28 grp1 (was 1000000)

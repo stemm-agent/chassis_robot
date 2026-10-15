@@ -509,11 +509,23 @@ def generate_launch_description():
                 # 2026-09-28: the refresh below keeps the age in the 0.5-5 s band,
                 # so a 2 s warning fired ~87 times per 15 min on a healthy system.
                 # 8 s still flags a real stall.
-                'warn_pose_age_sec': 8.0,
+                # 2026-10-12 B：8.0 -> 15.0。实测 /amcl_pose 在静止时约每
+                # 5.1 s 才有一个新位姿（AMCL 无内部定时发布，publishAmclPose
+                # 只由 resampled/force_publication 触发，静止时全靠 nomotion
+                # 服务驱动），对 8.0 s 只有 ~2.9 s 余量。17:37 那轮 AMCL 稍慢
+                # 即冲过 8.0 s -> 本节点判 stale -> adaptor blocked=true ->
+                # nav2_start_feedback_monitor 读到 interlock 未就绪 ->
+                # navigation_health_timeout -> 有图导航栈被判 failed 并清掉。
+                # 放到 15.0 s 让"短暂变慢"不再等于"定位失效"；
+                # 真正 AMCL 死亡仍会被 amcl_absence_shutdown_sec(15 s) 抓到。
+                'warn_pose_age_sec': 15.0,
                 # 2026-09-28: the limiter now refreshes a stale pose itself, so it no
                 # longer depends on the cold-start path only.  Exposed here so future
                 # tuning stays launch-only.
-                'nomotion_request_age_sec': 5.0,
+                # 2026-10-12 B：5.0 -> 1.5。实测把本节点看到的 pose_age 从
+                # 3~5 s 压到 2.0~2.4 s（运行时改参实测，随后已恢复），
+                # 于是对告警阈值留出 ~13 s 余量而不是 ~3 s。
+                'nomotion_request_age_sec': 1.5,
                 'nomotion_retry_sec': 2.0,
                 'nomotion_rearm_sec': 10.0,
                 'nomotion_max_attempts': 100000,

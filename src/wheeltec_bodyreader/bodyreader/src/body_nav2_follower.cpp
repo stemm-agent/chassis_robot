@@ -210,6 +210,18 @@ public:
     lost_timeout_s_ = declare_parameter<double>("lost_timeout_s", 1.0);
     body_invalid_grace_s_ =
       std::max(0.0, declare_parameter<double>("body_invalid_grace_s", 0.45));
+    body_loss_zero_grace_s_ =
+      std::max(0.0, declare_parameter<double>("body_loss_zero_grace_s", 0.30));
+    // 2026-10-09 (operator, fix A): the grace used while the last command was FORWARD.  Forward
+    // motion on frozen geometry closes on a person who just vanished from view, so it gets a much
+    // shorter grace than the reverse case (which keeps body_loss_zero_grace_s).
+    body_loss_forward_grace_s_ =
+      std::max(0.0, declare_parameter<double>("body_loss_forward_grace_s", 0.10));
+    // 2026-10-09 (A2 v2): the grace used while the last command was REVERSE.  Backing away is
+    // the safe direction, so a short blink must not stop it and force a ramp restart.  Bounded
+    // and hot-tunable; set it to body_loss_zero_grace_s to restore the two-way behaviour.
+    body_loss_reverse_grace_s_ =
+      std::max(0.0, declare_parameter<double>("body_loss_reverse_grace_s", 0.45));
     // 2026-10-06: reject implausible depth jumps (either direction).  The detector's
     // per-box ROI median can latch onto background behind the person, which turned a
     // 1.5 m target into 3-5 m and drove /cmd_vel to its 0.8 m/s ceiling (实测前冲).
@@ -265,6 +277,8 @@ public:
       declare_parameter<double>("avoidance_max_forward_step_m", 1.10);
     avoidance_occlusion_hold_s_ =
       declare_parameter<double>("avoidance_occlusion_hold_s", 6.0);
+    takeover_person_depth_min_m_ =
+      declare_parameter<double>("takeover_person_depth_min_m", 1.38);
     visual_clear_takeover_front_clearance_m_ =
       declare_parameter<double>("visual_clear_takeover_front_clearance_m", 0.80);
     visual_clear_takeover_side_clearance_m_ =
@@ -309,6 +323,28 @@ public:
     // Live-tunable: ros2 param set /body_nav2_follower human_retreat_trigger_extra_m <m>
     human_retreat_trigger_extra_m_ = std::max(
       0.0, declare_parameter<double>("human_retreat_trigger_extra_m", 0.12));
+    // 2026-10-07 (user decision): the retreat priority is a MINIMUM-SAFETY-DISTANCE
+    // fallback for the obstacle-avoidance phase only.
+    //   * inside an avoidance (laser: front <= 0.80 m or side <= 0.40 m) the retreat may
+    //     only take the tick below this distance -- default 1.0 m, the approved floor;
+    //   * between that floor and the normal 1.88 m trigger the tick belongs to the
+    //     avoidance chain, so the avoidance can reach its three-tick confirmation;
+    //   * human_retreat_hard_close_m (0.90 m, fires regardless of confirmation) sits below
+    //     the floor, so the innermost safety net still fires inside the window;
+    //   * outside an avoidance nothing changes.
+    // 0.0 disables the shortening (plain 1.88 m trigger everywhere).
+    retreat_avoid_priority_trigger_m_ = std::max(
+      0.0, declare_parameter<double>("retreat_avoid_priority_trigger_m", 1.0));
+    // false restores the 2026-10-06 behaviour (retreat branch skipped whenever an obstacle
+    // is inside the avoidance band).  Live-tunable: ros2 param set ... false
+    retreat_avoid_priority_enabled_ =
+      declare_parameter<bool>("retreat_avoid_priority_enabled", true);
+    // 2026-10-07 (user request): the laser criterion must hold for several consecutive
+    // control ticks before it is trusted.  One noisy scan used to flip the tick ownership
+    // between the retreat and the avoidance chain, which cancelled goals and froze the
+    // state machine.  1 restores the single-frame logic.
+    retreat_avoid_confirm_frames_ = std::max(
+      1, static_cast<int>(declare_parameter<int>("retreat_avoid_confirm_frames", 3)));
     // 2026-09-15 retreat hardening (see control_loop): ignore depths inside the
     // camera blind zone, confirm an ambiguous crossing with a couple of distinct
     // frames, but never delay a clearly-close person, and keep an exit band.
@@ -318,6 +354,22 @@ public:
       0.0, declare_parameter<double>("human_retreat_hard_close_m", 0.90));
     human_retreat_confirm_frames_ = std::max(
       1, static_cast<int>(declare_parameter<int>("human_retreat_confirm_frames", 2)));
+    // 2026-10-07 (user decision, P0-①): the state named "human_retreat_reverse_follow" is
+    // not a reverse controller -- it reuses the bidirectional visual PD, so whenever the
+    // person's depth was above 1.50 m + hold band it commanded FORWARD (46 of its 82
+    // commands in the 15:02 run, up to +0.80 m/s) and that is what drove the robot into an
+    // obstacle 0.163 m ahead.  With this flag a retreat never commands forward.
+    // false restores the old behaviour.  Live-tunable.
+    retreat_no_forward_ =
+      declare_parameter<bool>("retreat_no_forward", true);
+    // 2026-10-07 (user decision, P0-③): forward motion needs laser permission.  Every
+    // visual forward command goes through publish_visual_follow_cmd(), so the clearance
+    // guard lives there and also covers the ownership-lost watchdog crawl (+0.089 m/s was
+    // measured with the front laser at 0.164 m).  <=0 disables the guard.
+    // Default 0.35 m is the existing front_violation_observe_m_ danger line, well below the
+    // 0.80 m avoidance trigger, so ordinary following is not affected.
+    visual_forward_obstacle_clearance_m_ = std::max(
+      0.0, declare_parameter<double>("visual_forward_obstacle_clearance_m", 0.35));
     human_retreat_exit_hysteresis_m_ = std::max(
       0.0, declare_parameter<double>("human_retreat_exit_hysteresis_m", 0.20));
     RCLCPP_INFO(
@@ -381,8 +433,24 @@ public:
     // finish (measured: clearance confirmed from 10:58:58.98, handback only at 10:59:00.88 and
     // only because the human-approach retreat preempted). <=0 preempts as soon as the gate is
     // confirmed; a very large value restores the previous always-protect behaviour.
+    // 2026-10-07 (user decision, P0-B re-applied): hand back to visual control after 0.5 s
+    // of continuously confirmed clearance.  The previous 1.2 s was never reached because the
+    // grace timer was restarted by every interrupted confirmation burst, so
+    // physical_clear_takeover_confirming re-fired every 0.1-0.4 s for the whole detour and
+    // "Handing back to visual following" never ran (field evidence 2026-10-07 16:07).
     avoid_goal_protect_clear_grace_s_ = std::max(
-      0.0, declare_parameter<double>("avoid_goal_protect_clear_grace_s", 1.2));
+      0.0, declare_parameter<double>("avoid_goal_protect_clear_grace_s", 0.5));
+    // true  = the "continuously confirmed" stretch restarts when a confirmation burst is
+    //         interrupted (the 2026-09-28 intent; the grace can now mature because the
+    //         timer is no longer reset by the purely transient cases).
+    // false = once the clearance has been seen, keep the timer until the clearance itself
+    //         is lost (the :4192 reset) or the episode ends.
+    avoid_clear_grace_restart_on_gate_loss_ =
+      declare_parameter<bool>("avoid_clear_grace_restart_on_gate_loss", true);
+    // 2026-10-07 (P0-a): how long an avoidance aborted by the safety-floor retreat stays
+    // eligible for re-issue once the retreat releases.  0 disables the re-issue entirely.
+    avoid_abort_remembrance_s_ = std::max(
+      0.0, declare_parameter<double>("avoid_abort_remembrance_s", 5.0));
     // ---- G1: bounded wait for Nav2 to actually start moving ----
     avoid_handoff_timeout_s_ = std::max(
       0.0, declare_parameter<double>("avoid_handoff_timeout_s", 1.0));
@@ -468,6 +536,12 @@ public:
     visual_filter_alpha_ = declare_parameter<double>("visual_filter_alpha", 0.35);
     visual_angle_deadband_ = declare_parameter<double>("visual_angle_deadband", 0.025);
     visual_distance_deadband_mm_ = declare_parameter<double>("visual_distance_deadband_mm", 80.0);
+    // 2026-10-09 (operator, plan A): the proportional-law steepness, previously the
+    // compile-time constant BODY_NAV2_VISUAL_FULL_SPEED_ERROR_M (0.40).  The default keeps the
+    // historical value so behaviour does not change unless the launch says so; the launch sets
+    // 0.22.  See publish_visual_follow_cmd for the measurements and the reasoning.
+    visual_full_speed_error_m_ = declare_parameter<double>(
+      "visual_full_speed_error_m", BODY_NAV2_VISUAL_FULL_SPEED_ERROR_M);
     visual_max_linear_mps_ = declare_parameter<double>("visual_max_linear_mps", 0.75);
     // 2026-09-28: the forward ceiling may be raised without touching reverse, which the
     // operator requires to stay at its current value (the human-approach retreat reuses
@@ -480,6 +554,10 @@ public:
     visual_reverse_accel_limit_ =
       declare_parameter<double>("visual_reverse_accel_limit", 1.80);
     visual_linear_decel_limit_ = declare_parameter<double>("visual_linear_decel_limit", 0.35);
+    // 2026-10-09 (operator): see smooth_direct_cmd -- limits the through-zero pass of a
+    // direction change so the reverse is not gated by the gentle decel limit.
+    visual_direction_change_limit_mps2_ =
+      declare_parameter<double>("visual_direction_change_limit_mps2", 1.80);
     visual_angular_accel_limit_ = declare_parameter<double>("visual_angular_accel_limit", 0.9);
     visual_allow_reverse_ = declare_parameter<bool>("visual_allow_reverse", true);
     require_scan_for_visual_ = declare_parameter<bool>("require_scan_for_visual", true);
@@ -1385,10 +1463,10 @@ private:
       avoidance_rearm_required_ = false;
       reset_visual_controller();
       motion_gate_stop_published_ = publish_stop_cmd("motion_gate_disabled");
-      publish_state("motion_gate_observe_only");
+      publish_gate_state("motion_gate_observe_only");
     } else {
       motion_gate_stop_published_ = false;
-      publish_state("motion_gate_enabled");
+      publish_gate_state("motion_gate_enabled");
     }
     response->success = true;
     response->message = requested_enabled ?
@@ -2037,6 +2115,179 @@ private:
     return true;
   }
 
+  // 2026-10-07 (P0-a): remember the avoidance that the safety-floor retreat is aborting.
+  // 2026-10-08 (operator decision): a retreat that fires during the avoidance-CONFIRMATION
+  // phase used to abort an avoidance that had not been latched yet, so nothing was remembered
+  // and the avoidance was silently swallowed (field evidence: "Avoidance abort not remembered
+  // ... latched_goal=no" repeated 8+ times at 14:59).  The un-latched intent is now remembered
+  // too, and the goal is built from the live laser when the retreat releases.
+  void remember_avoid_abort_for_retreat(const char * why)
+  {
+    if (avoid_abort_remembrance_s_ <= 0.0) {
+      RCLCPP_INFO(
+        get_logger(), "Avoidance abort not remembered (%s): remembrance=%.2fs (disabled)",
+        why, avoid_abort_remembrance_s_);
+      return;
+    }
+    const auto now = this->now();
+    if (has_avoidance_gate_goal_) {
+      avoid_abort_pending_ = true;
+      avoid_abort_intent_only_ = false;
+      avoid_abort_goal_ = avoidance_gate_goal_;
+      avoid_abort_time_ = now;
+      avoid_abort_distance_m_ = active_avoidance_obstacle_.distance;
+      avoid_abort_angle_rad_ = active_avoidance_obstacle_.angle;
+      avoid_abort_is_side_ =
+        active_avoidance_obstacle_.sector == ObstacleSector::LEFT ||
+        active_avoidance_obstacle_.sector == ObstacleSector::RIGHT;
+      RCLCPP_WARN(
+        get_logger(),
+        "Avoidance abort remembered (%s): sector=%s range=%.2fm goal=(%.2f, %.2f) "
+        "reissue_window=%.1fs",
+        why, obstacle_sector_name(active_avoidance_obstacle_.sector),
+        avoid_abort_distance_m_, avoid_abort_goal_.pose.position.x,
+        avoid_abort_goal_.pose.position.y, avoid_abort_remembrance_s_);
+      return;
+    }
+    // No latched goal: the tick was taken during the confirmation phase.  Capture the intent
+    // from the live laser so the avoidance can be re-issued once the retreat releases.
+    ObstacleScan intent_obstacles;
+    if (scan_recent(now)) {
+      intent_obstacles = scan_obstacles(true);
+    }
+    const bool side_intent =
+      std::isfinite(intent_obstacles.left.distance) &&
+      intent_obstacles.left.distance <= side_obstacle_nav_distance_m_;
+    const bool front_intent =
+      std::isfinite(intent_obstacles.front.distance) &&
+      intent_obstacles.front.distance <= obstacle_nav_distance_m_;
+    if (!front_intent && !side_intent) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Avoidance abort not remembered (%s): no latched goal and no obstacle in the trigger "
+        "band (front=%.2f left=%.2f right=%.2f)",
+        why, intent_obstacles.front.distance, intent_obstacles.left.distance,
+        intent_obstacles.right.distance);
+      return;
+    }
+    avoid_abort_pending_ = true;
+    avoid_abort_intent_only_ = true;
+    avoid_abort_goal_ = geometry_msgs::msg::PoseStamped();
+    avoid_abort_time_ = now;
+    avoid_abort_is_side_ = side_intent && !front_intent;
+    avoid_abort_distance_m_ = side_intent && !front_intent ?
+      intent_obstacles.left.distance : intent_obstacles.front.distance;
+    avoid_abort_angle_rad_ = 0.0;
+    RCLCPP_WARN(
+      get_logger(),
+      "Avoidance intent remembered (%s): sector=%s range=%.2fm (confirmation phase, no latched "
+      "goal yet) reissue_window=%.1fs",
+      why, avoid_abort_is_side_ ? "side" : "front", avoid_abort_distance_m_,
+      avoid_abort_remembrance_s_);
+  }
+
+  // 2026-10-07 (P0-a): the retreat released the tick -- does the avoidance still apply?
+  void maybe_reissue_avoidance_after_retreat(const rclcpp::Time & now)
+  {
+    if (!avoid_abort_pending_) {
+      return;
+    }
+    const double age_s = (now - avoid_abort_time_).seconds();
+    if (age_s > avoid_abort_remembrance_s_) {
+      avoid_abort_pending_ = false;
+      RCLCPP_INFO(
+        get_logger(),
+        "Avoidance re-issue skipped: the remembered abort is stale (%.1fs > %.1fs)",
+        age_s, avoid_abort_remembrance_s_);
+      return;
+    }
+    // Is the same obstacle still inside its trigger band, with a fresh laser?
+    if (!scan_recent(now)) {
+      avoid_abort_pending_ = false;
+      RCLCPP_INFO(get_logger(), "Avoidance re-issue skipped: laser scan is stale");
+      return;
+    }
+    const ObstacleScan reissue_obstacles = scan_obstacles(true);
+    const bool still_there = avoid_abort_is_side_ ?
+      ((std::isfinite(reissue_obstacles.left.distance) &&
+      reissue_obstacles.left.distance <= side_obstacle_nav_distance_m_) ||
+      (std::isfinite(reissue_obstacles.right.distance) &&
+      reissue_obstacles.right.distance <= side_obstacle_nav_distance_m_)) :
+      (std::isfinite(reissue_obstacles.front.distance) &&
+      reissue_obstacles.front.distance <= obstacle_nav_distance_m_);
+    if (!still_there) {
+      avoid_abort_pending_ = false;
+      RCLCPP_INFO(
+        get_logger(),
+        "Avoidance re-issue skipped: obstacle left the trigger band (front=%.2f left=%.2f "
+        "right=%.2f, %.1fs after the abort)",
+        reissue_obstacles.front.distance, reissue_obstacles.left.distance,
+        reissue_obstacles.right.distance, age_s);
+      return;
+    }
+    avoid_abort_pending_ = false;
+    if (avoid_abort_intent_only_ || avoid_abort_goal_.header.frame_id.empty()) {
+      // 2026-10-08: the avoidance was aborted during its confirmation phase, so there is no
+      // remembered goal to restore.  Build the gate goal now from the live laser and latch it;
+      // the normal avoidance chain picks it up on this same tick path.
+      ObstacleObservation intent;
+      if (!avoidance_trigger_confirmed(reissue_obstacles, intent)) {
+        avoid_abort_intent_only_ = false;
+        RCLCPP_INFO(
+          get_logger(),
+          "Avoidance re-issue skipped: the obstacle is no longer confirmable (front=%.2f "
+          "left=%.2f right=%.2f)",
+          reissue_obstacles.front.distance, reissue_obstacles.left.distance,
+          reissue_obstacles.right.distance);
+        return;
+      }
+      geometry_msgs::msg::PoseStamped gate_goal;
+      geometry_msgs::msg::PoseStamped robot_pose_for_gate;
+      if (!lookup_robot_pose(robot_pose_for_gate) ||
+        !make_avoidance_gate_goal(robot_pose_for_gate, intent, gate_goal))
+      {
+        avoid_abort_intent_only_ = false;
+        RCLCPP_INFO(
+          get_logger(),
+          "Avoidance re-issue skipped: the gate goal could not be built (%.1fs after the abort)",
+          age_s);
+        return;
+      }
+      avoid_abort_intent_only_ = false;
+      avoidance_gate_goal_ = gate_goal;
+      has_avoidance_gate_goal_ = true;
+      avoidance_stage_ = AvoidanceStage::GATE;
+      active_avoidance_obstacle_ = intent;
+      avoidance_trigger_count_ = BODY_NAV2_AVOIDANCE_TRIGGER_CONFIRM_TICKS;
+      avoidance_start_time_ = now;
+      last_avoidance_goal_time_ = now;
+      RCLCPP_WARN(
+        get_logger(),
+        "Avoidance re-issued after retreat release: sector=%s range=%.2fm goal=(%.2f, %.2f) "
+        "aborted %.1fs ago (status=intent-remembered, built from src/laser)",
+        obstacle_sector_name(intent.sector), intent.distance,
+        gate_goal.pose.position.x, gate_goal.pose.position.y, age_s);
+      return;
+    }
+    avoidance_gate_goal_ = avoid_abort_goal_;
+    has_avoidance_gate_goal_ = true;
+    avoidance_stage_ = AvoidanceStage::GATE;
+    active_avoidance_obstacle_.sector =
+      avoid_abort_is_side_ ? ObstacleSector::LEFT : ObstacleSector::FRONT;
+    active_avoidance_obstacle_.distance = avoid_abort_distance_m_;
+    active_avoidance_obstacle_.angle = avoid_abort_angle_rad_;
+    avoidance_trigger_count_ = BODY_NAV2_AVOIDANCE_TRIGGER_CONFIRM_TICKS;
+    avoidance_start_time_ = now;
+    last_avoidance_goal_time_ = now;
+    RCLCPP_WARN(
+      get_logger(),
+      "Avoidance re-issued after retreat release: sector=%s range=%.2fm goal=(%.2f, %.2f) "
+      "aborred %.1fs ago (status=%s)",
+      avoid_abort_is_side_ ? "side" : "front", avoid_abort_distance_m_,
+      avoid_abort_goal_.pose.position.x, avoid_abort_goal_.pose.position.y, age_s,
+      avoid_abort_is_side_ ? "side-remembered" : "front-remembered");
+  }
+
   bool avoidance_episode_active() const
   {
     return avoidance_stage_ != AvoidanceStage::IDLE ||
@@ -2235,6 +2486,8 @@ private:
       reset_navigation_episode_tracking();
     }
     has_side_trigger_target_ = false;
+    // 2026-10-07 (P0-B): the handback grace belongs to one avoidance episode.
+    avoid_clear_preempt_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     avoidance_motion_logged_ = false;
     avoidance_start_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
     avoidance_goal_accept_time_ =
@@ -2327,7 +2580,20 @@ private:
       visual_reverse_accel_limit_ : visual_linear_accel_limit_;
     const double decel_limit = decel_limit_override >= 0.0 ?
       decel_limit_override : visual_linear_decel_limit_;
-    const double linear_limit = speeding_up ? accel_limit : decel_limit;
+    // 2026-10-09 (operator): the forward->reverse through-zero pass used the plain deceleration
+    // limit even though the reverse itself is allowed visual_reverse_accel_limit -- a 5.1x
+    // asymmetry (0.35 vs 1.80).  Measured 2026-10-09 13:11-13:12: from +0.74/+0.80 m/s the car
+    // kept travelling FORWARD for 2.1-2.3 s before any reverse began, which the operator
+    // reported as "reverse is very unresponsive" (log: state=visual_reverse_follow at a person
+    // depth of 948 mm still commanded linear=+0.127).
+    // This dedicated limit applies ONLY to that through-zero pass; ordinary distance-control
+    // deceleration keeps using decel_limit.  Set it to 0.35 to restore the old behaviour.
+    const double linear_limit = reversing_direction ?
+      std::max(decel_limit, visual_direction_change_limit_mps2_) :
+      (speeding_up ? accel_limit : decel_limit);
+    // 2026-10-09: remember which limit shaped this tick and why, for the "Visual cmd" log line.
+    last_slew_limit_mps2_ = linear_limit;
+    last_slew_mode_ = reversing_direction ? 2 : (speeding_up ? 1 : 0);
     const double max_linear_delta = std::max(0.0, linear_limit) * dt;
     const double max_angular_delta = std::max(0.0, visual_angular_accel_limit_) * dt;
 
@@ -2426,8 +2692,27 @@ private:
     }
 
     geometry_msgs::msg::Twist desired;
+    // 2026-10-09 (operator, plan A): this was the compile-time constant
+    // BODY_NAV2_VISUAL_FULL_SPEED_ERROR_M (0.40).  Measured on the live trace at 0.40:
+    //   person 1.71 m (err 0.16) -> 0.078 m/s
+    //   person 1.76 m (err 0.21) -> 0.181 m/s
+    //   person 1.95 m (err 0.40) -> 0.600 m/s   <-- full speed only here, i.e. the person had
+    //                                               to walk 40 cm past follow_distance before
+    //                                               the car matched their speed.
+    // At 0.22: err 0.16 -> 0.240 m/s (3.1x) and full speed at person 1.77 m (18 cm earlier).
+    // It changes ONLY the gain -- the forward trigger, the hold band and the reverse engagement
+    // all stay where the 2026-10-09 parameter set put them -- and the reverse shares the same
+    // ratio, so it sharpens symmetrically.  Read every tick, so it stays hot-tunable:
+    //   ros2 param set /body_nav2_follower visual_full_speed_error_m 0.22
+    // Set it back to BODY_NAV2_VISUAL_FULL_SPEED_ERROR_M (0.40) to restore the old feel.
+    double visual_full_speed_error_m = visual_full_speed_error_m_;
+    try {
+      visual_full_speed_error_m = get_parameter("visual_full_speed_error_m").as_double();
+    } catch (const std::exception &) {
+      // keep the declared default
+    }
     const double full_speed_error_m = std::max(
-      distance_deadband_m + 1e-3, BODY_NAV2_VISUAL_FULL_SPEED_ERROR_M);
+      distance_deadband_m + 1e-3, visual_full_speed_error_m);
     const double effective_distance_error_m = std::max(
       0.0, std::fabs(raw_distance_error_m) - distance_deadband_m);
     const double distance_speed_ratio = clamp_value(
@@ -2467,6 +2752,38 @@ private:
       desired.linear.x = std::max(desired.linear.x, minimum_forward_mps);
     }
 
+    // ---- P0-①/③ (2026-10-07): forward motion is a privilege, not a default. ----
+    // One place only: every visual forward command (retreat, watchdog, handoff fallback,
+    // direct and weighted follow) passes through here.
+    bool forward_allowed = true;
+    if (desired.linear.x > 0.0) {
+      if (retreat_no_forward_ && human_retreat_active_flag_) {
+        forward_allowed = false;                       // ① the retreat never drives forward
+      }
+      if (visual_forward_obstacle_clearance_m_ > 0.0 && scan_recent(now)) {
+        const ObstacleScan guard_obstacles = scan_obstacles(true);
+        const bool front_blocked =
+          std::isfinite(guard_obstacles.front.distance) &&
+          guard_obstacles.front.distance <= visual_forward_obstacle_clearance_m_;
+        const bool side_blocked =
+          (std::isfinite(guard_obstacles.left.distance) &&
+          guard_obstacles.left.distance <= visual_forward_obstacle_clearance_m_) ||
+          (std::isfinite(guard_obstacles.right.distance) &&
+          guard_obstacles.right.distance <= visual_forward_obstacle_clearance_m_);
+        if (front_blocked || side_blocked) {
+          forward_allowed = false;                     // ③ no laser clearance -> no forward
+        }
+      }
+      if (!forward_allowed) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Forward blocked (retreat=%s laser_clearance=%.2fm): clamping %.3f -> 0.000",
+          human_retreat_active_flag_ ? "active" : "inactive",
+          visual_forward_obstacle_clearance_m_, desired.linear.x);
+        desired.linear.x = 0.0;
+      }
+    }
+
     if (!visual_allow_reverse_ && desired.linear.x < 0.0) {
       desired.linear.x = 0.0;
     }
@@ -2497,17 +2814,28 @@ private:
       (desired.linear.x < 0.0 ? visual_reverse_accel_limit_ : visual_linear_accel_limit_);
     const auto cmd = smooth_direct_cmd(desired, now, decel_limit);
     visual_cmd_pub_->publish(cmd);
+    // 2026-10-09 (operator): the controller does NOT use raw_z -- it uses filtered_distance_mm_
+    // (one-pole, visual_filter_alpha) and then shapes the magnitude with a slew limiter.  The
+    // line therefore could not explain the commanded speed: on 2026-10-09 the SAME raw depth
+    // (0.82 m) appeared with linear=-0.181 and linear=-0.600.  filt_z / err / hold / slew make
+    // the reverse numerically diagnosable; slew mode is accel / decel / rezero.
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
-      "Visual cmd source=%s state=%s body=%d raw_x=%.0fmm raw_z=%.0fmm "
+      "Visual cmd source=%s state=%s body=%d raw_x=%.0fmm raw_z=%.0fmm filt_z=%.0fmm "
+      "err=%+.0fmm dead=%.0fmm hold=%d slew=%.2f(%s) "
       "scale=%.2f linear=%.3f angular=%.3f",
       active_visual_body_is_dual_ ? "raw_dual" : "strict_validated",
       state.c_str(), active_visual_body_.bodyid,
       active_visual_body_.centerofmass_x, active_visual_body_.centerofmass_z,
+      filtered_distance_mm_,
+      raw_distance_error_m * 1000.0, distance_deadband_m * 1000.0,
+      visual_hold_active_ ? 1 : 0,
+      last_slew_limit_mps2_,
+      last_slew_mode_ == 2 ? "rezero" : (last_slew_mode_ == 1 ? "accel" : "decel"),
       safe_linear_scale, cmd.linear.x, cmd.angular.z);
     last_visual_error_angle_ = error_x_angle;
     last_visual_error_distance_ = error_distance;
-    publish_state(visual_hold_active_ ? "visual_distance_hold" : state);
+    publish_visual_state(visual_hold_active_ ? "visual_distance_hold" : state);
     return true;
   }
 
@@ -2574,7 +2902,8 @@ private:
     const rclcpp::Time & now,
     const ObstacleScan & obstacles,
     bool avoidance_active,
-    bool nav_engaged) const
+    bool nav_engaged,
+    bool require_fresh_body = true) const
   {
     if (!avoidance_active || !nav_engaged || !scan_recent(now) ||
         !scan_sectors_valid(obstacles) ||
@@ -2587,9 +2916,18 @@ private:
 
     // A: 人不在画面时不得以"路径净空"为理由取消 Nav2 的绕障——取消完就没人可看，
     //    只会停在 SAFETY_GATE 里零速死等。新鲜度与安全闸保持一致。
-    if (!has_body_ ||
+    // 2026-10-08 (operator principle: each accumulator is cleared only by its own condition):
+    // this term belongs to the CONFIRMATION gate -- which must have a followable person -- and
+    // NOT to the G2 grace timer, which measures "the path has been physically clear for X s".
+    // Measured perception blinks: mean 0.27 s against this 0.30 s threshold, ~34 per 73 s, so
+    // keeping it unconditional restarted the grace clock for a reason unrelated to clearance.
+    // The handback-confirmation caller keeps the default (true); the grace caller passes false.
+    // A release still cannot happen without a fresh body, because G2 releases only inside
+    // if (visual_clear_takeover_confirmed(...)), which checks this with the default.
+    if (require_fresh_body &&
+        (!has_body_ ||
         (now - last_body_time_).seconds() >
-        visual_clear_takeover_require_body_max_age_s_)
+        visual_clear_takeover_require_body_max_age_s_))
     {
       return false;
     }
@@ -3154,6 +3492,21 @@ private:
     }
 
     nav_retry_waiting_ = false;
+    // 2026-10-08 (operator decision, second pass): carry the avoidance retreat floor across a
+    // handback that went through the clear/re-acquire drain as well.  The AVOID_GATE-SUCCEEDED
+    // path already does this; without it here, reset_avoidance_episode() below ends the episode,
+    // the floor is released on the next tick, and the base 1.38 m trigger takes the handback away
+    // again -- the 16:23:08 regression, on the path episode 931 actually used.
+    if (retreat_held_for_avoidance_) {
+      retreat_hold_post_handback_ = true;
+      RCLCPP_INFO(
+        get_logger(),
+        "Avoidance floor kept across the visual takeover: the retreat stays at %.2f m until the "
+        "person clears %.2f m",
+        retreat_avoid_priority_trigger_m_,
+        follow_distance_m_ - hold_distance_band_m_ + human_retreat_trigger_extra_m_ +
+        human_retreat_exit_hysteresis_m_);
+    }
     reset_avoidance_episode(true);
     visual_takeover_phase_ = VisualTakeoverPhase::SAFETY_GATE;
     avoid_gate_hold_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
@@ -3240,6 +3593,41 @@ private:
       reset_visual_clear_takeover_confirmation();
     }
 
+    // 2026-10-08 (operator criterion): on top of every existing handback gate, the person must
+    // ALREADY BE CLOSER THAN the follow trigger (< 1.38 m) before control returns to visual
+    // direct following.  Rationale: the handback is wanted exactly when the person is near --
+    // then visual direct following (and its forward-clearance clamp) is the right controller,
+    // and the avoidance retreat floor (1.0 m, kept across the handback) covers the close range.
+    // While this gate blocks, the confirmation counter is deliberately NOT advanced and the
+    // Nav2 goal keeps ownership (this function publishes no command), so the detour continues
+    // instead of standing still.
+    // 2026-10-08: re-read live so the value can be compared on site without a service restart
+    // (declared once at startup, otherwise never refreshed).  Same pattern as the retreat block.
+    double takeover_person_depth_limit_m = takeover_person_depth_min_m_;
+    try {
+      takeover_person_depth_limit_m =
+        get_parameter("takeover_person_depth_min_m").as_double();
+    } catch (const std::exception &) {
+      // keep the declared default
+    }
+    const double takeover_person_depth_max_m =
+      takeover_person_depth_limit_m > 0.0 ?
+      takeover_person_depth_limit_m :
+      (follow_distance_m_ - hold_distance_band_m_ + human_retreat_trigger_extra_m_);
+    const double handback_person_m = latest_body_.centerofmass_z * 0.001;
+    const bool handback_person_depth_ok =
+      std::isfinite(handback_person_m) && handback_person_m > 0.0 &&
+      handback_person_m < takeover_person_depth_max_m;
+    if (!handback_person_depth_ok) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Clearance is ready but the handback waits for the person to come closer than %.2f m "
+        "(current %.2f m); the Nav2 avoidance goal keeps ownership",
+        takeover_person_depth_max_m,
+        (std::isfinite(handback_person_m) ? handback_person_m : -1.0));
+      return false;
+    }
+
     visual_clear_takeover_last_scan_generation_ = scan_generation_;
     ++visual_clear_takeover_count_;
     if (visual_clear_takeover_count_ == 1) {
@@ -3255,7 +3643,13 @@ private:
     }
 
     if (visual_clear_takeover_count_ < visual_clear_takeover_confirm_frames_) {
-      publish_state("physical_clear_takeover_confirming");
+      // 2026-10-07 (P0-b): this branch used to publish a ZERO /cmd_vel on every entry.
+      // While the clearance gate is still being confirmed the Nav2 goal is STILL the owner
+      // of the robot, so zeroing here chopped every detour into 0.1-0.4 s stop/go slivers
+      // (measured 9 entries in 3 s; 1.5 s / 0.7 s / 0.7 s / 0.4 s zero stretches at
+      // 2026-10-07 16:24).  Only the label is kept, with a name that says who owns the
+      // robot -- attribution in the log, no safety change.
+      publish_state("physical_clear_confirming_nav2_keeping");
       return false;
     }
 
@@ -3298,10 +3692,157 @@ private:
           priority_obstacles.right.distance <= side_obstacle_nav_distance_m_);
       }
     }
+    // 2026-10-07: debounce the laser criterion.  A single noisy frame must not flip the
+    // tick ownership between the retreat and the avoidance chain.
+    int retreat_avoid_confirm_need = retreat_avoid_confirm_frames_;
+    try {
+      retreat_avoid_confirm_need = std::max(
+        1, static_cast<int>(get_parameter("retreat_avoid_confirm_frames").as_int()));
+    } catch (const std::exception &) {
+      // keep the declared default
+    }
+    if (obstacle_blocks_retreat) {
+      if (retreat_avoid_confirm_count_ < 1000) {
+        retreat_avoid_confirm_count_ += 1;
+      }
+    } else {
+      retreat_avoid_confirm_count_ = 0;
+    }
+    const bool obstacle_confirmed =
+      obstacle_blocks_retreat &&
+      retreat_avoid_confirm_count_ >= retreat_avoid_confirm_need;
+    (void)obstacle_confirmed;   // 2026-10-08: kept for diagnostics/future use; the retreat
+                                // floor below now keys off retreat_priority_confirmed.
+    // 2026-10-08 (operator design): the retreat floor used by the avoidance chain must apply
+    // from the FIRST frame of the avoidance-confirmation phase.  Until now the obstacle had to
+    // pass the 3-frame debounce (obstacle_confirmed) before the 1.0 m avoidance floor took
+    // effect; during those frames the retreat fell back to the base follow trigger (1.38 m),
+    // stole the tick, and the avoidance goal was never latched at all.  Field evidence
+    // 2026-10-08 14:59: front=0.635m entered confirm, person 1.32 m -> "Human retreat start"
+    // with the 1.38 m trigger, and "Avoidance abort not remembered ... latched_goal=no"
+    // repeated 8+ times: the avoidance never started, so nothing could hand back to visual.
+    const bool retreat_priority_confirmed =
+      obstacle_blocks_retreat ||
+      retreat_avoid_confirm_count_ >= retreat_avoid_confirm_need;
+
+    // 2026-10-08 (operator decision, second pass): the avoidance retreat floor (1.0 m) belongs
+    // to the WHOLE avoidance episode -- from the first confirmation frame until the handback to
+    // visual control has completed -- not only to the ticks on which an obstacle is still inside
+    // the band.  Field evidence 2026-10-08 16:55:04 (episode 931): the obstacle had already
+    // cleared to front=1.17 m while the person was still at 1.41 m, so the floor was never
+    // raised; the handback then opened at 1.38 m and the base follow trigger cancelled the
+    // takeover 100 ms later ("takeover cancel: reason=human_retreat_priority"), one confirmation
+    // scan short of completion.  The floor is read once here so the in-band and out-of-band
+    // decisions cannot drift apart.
+    double retreat_priority_m = retreat_avoid_priority_trigger_m_;
+    bool retreat_priority_on = retreat_avoid_priority_enabled_;
+    try {
+      retreat_priority_m = std::max(
+        0.0, get_parameter("retreat_avoid_priority_trigger_m").as_double());
+      retreat_priority_on =
+        get_parameter("retreat_avoid_priority_enabled").as_bool();
+    } catch (const std::exception &) {
+      // keep the declared defaults
+    }
+    const double retreat_priority_floor_m =
+      human_retreat_trigger_extra_m_ > 0.0 ?
+      std::max(follow_distance_m_ - hold_distance_band_m_ +
+      human_retreat_trigger_extra_m_, retreat_priority_m) :
+      retreat_priority_m;
+    const bool retreat_floor_configured = retreat_priority_on && retreat_priority_m > 0.0;
+    if (!retreat_floor_configured) {
+      // Shortening disabled -> the avoidance owns the tick whatever the distance, and no
+      // avoidance floor is held (the 2026-10-06 behaviour).
+      retreat_held_for_avoidance_ = false;
+      retreat_hold_post_handback_ = false;
+    }
+
+    // 2026-10-07: while an obstacle sits inside the avoidance band this tick belongs to the
+    // avoidance chain unless the person is already inside the retreat safety floor.  The
+    // floor expression mirrors the base trigger used inside the block below
+    // (follow - hold_band + extra), so the two decisions cannot drift apart.
+    bool retreat_capture_tick = true;
+    bool retreat_avoid_floor_active = false;
+    if (obstacle_blocks_retreat) {
+      if (retreat_floor_configured) {
+        const double retreat_person_m = latest_body_.centerofmass_z * 0.001;
+        const bool retreat_person_known =
+          std::isfinite(retreat_person_m) && retreat_person_m > 0.0;
+        retreat_avoid_floor_active =
+          retreat_person_known &&
+          ((retreat_priority_confirmed && retreat_person_m < retreat_priority_floor_m) ||
+          // Innermost net: below the hard-close floor the retreat acts at once and does
+          // not wait for the confirmation frames.  This one is deliberately NOT hysteretic:
+          // 0.90 m is a safety floor, not a mode.
+          retreat_person_m < human_retreat_hard_close_m_);
+        retreat_capture_tick =
+          retreat_avoid_floor_active && retreat_person_m < retreat_priority_floor_m;
+        // The floor is in force for the whole episode, so remember it: the tick must stay ours
+        // once the obstacle leaves the band.
+        retreat_held_for_avoidance_ = true;
+      } else {
+        retreat_capture_tick = false;
+      }
+    } else {
+      // 2026-10-08 (operator answer to Q4, extended): no obstacle inside the avoidance band this
+      // tick, but the floor stays in force for the rest of the episode.  Raise the hold here too,
+      // otherwise an obstacle that clears while the person is still outside 1.0 m leaves the tick
+      // to the base 1.38 m trigger and a handback in flight is cancelled.
+      if (!retreat_held_for_avoidance_ && retreat_floor_configured &&
+        avoidance_episode_active())
+      {
+        retreat_held_for_avoidance_ = true;
+        RCLCPP_INFO_THROTTLE(
+          get_logger(), *get_clock(), 2000,
+          "Avoidance floor raised for the rest of the episode: the retreat stays at %.2f m "
+          "while no obstacle is left inside the band", retreat_priority_floor_m);
+      }
+      if (retreat_held_for_avoidance_) {
+        const double retreat_person_m = latest_body_.centerofmass_z * 0.001;
+        const bool retreat_person_known =
+          std::isfinite(retreat_person_m) && retreat_person_m > 0.0;
+        // 2026-10-08 (operator choice (a), revised): the release condition depends on the phase.
+        //   * after a handback to visual control -> the base follow trigger plus its hysteresis
+        //     (1.38 + 0.20 = 1.58 m).  Otherwise a person still standing at ~1.36 m would
+        //     immediately be chased again by the 1.38 m retreat, which is the "handed back and
+        //     then taken away three seconds later" case seen at 16:23:08.
+        //   * during the episode -> the floor is released by the end of the episode itself, not
+        //     by distance.  The old 0.80 m band released it on the very tick it was raised
+        //     whenever the person was farther than the obstacle band -- exactly the 1.0-1.38 m
+        //     window a handback needs.
+        // 2026-10-08 (correction, same day): an UNKNOWN depth must NOT release the floor.
+        // Both handback paths clear the exact observation immediately after raising the floor
+        // (clear_exact_visual_observation() zeroes latest_body_.centerofmass_z), so the first
+        // tick after every handback looks "unknown" and the earlier expression released the
+        // floor on that very tick.  Live proof, session 17:15:14-17:16:27:
+        //   17:15:24.566  Avoidance floor kept across the visual takeover (retreat at 1.00 m)
+        //   17:15:24.667  Visual safety gate holds: fresh exact body is stale or absent
+        //   17:15:25.066  Human retreat start: depth=1.10 m trigger=1.38 m  <- floor already gone
+        // Result was 4 retreats in 73 s at 1.10-1.32 m, all with trigger=1.38 m, i.e. exactly
+        // inside the band the floor is meant to protect.  Only a CONFIRMED distance beyond the
+        // band releases the floor now; an unknown distance keeps it.  The retreat itself stays
+        // gated by has_body_ / invalid_body_since_ / depth validity, so this widens no safety net.
+        const bool released = retreat_hold_post_handback_ ?
+          (retreat_person_known &&
+          retreat_person_m >= follow_distance_m_ - hold_distance_band_m_ +
+          human_retreat_trigger_extra_m_ + human_retreat_exit_hysteresis_m_) :
+          !avoidance_episode_active();
+        if (released) {
+          retreat_held_for_avoidance_ = false;
+          retreat_hold_post_handback_ = false;
+        } else {
+          // The floor is in force: the retreat keeps this tick, but only below the avoidance
+          // floor (1.0 m) -- not below the base follow trigger (1.38 m).  That 0.38 m window is
+          // what lets a handback finish instead of being cancelled mid-flight.
+          retreat_capture_tick =
+            retreat_person_known && retreat_person_m < retreat_priority_floor_m;
+        }
+      }
+    }
 
     if (human_retreat_priority_enabled_ && mode_ == 2 && motion_enabled_ &&
       visual_allow_reverse_ && has_body_ && invalid_body_since_.nanoseconds() == 0 &&
-      last_body_time_.nanoseconds() != 0 && !obstacle_blocks_retreat)
+      last_body_time_.nanoseconds() != 0 && retreat_capture_tick)
     {
       const double retreat_person_m = latest_body_.centerofmass_z * 0.001;
       // Live-tunable extra distance (ros2 param set ... human_retreat_trigger_extra_m).
@@ -3396,7 +3937,17 @@ private:
         }
         visual_takeover_phase_ = VisualTakeoverPhase::NONE;
         awaiting_visual_after_avoidance_ = false;
-        if (!obstacle_blocks_retreat) {
+        // Clear the avoidance episode only when the retreat itself owns this tick.  When
+        // the tick belongs to the avoidance chain this block is never entered, so its
+        // confirmation counters and latched goal stay alive.
+        // One semantics only: if the retreat takes this tick, the avoidance episode is
+        // cleared (cancels a running goal, re-arms).  While the avoidance owns the tick
+        // this block is not entered at all, so its counters stay alive.
+        if (retreat_capture_tick) {
+          // 2026-10-07 (P0-a): the safety-floor retreat owns this tick, so the running
+          // avoidance goal is cancelled -- but remember it, otherwise the detour is simply
+          // abandoned whenever a person steps inside 1.38 m (field case 2026-10-07 16:25).
+          remember_avoid_abort_for_retreat("retreat_capture");
           reset_avoidance_episode();
         }
         avoidance_rearm_required_ = false;
@@ -3415,6 +3966,10 @@ private:
           visual_kick_ramp_until_ = now + rclcpp::Duration::from_seconds(takeover_kick_ramp_s_);
           avoid_diag_kick_ramps_ += 1;
         }
+        // 2026-10-07 (P0-a): if the retreat aborted an avoidance and that obstacle is still
+        // in the trigger band, re-issue the same goal instead of silently falling back to
+        // visual following.  Attribution is logged either way.
+        maybe_reissue_avoidance_after_retreat(now);
       }
     }
     human_retreat_cmd_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
@@ -3459,7 +4014,16 @@ private:
       const bool should_move =
         std::isfinite(person_m) && person_m > 0.10 &&
         std::fabs(person_m - follow_distance_m_) > deadband;
-      if (should_move && (now - last_cmd_motion_time_).seconds() >= ownership_lost_timeout_s_) {
+      // 2026-10-09 (operator): read it every tick so it can be tuned live.  Previously it was
+      // captured once from declare_parameter, so `ros2 param set` had no effect at all.
+      double ownership_lost_timeout_s = ownership_lost_timeout_s_;
+      try {
+        ownership_lost_timeout_s = std::max(
+          0.0, get_parameter("ownership_lost_timeout_s").as_double());
+      } catch (const std::exception &) {
+        // keep the declared default
+      }
+      if (should_move && (now - last_cmd_motion_time_).seconds() >= ownership_lost_timeout_s) {
         avoid_diag_ownership_lost_ += 1;
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 1000,
@@ -3509,7 +4073,7 @@ private:
       if (!motion_gate_stop_published_) {
         motion_gate_stop_published_ = publish_stop_cmd("motion_gate_observe_only");
       }
-      publish_state("motion_gate_observe_only");
+      publish_gate_state("motion_gate_observe_only");
       return;
     }
     motion_gate_stop_published_ = false;
@@ -4101,8 +4665,13 @@ private:
       // confirm-count gate's return value: that gate returns false on any tick without a new
       // scan generation, so using it restarted the grace at the control rate and it never
       // matured (live logs read "clear handback confirmed 0.00/1.20s").
+      // 2026-10-08: the grace follows the CLEARANCE only, never the confirm-count gate's
+      // return value.  require_fresh_body=false drops the body-freshness term (a perception
+      // property) while keeping nav/scan/sector validity, the minimum avoidance duration and
+      // the three-sector clearance -- i.e. exactly Acc2's own condition.
       if (!visual_takeover_progress_clearance_ready(
-          now, takeover_obstacles, avoidance_active, nav_engaged))
+          now, takeover_obstacles, avoidance_active, nav_engaged,
+          /*require_fresh_body=*/false))
       {
         avoid_clear_preempt_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       }
@@ -4150,8 +4719,10 @@ private:
           publish_safety_stop_cmd("cancel_nav2_physical_clear_takeover");
           return;
         }
-      } else {
-        // 2026-09-28: gate not confirmed -> the "continuously confirmed" stretch restarts.
+      } else if (avoid_clear_grace_restart_on_gate_loss_) {
+        // 2026-09-28 intent: an interrupted confirmation restarts the "continuously
+        // confirmed" stretch.  Now optional, because this is what kept the grace from ever
+        // maturing while the avoidance goal was still progressing.
         avoid_clear_preempt_since_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
       }
     } else if (!avoidance_active || !nav_engaged) {
@@ -4160,6 +4731,83 @@ private:
     }
 
     if (visual_recent) {
+      // ---- 2026-10-08 (operator): no residual velocity after a confirmed body loss. ----
+      // Every publish_visual_follow_cmd() site below computes its command from
+      // active_visual_body_, which is only refreshed while the observation is fresh (the
+      // visual_recent assignment above).  During the body-loss window that geometry is frozen,
+      // so the PD output stays roughly constant and the robot cruises at the speed it had when
+      // the target disappeared.  Measured 2026-10-08: 94 loss transitions in 136 s, each worth
+      // up to lost_timeout_s_ = 1.5 s of stale-geometry driving (~1.2 m at 0.8 m/s), toward
+      // where the person last was.
+      // The detector emits exactly ONE lock_status=0 frame per valid->invalid transition and
+      // then goes silent, so the confirmed-loss signal is the persistence of that silence:
+      // past body_loss_zero_grace_s (~3 control ticks at 10 Hz) we hold zero.  Sub-0.3 s
+      // perception blinks (measured mean 0.27 s) are unaffected, so the car does not chatter.
+      // Gated on !avoidance_active && !nav_engaged: while Nav2 owns the tick we must never
+      // inject a competing stop -- the class of bug that dead-locked the robot when G2 was
+      // deleted at 16:42.  Identity/memory is untouched (has_body_ still clears at 2.0 s).
+      double body_loss_zero_grace_s = body_loss_zero_grace_s_;
+      try {
+        body_loss_zero_grace_s = std::max(
+          0.0, get_parameter("body_loss_zero_grace_s").as_double());
+      } catch (const std::exception &) {
+        // keep the declared default
+      }
+      const double body_age_for_motion_s =
+        last_body_time_.nanoseconds() == 0 ? 1e9 : (now - last_body_time_).seconds();
+      // 2026-10-09 (operator, fix A): ASYMMETRIC body-loss grace.
+      // While the observation is stale the controller keeps computing from FROZEN geometry, so it
+      // "cruises at the speed it had when the target disappeared" (see the note above).  That is
+      // acceptable when the last command was a REVERSE -- backing away is the safe direction --
+      // but when it was FORWARD the car keeps closing on a person who has just vanished from view.
+      // Measured 2026-10-09 13:20-13:23: 26 dropouts in 170 s, about half of them shorter than the
+      // 0.30 s grace, each worth up to 0.24 m of blind forward travel while the person closed at
+      // ~0.7 m/s.  Getting closer then made detection WORSE (valid 78.8 % -> 59.7 %,
+      // no_detection 39.5 %, closest 0.786 m -- below the 0.90 m hard close): a positive feedback
+      // loop that ended with the person undetectable.
+      // The forward case therefore gets its own, much shorter grace; the reverse case keeps the
+      // original body_loss_zero_grace_s.  Read every tick, so it is hot-tunable:
+      //   ros2 param set /body_nav2_follower body_loss_forward_grace_s 0.10
+      // Set it equal to body_loss_zero_grace_s to restore the previous symmetric behaviour.
+      double body_loss_forward_grace_s = body_loss_forward_grace_s_;
+      try {
+        body_loss_forward_grace_s = std::max(
+          0.0, get_parameter("body_loss_forward_grace_s").as_double());
+      } catch (const std::exception &) {
+        // keep the declared default
+      }
+      // 2026-10-09 (A2 v2): three-way grace.  Read the reverse grace every tick like the
+      // forward one so it stays hot-tunable.  This ONLY selects a grace value -- it never
+      // touches the command magnitude or last_direct_cmd_, so it cannot latch (see the note
+      // above this block for the three exit paths).
+      double body_loss_reverse_grace_s = body_loss_reverse_grace_s_;
+      try {
+        body_loss_reverse_grace_s = std::max(
+          0.0, get_parameter("body_loss_reverse_grace_s").as_double());
+      } catch (const std::exception &) {
+        // keep the declared default
+      }
+      const bool moving_forward = last_direct_cmd_.linear.x > 0.0;
+      const bool moving_reverse = last_direct_cmd_.linear.x < 0.0;
+      const char * grace_case =
+        moving_forward ? "FORWARD" : (moving_reverse ? "REVERSE" : "idle");
+      const double effective_zero_grace_s =
+        moving_forward ? body_loss_forward_grace_s :
+        (moving_reverse ? body_loss_reverse_grace_s : body_loss_zero_grace_s);
+      if (!avoidance_active && !nav_engaged &&
+        body_age_for_motion_s > effective_zero_grace_s)
+      {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "Body observation stale for %.3fs (> %.3fs, last cmd %s): holding zero instead of "
+          "driving on cached geometry",
+          body_age_for_motion_s, effective_zero_grace_s,
+          grace_case);
+        reset_visual_controller();
+        publish_stop_cmd("body_loss_confirmed_stop");
+        return;
+      }
+
       // 2026-09-15: in map-free mode the *visual* controller keeps following (smooth, same
       // feel as map mode); the odom-frame Nav2 only takes over for obstacle avoidance, which
       // is exactly how the map stack is used. Goal-based following was observed to be very
@@ -5100,6 +5748,20 @@ private:
           case rclcpp_action::ResultCode::SUCCEEDED:
             nav_retry_waiting_ = false;
             if (goal_kind == NavGoalKind::AVOID_GATE) {
+              // 2026-10-08 (operator choice (a)): carry the avoidance retreat floor across the
+              // handback.  The episode is about to be reset, so the hold would otherwise be
+              // released and the base 1.38 m trigger would fire on a person still at ~1.36 m
+              // (observed 16:23:08, three seconds after a successful handback).
+              if (retreat_held_for_avoidance_) {
+                retreat_hold_post_handback_ = true;
+                RCLCPP_INFO(
+                  get_logger(),
+                  "Avoidance floor kept across handback: retreat stays at %.2f m until the "
+                  "person clears %.2f m",
+                  retreat_avoid_priority_trigger_m_,
+                  follow_distance_m_ - hold_distance_band_m_ + human_retreat_trigger_extra_m_ +
+                  human_retreat_exit_hysteresis_m_);
+              }
               reset_avoidance_episode();
               avoidance_rearm_required_ = true;
               clear_exact_visual_observation();
@@ -5503,17 +6165,45 @@ private:
     avoid_diag_pub_->publish(msg);
   }
 
-  void publish_state(const std::string & state)
+  // 2026-10-09 (operator): ONE CONCEPT PER LOG CHANNEL.
+  //
+  // Before this, publish_state() carried three unrelated things through a single channel:
+  //   * the OUTER intent         (why we move at all: retreat / avoidance / takeover / loss),
+  //   * the INNER visual class   (what the visual controller does: direct / weighted / hold /
+  //                               reverse), produced ONE CALL LATER in the same tick, and
+  //   * the motion-gate heartbeat (motion_gate_enabled, re-sent every tick).
+  // Every tick therefore logged two different strings and the state looked like it oscillated
+  // several times per second.  Measured 2026-10-09 11:51 (map following, 82 s): 58 % of all
+  // transitions were inside {human_retreat_reverse_follow, visual_reverse_follow,
+  // visual_distance_hold} -- one behaviour reported three ways -- and every busy state had a
+  // 0.00 s median dwell, i.e. shorter than the 1 s log resolution.
+  //
+  // Each concept now has its own line and its own change detection, so a `follow_state` line
+  // means the intent really changed.  /body_nav2_state is UNCHANGED (all three still publish to
+  // it through the same last_state_ dedupe), so no consumer is affected.
+  static constexpr double kStateHoldRelogSec = 2.0;   // main intent: keep the liveness proof
+  static constexpr double kSideHoldRelogSec = 5.0;    // side channels: lower volume
+
+  void log_state_line(
+    const char * channel, const std::string & value,
+    std::string & remembered, rclcpp::Time & last_time, double hold_relog_sec)
   {
-    if (state != last_logged_state_) {
-      last_logged_state_ = state;
-      last_state_log_time_ = this->now();
-      RCLCPP_INFO(get_logger(), "follow_state: %s", state.c_str());
-    } else if ((this->now() - last_state_log_time_).seconds() >= 2.0) {
-      last_state_log_time_ = this->now();
-      RCLCPP_INFO(get_logger(), "follow_state(hold %.1fs): %s",
-        (this->now() - last_state_log_time_).seconds(), state.c_str());
+    const rclcpp::Time now = this->now();
+    const double elapsed = (now - last_time).seconds();
+    if (value != remembered) {
+      remembered = value;
+      last_time = now;
+      RCLCPP_INFO(get_logger(), "%s: %s", channel, value.c_str());
+    } else if (elapsed >= hold_relog_sec) {
+      // NOTE: the timestamp is updated AFTER measuring, so the reported hold is the real one.
+      // The previous code assigned first and subtracted second, which always printed 0.0 s.
+      last_time = now;
+      RCLCPP_INFO(get_logger(), "%s(hold %.1fs): %s", channel, elapsed, value.c_str());
     }
+  }
+
+  void publish_state_topic_only(const std::string & state)
+  {
     if (state == last_state_) {
       return;
     }
@@ -5522,6 +6212,29 @@ private:
     std_msgs::msg::String msg;
     msg.data = state;
     state_pub_->publish(msg);
+  }
+
+  void publish_state(const std::string & state)
+  {
+    log_state_line(
+      "follow_state", state, last_logged_state_, last_state_log_time_, kStateHoldRelogSec);
+    publish_state_topic_only(state);
+  }
+
+  // The visual controller's own classification.  Own log channel; topic content unchanged.
+  void publish_visual_state(const std::string & state)
+  {
+    log_state_line(
+      "follow_visual", state, last_visual_logged_, last_visual_log_time_, kSideHoldRelogSec);
+    publish_state_topic_only(state);
+  }
+
+  // The motion-gate heartbeat.  Own log channel; topic content unchanged.
+  void publish_gate_state(const std::string & state)
+  {
+    log_state_line(
+      "follow_gate", state, last_gate_logged_, last_gate_log_time_, kSideHoldRelogSec);
+    publish_state_topic_only(state);
   }
 
   std::string nav_action_name_;
@@ -5557,6 +6270,15 @@ private:
   double goal_yaw_tolerance_rad_;
   double lost_timeout_s_;
   double body_invalid_grace_s_;
+  // 2026-10-08 (operator): how long a stale body observation may keep authorising motion.
+  // Past this the follower publishes zero instead of driving on cached geometry.  Live-tunable
+  // (ros2 param set /body_nav2_follower body_loss_zero_grace_s <s>) because it trades residual
+  // blind travel against chatter on short perception blinks.
+  double body_loss_zero_grace_s_{0.30};
+  // 2026-10-09 (fix A): separate, shorter grace while the last command was forward.
+  double body_loss_forward_grace_s_{0.10};
+  // 2026-10-09 (A2 v2): the grace used while the last command was reverse.
+  double body_loss_reverse_grace_s_{0.45};
   double max_depth_jump_mm_{800.0};
   int depth_jump_confirm_samples_{3};
   double last_accepted_body_depth_mm_{0.0};
@@ -5598,6 +6320,10 @@ private:
   double visual_clear_takeover_side_clearance_m_;
   double visual_clear_takeover_min_avoidance_s_;
   double visual_clear_takeover_body_max_age_s_;
+  // 2026-10-08 (operator criterion): handback depth limit -- control returns to visual direct
+  // following only while the person is CLOSER than this (default 1.38 m).  <= 0 falls back to
+  // follow - hold_band + extra.
+  double takeover_person_depth_min_m_{1.38};
   // ---- B2' state (all switchable through the parameters declared above) ----
   bool takeover_hysteresis_enabled_{true};
   double visual_clear_takeover_front_exit_m_{0.55};
@@ -5669,7 +6395,23 @@ private:
   // 2026-09-15 hardening of the human-approach retreat (see control_loop)
   double human_retreat_min_valid_m_{0.60};        // depths below this are unusable
   double human_retreat_hard_close_m_{0.90};       // clearly-close: immediate reverse
+  // 2026-10-07: minimum-safety-distance fallback for the avoidance phase (see ctor).
+  double retreat_avoid_priority_trigger_m_{1.0};
+  bool retreat_avoid_priority_enabled_{true};
+  int retreat_avoid_confirm_frames_{3};
+  int retreat_avoid_confirm_count_{0};
+  // 2026-10-08 (operator design / Q4): true while the avoidance floor must keep owning the
+  // tick even after the obstacle leaves the band, until the person clears the avoidance
+  // release band.  Prevents a handback to visual control from being undone immediately by
+  // the 1.38 m follow trigger.
+  bool retreat_held_for_avoidance_{false};
+  // 2026-10-08 (operator choice (a)): true once the hold has been carried across a successful
+  // avoidance handback; the release band then uses the base trigger + hysteresis (1.58 m).
+  bool retreat_hold_post_handback_{false};
   int human_retreat_confirm_frames_{2};           // distinct frames for an ambiguous crossing
+  // 2026-10-07 P0-①/③: forward clamps (see publish_visual_follow_cmd).
+  bool retreat_no_forward_{true};
+  double visual_forward_obstacle_clearance_m_{0.35};
   double human_retreat_exit_hysteresis_m_{0.20};  // exit band above the trigger
   int human_retreat_confirm_count_{0};
   rclcpp::Time human_retreat_confirm_body_time_{0, 0, RCL_ROS_TIME};
@@ -5677,7 +6419,18 @@ private:
   bool avoid_goal_protect_enabled_{true};
   int avoid_goal_protect_stall_ticks_{15};
   double avoid_goal_protect_progress_m_{0.03};
-  double avoid_goal_protect_clear_grace_s_{1.2};
+  double avoid_goal_protect_clear_grace_s_{0.5};
+  bool avoid_clear_grace_restart_on_gate_loss_{true};
+  // 2026-10-07 (P0-a): an avoidance aborted by the safety-floor retreat is remembered here
+  // so it can be re-issued when the retreat releases.
+  bool avoid_abort_pending_{false};
+  bool avoid_abort_intent_only_{false};
+  bool avoid_abort_is_side_{false};
+  geometry_msgs::msg::PoseStamped avoid_abort_goal_;
+  rclcpp::Time avoid_abort_time_;
+  double avoid_abort_distance_m_{0.0};
+  double avoid_abort_angle_rad_{0.0};
+  double avoid_abort_remembrance_s_{5.0};
   rclcpp::Time avoid_clear_preempt_since_;
   int avoid_diag_goal_protect_clear_preempts_{0};
   bool avoid_protect_have_pose_{false};
@@ -5722,12 +6475,15 @@ private:
   double visual_filter_alpha_;
   double visual_angle_deadband_;
   double visual_distance_deadband_mm_;
+  // 2026-10-09 (plan A): proportional-law steepness, read live every tick.
+  double visual_full_speed_error_m_;
   double visual_max_linear_mps_;
   double visual_max_reverse_mps_{0.0};
   double visual_max_angular_rps_;
   double visual_linear_accel_limit_;
   double visual_reverse_accel_limit_;
   double visual_linear_decel_limit_;
+  double visual_direction_change_limit_mps2_;
   double visual_angular_accel_limit_;
   double camera_offset_x_m_;
   double camera_offset_y_m_;
@@ -5766,6 +6522,11 @@ private:
   double visual_takeover_body_stale_timeout_s_;
   int64_t visual_takeover_body_stale_since_ns_{0};
   rclcpp::Time last_state_log_time_{0, 0, RCL_ROS_TIME};
+  // 2026-10-09: independent change detection for the two side log channels.
+  std::string last_visual_logged_;
+  rclcpp::Time last_visual_log_time_{0, 0, RCL_ROS_TIME};
+  std::string last_gate_logged_;
+  rclcpp::Time last_gate_log_time_{0, 0, RCL_ROS_TIME};
 
   bodyreader_msg::msg::Bodyposture latest_body_;
   bodyreader_msg::msg::Bodyposture latest_dual_presence_body_;
@@ -5898,6 +6659,9 @@ private:
   double last_visual_error_distance_;
   sensor_msgs::msg::LaserScan last_scan_;
   geometry_msgs::msg::Twist last_direct_cmd_;
+  // 2026-10-09: observable slew state (logging only).
+  double last_slew_limit_mps2_{0.0};
+  int last_slew_mode_{0};   // 0 = decel, 1 = accel, 2 = direction change through zero
   geometry_msgs::msg::Twist last_observed_cmd_;
   geometry_msgs::msg::PointStamped calibration_reference_map_;
   geometry_msgs::msg::PoseStamped last_person_map_pose_;

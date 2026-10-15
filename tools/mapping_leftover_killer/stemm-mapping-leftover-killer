@@ -80,7 +80,17 @@ fi
 # 依据：PAT 覆盖 component_container_isolated 与 amcl_odom_limiter，
 # 而独立导航栈使用的正是这两个同名进程，会被误判为“建图残留”。
 if pgrep -f "$NAV_LAUNCH_PAT" >/dev/null 2>&1; then
-  echo "$(date -Is) independent navigation launch is running - skipping mapping-leftover kill" >> "$LOG"
+  # 2026-10-09: name WHICH launch matched.  bodyfollow_nav2.launch.py belongs to the
+  # permanently-running bodyfollow-nav2.service, so this branch almost always means "the follow
+  # stack is up" rather than "navigation is running"; the old wording sent the reader looking for
+  # a navigation stack that was not there.  The guard condition itself is UNCHANGED -- the two
+  # extra pgrep calls only build the message.
+  nav_why=""
+  pgrep -f 'ros2 launch wheeltec_nav2 wheeltec_nav2.launch.py' >/dev/null 2>&1 \
+    && nav_why="wheeltec_nav2(navigation)"
+  pgrep -f 'ros2 launch bodyreader bodyfollow_nav2.launch.py' >/dev/null 2>&1 \
+    && nav_why="${nav_why:+$nav_why+}bodyfollow_nav2(follow,always-on)"
+  echo "$(date -Is) guard A: independent launch running [${nav_why:-unknown}] - skipping mapping-leftover kill (expected while bodyfollow-nav2.service is up)" >> "$LOG"
   exit 0
 fi
 

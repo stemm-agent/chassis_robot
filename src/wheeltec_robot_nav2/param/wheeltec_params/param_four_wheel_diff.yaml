@@ -130,23 +130,24 @@ controller_server:
       batch_size: 600   #2026-10-07: 1000->600（单周期 48x600x2=57.6k 轨迹，消除控制环掉频与首周期优化失败）
       vx_std: 0.2       #Vx 的抽样标准差
       vy_std: 0.2       #Vy 的抽样标准差
-      wz_std: 0.3       #Wz（角速度）的抽样标准差
+      wz_std: 0.35      #Wz（角速度）的抽样标准差  # 2026-10-07 平滑第1批: 0.3->0.35
       vx_max: 0.5       #目标最大前进速度（米/秒）
       vx_min: 0.0      #目标最大反向速度（米/秒）
       vy_max: 0.5       #如果使用Omni运动模型，目标最大横向速度（m/s）
       wz_max: 2.0       #最大旋转速度（弧度/秒）
-      ax_max: 1.5
+      ax_max: 1.5       # 注意: MPPI 未声明该参数（ros2 param list 无此项），实际不生效
       ax_min: -1.5
       ay_max: 0.0
-      az_max: 1.5
+      az_max: 1.5       # 注意: MPPI 未声明该参数，实际不生效
       iteration_count: 2 #2026-10-06: 1->2（提高优化质量，减少优化失败）
       prune_distance: 1.5 #路径上距离机器人最近点的距离（米）
       enforce_path_inversion: false
       transform_tolerance: 1.0
-      temperature: 0.3 #根据成本选择轨迹，0表示使用成本最佳的控制，巨大的值将导致仅取所有轨迹的平均值而不考虑成本。
-      gamma: 0.015 #平滑度（高）和低能耗（低）之间的权衡,保持默认值
+      temperature: 0.3 #根据成本选择轨迹，0表示使用成本最佳的控制，巨大的值将导致仅取所有轨迹的平均值而不考虑成本。  # 2026-10-07 回退: 0.5->0.3（平滑第1批引入，实测导致原地旋转占比 15%->38%）
+      gamma: 0.015 #平滑度（高）和低能耗（低）之间的权衡  # 2026-10-07 回退: 0.02->0.015
       motion_model: "DiffDrive" #用于轨迹规划的所需运动模型。选项包括DiffDrive、Omni或Ackermann。
       visualize: false #是否发布调试轨迹以供可视化。
+      reset_period: 4.0
       TrajectoryVisualizer: #轨迹可视化
         trajectory_step: 5 #轨迹之间的步骤可视化以对候选轨迹池进行下采样
         time_step: 3 #轨迹上点之间的步骤可视化以降低轨迹密度的采样

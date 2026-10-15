@@ -109,6 +109,87 @@ class VoiceNavigationHealthContractTest(unittest.TestCase):
         self.assertIn('self.base_max_linear_speed * dt', discontinuity)
         self.assertIn('self.base_max_angular_speed * dt', discontinuity)
 
+    def test_seed_accept_timeout_gives_amcl_time_to_converge(self):
+        """2026-10-12 N-4a: AMCL 播种接受超时必须给激光匹配留够收敛时间。
+
+        原值 3.0s：同一场会话里 1.3s 收敛成功、6.7s 未收敛都出现过。
+        一旦超时即以 sticky 的 refused 发布，bridge 随即扣住自动拉起导航栈，
+        而 bridge 的重试入口要求会话仍在跑（会话往往已 closed）——
+        结果导航栈一直起不来（2026-10-12 14:41 实测）。
+        """
+        import re
+
+        source = read_source(BRIDGE_PATH)
+        m = re.search(
+            r"declare_parameter\('seed_accept_timeout_s',\s*([0-9.]+)\)",
+            source)
+        self.assertIsNotNone(m, '未找到 seed_accept_timeout_s 声明')
+        timeout_s = float(m.group(1))
+        self.assertGreaterEqual(
+            timeout_s, 8.0,
+            '播种接受超时仅 %.1fs，对 AMCL 激光匹配收敛太紧' % timeout_s)
+        self.assertLessEqual(
+            timeout_s, 30.0,
+            '播种接受超时 %.1fs 过长，会明显拖慢返航后的导航恢复' % timeout_s)
+
+        # 收敛判据不得被放宽（否则等于牺牲定位正确性）
+        m2 = re.search(
+            r"declare_parameter\('seed_accept_max_error_m',\s*([0-9.]+)\)",
+            source)
+        self.assertIsNotNone(m2, '未找到 seed_accept_max_error_m 声明')
+        self.assertLessEqual(float(m2.group(1)), 0.50 + 1e-9,
+                             '收敛判据被放宽，等于牺牲定位正确性')
+
+        # sticky 拒绝语义与全局定位补救路径必须保留
+        self.assertIn("'refused', 'seed_acceptance_timeout'", source)
+        self.assertIn('sticky=True', source)
+        self.assertIn('_request_global_localization()', source)
+
+    def test_seed_dock_evidence_stops_applying_when_far_from_dock(self):
+        """2026-10-12 N-4b: 离桩超过阈值后，桩证据不得再否决播种。
+
+        实测 15:15：auto-nav 已正确拉起 wheeltec_nav2（amcl/map_server/limiter
+        都在跑），但 voice_recharge_bridge 以
+          'dock/charging evidence says the robot is on the charger
+           (within 0.97m of the recharge point) but the candidate seed
+           (-1.01, 0.70) is 1.23m away'
+        拒绝播种，导航栈永久停在 starting（AMCL 无初值 -> 无 map->odom）。
+
+        该判据的 limit = seed_dock_max_distance_m + max(dock_offset_distance_m,
+        undock_min_travel_m) 只覆盖"机器人还贴在桩上"；离桩 1m 以上时桩证据
+        本就不适用（建图后返航回原点的场景很常见）。
+        """
+        import re
+
+        text = read_source(BRIDGE_PATH)
+        m = re.search(
+            r"declare_parameter\('seed_dock_evidence_max_away_m',\s*([0-9.]+)\)",
+            text)
+        self.assertIsNotNone(m, '未找到 seed_dock_evidence_max_away_m 声明')
+        away_m = float(m.group(1))
+        self.assertGreaterEqual(
+            away_m, 1.5,
+            '离桩阈值仅 %.1fm，仍会误否决正常的播种候选' % away_m)
+        self.assertLessEqual(
+            away_m, 10.0,
+            '离桩阈值 %.1fm 过大，等于放弃桩一致性检查' % away_m)
+
+        # 阈值内必须保留原判据与原文案（不得顺手删掉）
+        self.assertIn('if away <= self.seed_dock_evidence_max_away_m:', text)
+        self.assertIn('dock/charging evidence says the robot is on the ', text)
+        self.assertIn('within %.2fm of the recharge point', text)
+
+        # undock_min_travel_m 必须保持原值：它同时是脱桩检测门限（688 行）
+        # 与 dock→origin 行程还原判据（1243 行），抬高副作用更大。
+        m2 = re.search(
+            r"declare_parameter\('undock_min_travel_m',\s*([0-9.]+)\)", text)
+        self.assertIsNotNone(m2, '未找到 undock_min_travel_m 声明')
+        self.assertLessEqual(
+            float(m2.group(1)), 0.20 + 1e-9,
+            'undock_min_travel_m 被抬高到 %s，会破坏脱桩检测与行程还原'
+            % m2.group(1))
+
+
     def test_timeout_reports_blockers_and_failure_feedback(self):
         source = method_source(
             MONITOR_PATH, 'Nav2StartFeedbackMonitor', '_check_nav2')

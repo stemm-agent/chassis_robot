@@ -41,6 +41,8 @@ setup(
             'stemm_cartographer_exploration.state_saver:main',
             'stemm_cartographer_session_runner = '
             'stemm_cartographer_exploration.session_runner:main',
+            'stemm_cartographer_escape_controller = '
+            'stemm_cartographer_exploration.escape_controller:main',
         ],
     },
 )

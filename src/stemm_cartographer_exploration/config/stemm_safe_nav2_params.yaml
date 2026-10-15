@@ -103,7 +103,15 @@ behavior_server:
     global_frame: map
     robot_base_frame: base_footprint
     transform_tolerance: 0.5
-    simulate_ahead_time: 2.0
+    # 2026-10-12 N-10b：Spin 的前瞻扫掠从 0.6rad(34°) 降到 0.15rad(8.6°)。
+    # spin.cpp 模拟 cycle_frequency(10) * simulate_ahead_time(2.0) = 20 步、
+    # 每步 0.1rad，任一位姿 footprint 代价 >= 254 即 "Collision Ahead"。
+    # 实测 16:26 轮自转恢复 5/5 失败，而 BT 恢复树里只有 Spin 能改变位姿
+    # （后向 130° 盲区，刻意不含 BackUp），于是 6 次重试全空转、目标耗满 50s。
+    # 0.5 仍保留"向前看一小段、撞了就停"的安全语义，只是不再因为
+    # "34° 之后可能撞"而否决"转 8.6° 就能脱困"。0.1s 重算一次，
+    # 安全仍由 costmap 实时把关。
+    simulate_ahead_time: 0.5
     max_rotational_vel: 0.3
     min_rotational_vel: 0.05
     rotational_acc_lim: 0.3
@@ -140,6 +148,17 @@ controller_server:
     FollowPath:
       plugin: "nav2_rotation_shim_controller::RotationShimController" # 与通用四轮差速导航一致
       primary_controller: "nav2_mppi_controller::MPPIController"
+      # 2026-10-14 P43：补上 RotationShim 参数（此前完全未配，全走 Nav2 默认值）。
+      # 默认 angular_dist_threshold=0.785(45°) 表示"路径起始航向差 >45° 就先
+      # 原地旋转"，现场表现为"正常行驶中时不时掉头/原地转"。
+      # 实测 2026-10-14：10 次派发里 5 次（50%）转角 >45° -> 触发原地旋转。
+      # 导航侧 2026-10-07 已显式化并放宽到 1.22(70°)、加速度调柔，建图侧漏配
+      # （上面那行注释虽写"与通用四轮差速导航一致"，参数实际并未对齐）。
+      # 放宽后中等转弯交由 MPPI 边走边转；确需掉头（>70°）时仍会旋转。
+      angular_dist_threshold: 1.22      # 45° -> 70°：只在必须掉头时才原地转
+      max_angular_accel: 2.4            # 3.2 -> 2.4：确需旋转时更柔和
+      simulate_ahead_time: 1.0          # 旋转前碰撞仿真时长
+      forward_sampling_distance: 0.5    # 路径采样前瞻距离
       time_steps: 56    #候选轨迹中的时间步长（点）数
       model_dt: 0.1    #每个时间步长的时间步长的长度dt（以秒为单位）是预测范围
       batch_size: 1000  #通用四轮差速导航已验证的候选轨迹数
@@ -192,7 +211,9 @@ controller_server:
         critical_weight: 30.0
         consider_footprint: false
         collision_cost: 10000.0 #应用于轨迹中真实碰撞的成本。
-        collision_margin_distance: 0.1
+        collision_margin_distance: 0.42   # 2026-10-14 W3: 0.1 -> 0.42
+        # 依据：dist_to_obj = (障碍距车心) - inscribed(0.18)；原 0.1 相当于"车头壳沿余量 -0.36 m"，从不生效。
+        # 0.42 ⇒ 车头壳沿（前伸 0.32 m）保留约 0.28 m 余量。
         near_goal_distance: 0.4
         cost_scaling_factor: 5.0
         inflation_radius: 0.15
@@ -246,16 +267,34 @@ local_costmap:
       transform_tolerance: 1.0
       use_sim_time: False  #仿真时间
       rolling_window: true #成本地图是否应随机器人基座框架滚动
-      width: 3             #代价地图的宽度（m）
-      height: 3            #代价地图的高度（m）
+      # 2026-10-13 P15-A：3 -> 6。
+      # 实测 15:01 轮：车外接半径 0.469 + inflation_radius 0.55 = 1.019 m，
+      # 而 3x3 m 网格里车心到边缘仅 1.50 m、"干净"(未膨胀)半径约 1.03 m，
+      # 于是规划器 failed to generate a valid path 23 次、
+      # exceeded maximum iterations 14 次，Spin 前瞻扫掠也总碰到 253/254
+      # 而 Collision Ahead 立即失败（Pose Goes Off Grid 7 次）。
+      # 扩到 6x6 m 后干净半径约 2.53 m，规划与自转均有余量；
+      # 本改动不动任何安全边界（膨胀半径/门禁/限速）。
+      width: 6             #代价地图的宽度（m）
+      height: 6            #代价地图的高度（m）
+      # 6 m / 0.05 = 120 格（原 60 格），格数 3600 -> 14400，
+      # update 5Hz / publish 2Hz 下开销线性增长，仍很轻。
       resolution: 0.05     #代价地图1像素的分辨率，以米为单位
       #robot_radius: 0.20   #机器人半径，如果未提供足迹坐标，则使用机器人半径。
-      footprint: "[[-0.335, -0.328], [-0.335, 0.328], [0.335, 0.328], [0.335, -0.328]]"
+      footprint: "[[-0.18, -0.20], [-0.18, 0.20], [0.32, 0.20], [0.32, -0.20]]"  # 2026-10-14: 0.67x0.656 -> 0.50x0.40（原值错抄 flagship 型号，内切半径虚大 0.128m）
       plugins: ["obstacle_layer","inflation_layer"] #2D雷达场景使用障碍层，减少体素层CPU开销
       inflation_layer:                             #膨胀层参数
         plugin: "nav2_costmap_2d::InflationLayer"  #膨胀层插件。
         cost_scaling_factor: 3.0                   #与已验证四轮底盘一致
-        inflation_radius: 0.55                     #与已验证四轮底盘一致
+        # 2026-10-13 P17-B'：0.55 -> 0.45。
+        # 实测 15:13 开局段：车在原点卡死 50s（目标未达），front blocked
+        # 0.45~0.54m、footprint_cost 反复 253、Spin 一碰膨胀层就 Collision
+        # Ahead、controller Failed to make progress。
+        # 几何根因：车外接 0.469 + 0.55 = 1.019m 死区，而实测通道仅 0.72~0.81m。
+        # 调 0.45 后：死区 0.778m、最小可通行通道 1.57m（车宽仅 0.656m）。
+        # 注：global_costmap 的 inflation_radius 本来就是 0.4（本次未动），
+        # 因此规划器判据完全不变，仅放宽局部控制/自转的可用空间。
+        inflation_radius: 0.45                     # 2026-10-13 P17 由 0.55 下调
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"   #2D障碍层插件，比VoxelLayer更轻量。
         enabled: True
@@ -289,7 +328,7 @@ global_costmap:
       transform_tolerance: 1.0
       use_sim_time: False               #仿真时间
       #robot_radius: 0.20                #机器人半径
-      footprint: "[[-0.335, -0.328], [-0.335, 0.328], [0.335, 0.328], [0.335, -0.328]]"
+      footprint: "[[-0.18, -0.20], [-0.18, 0.20], [0.32, 0.20], [0.32, -0.20]]"  # 2026-10-14: 0.67x0.656 -> 0.50x0.40（原值错抄 flagship 型号，内切半径虚大 0.128m）
       resolution: 0.05                  #全局地图1像素的分辨率，以米为单位
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"] #全局代价地图只跟随SLAM地图，避免长期建图时重复处理/scan导致TF队列刷屏
@@ -358,7 +397,11 @@ planner_server: #规划器服务器参数
       allow_unknown: true                 # frontier exploration needs plans that can bridge into unknown edges
       max_iterations: 1000000             # maximum total iterations to search for before failing (in case unreachable), set to -1 to disable
       max_on_approach_iterations: 1000    # maximum number of iterations to attempt to reach goal once in tolerance, 2D only
-      max_planning_time: 5.0              # max time in s for planner to plan, smooth, and upsample. Will scale maximum smoothing and upsampling times based on remaining time after planning.
+      # 2026-10-10 (operator): 5.0 -> 10.0。实测 13 次
+      # 'exceeded maximum iterations'（用光 100 万次迭代仍未搜完），
+      # 集中在同一目标上连续 8 次、历时 19 秒，当时距目标仅 1.99m、
+      # 前方余量 1.09m。给搜索更多时间以降低该形态的失败率。
+      max_planning_time: 10.0
       motion_model_for_search: "DUBIN"         # 全局路径保持前向搜索，短退只交给控制器/恢复动作
       cost_travel_multiplier: 2.0         # 与已验证四轮导航一致，提高高代价路径惩罚。
       angle_quantization_bins: 72         # For Hybrid/Lattice nodes: Number of angle bins for search, must be 1 for 2D node (no angle search)

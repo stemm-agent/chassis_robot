@@ -15,7 +15,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped, Twist
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from rclpy.action import ActionClient
@@ -101,8 +101,20 @@ class StemmNav2Manager(Node):
         self.failed_goals = []
         self.blocked_places = []
         self.failed_goal_ttl = 90.0   # 2026-09-29 conservative: 240 s outlived a 6-10 min exploration session, so a region could not be retried after the map improved
-        self.failed_goal_radius = 1.5
-        self.blocked_place_radius = 1.5
+        # 2026-10-10 (operator): 1.5 -> 0.8。原值 1.5m 的排斥半径会
+        # 在规划失败时把机器人自身周围一大片区域拉黑（实测累积到 4 个点、
+        # 同期 33 次 'no selectable frontier'），形成"失败 -> 拉黑自己 ->
+        # 可选目标变少 -> 更难规划"的恶性循环。收紧后按更小的排斥圈记忆。
+        # 声明为参数便于热调与回退。
+        # 2026-10-10: 一度收紧为 0.8 以打破"失败->拉黑自己"的循环，
+        # 但实测把"拉黑后换目标"变成了"原地反复重试同一坏目标"
+        # （规划失败由 20 次涨到 102 次），故回退为 1.5，保留参数化。
+        self.declare_parameter('failed_goal_radius', 1.5)
+        self.declare_parameter('blocked_place_radius', 1.5)
+        self.failed_goal_radius = max(
+            0.1, float(self.get_parameter('failed_goal_radius').value))
+        self.blocked_place_radius = max(
+            0.1, float(self.get_parameter('blocked_place_radius').value))
         self.no_progress_timeout = 12.0
         self.no_progress_distance = 0.03
         self.no_progress_yaw = 0.12
@@ -161,6 +173,44 @@ class StemmNav2Manager(Node):
         self.tf_buffer = Buffer(cache_time=Duration(seconds=30))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.nav_client = ActionClient(self, NavigateToPose, self.navigate_action)
+        # 2026-10-12 A：兜底候选派发前用规划器本身验证一次路径。
+        # 代理判据（BFS + costmap 阈值）已被证明会漏：实测两轮 N-9/N-11
+        # 拒发均为 0，却各有大量 no valid path found / exceeded maximum iterations。
+        self.declare_parameter('explore_prevalidate_planner', True)
+        self.declare_parameter('explore_prevalidate_planner_id', 'GridBased')
+        self.declare_parameter('explore_prevalidate_timeout_sec', 6.0)
+        self.explore_prevalidate_planner = bool(
+            self.get_parameter('explore_prevalidate_planner').value)
+        self.explore_prevalidate_planner_id = str(
+            self.get_parameter('explore_prevalidate_planner_id').value)
+        self.explore_prevalidate_timeout_sec = max(
+            0.5, float(self.get_parameter(
+                'explore_prevalidate_timeout_sec').value))
+        self._planner_client = None
+        self._prevalidate_future = None
+        self._prevalidate_result_future = None
+        self._prevalidate_phase = 'idle'
+        self._prevalidate_started_at = 0.0
+        self._prevalidate_candidate = None
+        self._prevalidate_rejected = {}
+        self._prevalidate_index = 0
+        self._fallback_candidate_order = []
+        self._fallback_candidate_pose = (0.0, 0.0)
+        if self.explore_prevalidate_planner:
+            try:
+                self._planner_client = ActionClient(
+                    self, ComputePathToPose, 'compute_path_to_pose')
+                self.get_logger().info(
+                    'exploration goals are planner-validated before '
+                    "dispatch: compute_path_to_pose (planner_id='%s', "
+                    'timeout=%.1fs)'
+                    % (self.explore_prevalidate_planner_id,
+                       self.explore_prevalidate_timeout_sec))
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(
+                    'planner pre-validation unavailable (%s); '
+                    'dispatching candidates without it' % exc)
+                self.explore_prevalidate_planner = False
         for node_name in self.nav_lifecycle_nodes:
             self.nav_lifecycle_clients[node_name] = self.create_client(GetState, f'{node_name}/get_state')
             self.nav_lifecycle_futures[node_name] = None
@@ -193,6 +243,18 @@ class StemmNav2Manager(Node):
         self.last_map_time = time.monotonic()
         self.last_map = msg
         self.last_map_info = msg.info
+        # 2026-10-10: 记录静态层实际收到的地图尺寸/原点，用于核对
+        # map_server 加载的是不是本轮建图产物（证据项）。
+        try:
+            _info = msg.info
+            self._loaded_map_signature = (
+                int(_info.width), int(_info.height),
+                round(float(_info.resolution), 6),
+                round(float(_info.origin.position.x), 4),
+                round(float(_info.origin.position.y), 4),
+            )
+        except Exception:  # noqa: BLE001 - 诊断字段绝不能影响建图
+            pass
 
     def scan_callback(self, msg):
         front_ranges = []
@@ -1078,19 +1140,79 @@ class StemmNav2Manager(Node):
         if goal is None:
             # Fallback: if all frontiers blocked, pick a random free cell 2-4m away
             # to move the robot and discover new frontiers from a fresh vantage
+            # 2026-10-12 A：兜底候选先问规划器，再派发。
+            # 实测这些候选中相当一部分"规划不出来"，每个要耗满 50s 硬上限
+            # （17:34 轮 30 次派发仅 4 次到达）。
+            if (getattr(self, 'explore_prevalidate_planner', False)
+                    and self._prevalidate_planner_available()):
+                verdict = self._prevalidate_poll()
+                if verdict == 'ok':
+                    cand = getattr(self, '_prevalidate_candidate', None)
+                    self._prevalidate_candidate = None
+                    if cand is not None:
+                        fallback = self._fallback_goal_for(cand[0], cand[1])
+                        if fallback is not None:
+                            self.get_logger().info(
+                                'planner-validated fallback goal: '
+                                f'{fallback.pose.position.x:.2f}, '
+                                f'{fallback.pose.position.y:.2f}')
+                            self.send_nav_goal(fallback, validate_map=True)
+                            return
+                elif verdict == 'rejected':
+                    cand = getattr(self, '_prevalidate_candidate', None)
+                    if cand is not None:
+                        self._prevalidate_remember(cand[0], cand[1])
+                        self.get_logger().warn(
+                            'fallback candidate (%.2f, %.2f) has no planner '
+                            'path; skipped (not dispatched)'
+                            % (cand[0], cand[1]))
+                    self._prevalidate_candidate = None
+                    if self._prevalidate_dispatch_next():
+                        return
+                    self._prevalidate_index = 0
+                # 正在验证中：本拍先不动，下一拍拿结论
+                if getattr(self, '_prevalidate_phase', 'idle') != 'idle':
+                    return
+                # 空闲：挑一个未被否决的候选开始验证
+                if self._prevalidate_dispatch_next():
+                    return
+                self._prevalidate_index = 0
             fallback = self._pick_fallback_goal()
             if fallback is not None:
                 self.get_logger().info(
                     f'no frontiers available; fallback goal: {fallback.pose.position.x:.2f}, {fallback.pose.position.y:.2f}')
                 self.send_nav_goal(fallback, validate_map=True)
                 return
+            # 2026-10-10: 没有前沿点、也没有 fallback 时必须显式停车。
+            # 原实现只是把状态置为 waiting_for_frontier 就 return，机器人会带着
+            # 上一条速度指令继续跑（实测 09:55:25-09:55:36 约 7 秒的原地兜转）。
+            # 同函数上方的 front_blocked 分支本来就是停车的，这里补齐。
+            self.publish_zero_velocity()
             self.mode = 'mapping'
             self.navigation_state = 'waiting_for_frontier'
+            self._log_frontier_idle()
             return
 
         self.get_logger().info(
             f'auto exploration goal: {goal.pose.position.x:.2f}, {goal.pose.position.y:.2f}')
         self.send_nav_goal(goal, validate_map=True)
+
+    def _log_frontier_idle(self):
+        """Throttled notice: no frontier and no fallback, so the robot holds still.
+
+        2026-10-10: 之前这条路是静默的（只改状态就 return），既掩盖了停车缺失，
+        也让"探索是否已收敛"无从判断。这里按 5s 节流打一条，便于统计该状态
+        真实持续多久。
+        """
+        now = time.monotonic()
+        if now - getattr(self, '_frontier_idle_logged_at', 0.0) < 5.0:
+            return
+        self._frontier_idle_logged_at = now
+        self.get_logger().warn(
+            'no frontier and no fallback goal: holding position '
+            '(front=%.2fm, map %s)'
+            % (-1.0 if self.front_min_range is None else float(self.front_min_range),
+               'present' if self.last_map is not None else 'missing'))
 
     def select_frontier_goal(self):
         if self.last_map is None:
@@ -1198,6 +1320,143 @@ class StemmNav2Manager(Node):
         goal.pose.orientation.z = math.sin(yaw * 0.5)
         goal.pose.orientation.w = math.cos(yaw * 0.5)
         return goal
+
+    # ==== 2026-10-12 A：派发前用规划器验证路径（非阻塞三拍状态机） ====
+    def _prevalidate_map_signature(self):
+        try:
+            info = self.last_map.info
+            return (int(info.width), int(info.height),
+                    int(float(info.resolution) * 1e6))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _prevalidate_planner_available(self):
+        client = getattr(self, '_planner_client', None)
+        if client is None:
+            return False
+        try:
+            return bool(client.server_is_ready())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _fallback_goal_for(self, x, y):
+        """按已验证的坐标重建目标（朝向取到该点的方位）。"""
+        try:
+            pose = self._fallback_candidate_pose
+            bearing = math.atan2(float(y) - pose[1], float(x) - pose[0])
+        except Exception:  # noqa: BLE001
+            bearing = 0.0
+        return self.make_pose_goal(float(x), float(y), bearing)
+
+    def _prevalidate_remember(self, x, y):
+        self._prevalidate_rejected[
+            (self._prevalidate_map_signature(), round(float(x), 2),
+             round(float(y), 2))] = time.monotonic()
+
+    def _prevalidate_was_rejected(self, x, y):
+        return (self._prevalidate_map_signature(), round(float(x), 2),
+                round(float(y), 2)) in self._prevalidate_rejected
+
+    def _prevalidate_reset(self):
+        self._prevalidate_future = None
+        self._prevalidate_result_future = None
+        self._prevalidate_phase = 'idle'
+        self._prevalidate_candidate = None
+
+    def _prevalidate_dispatch_next(self):
+        """挑下一个未被否决的候选并发起验证。返回 True 表示已发出。"""
+        order = getattr(self, '_fallback_candidate_order', None) or []
+        if not order:
+            return False
+        start = int(getattr(self, '_prevalidate_index', 0))
+        for i in range(start, min(start + 60, len(order))):
+            x, y = order[i]
+            if self._prevalidate_was_rejected(x, y):
+                continue
+            self._prevalidate_index = i + 1
+            self._prevalidate_candidate = (float(x), float(y))
+            self._prevalidate_started_at = time.monotonic()
+            self._prevalidate_phase = 'accept'
+            client = self._planner_client
+            goal = ComputePathToPose.Goal()
+            goal.goal.header.frame_id = 'map'
+            current = self.update_pose()
+            if current is not None:
+                goal.goal.header.stamp = current.header.stamp
+            goal.goal.pose.position.x = float(x)
+            goal.goal.pose.position.y = float(y)
+            goal.goal.pose.orientation.w = 1.0
+            goal.use_start = False
+            goal.planner_id = self.explore_prevalidate_planner_id
+            try:
+                self._prevalidate_future = client.send_goal_async(goal)
+            except Exception as exc:  # noqa: BLE001
+                # fail-open：验证发不出去就直接放行该候选
+                self._log_recovery_event(
+                    'prevalidate_send_failed',
+                    'planner pre-validation could not be sent (%s); '
+                    'dispatching the candidate without it' % exc)
+                self._prevalidate_reset()
+                return False
+            return True
+        return False
+
+    def _prevalidate_poll(self):
+        """非阻塞轮询。返回 'ok' / 'rejected' / None（无结论或 fail-open）。
+
+        ★ 三拍状态机，每拍只查 done()，绝不调用会阻塞的 result()：
+           accept 拍：future.done() → result() 得 goal_handle
+                      rejected ⇒ 'rejected'；accepted ⇒ 发 get_result_async()
+           result 拍：result_future.done() → result() 得 path
+                      path.poses 非空 ⇒ 'ok'；空/异常 ⇒ 'rejected'
+        """
+        phase = getattr(self, '_prevalidate_phase', 'idle')
+        if phase == 'idle':
+            return None
+        if (time.monotonic() - getattr(self, '_prevalidate_started_at', 0.0)
+                > self.explore_prevalidate_timeout_sec):
+            self.get_logger().warn(
+                'planner pre-validation timed out after %.1fs; dispatching '
+                'the candidate anyway'
+                % self.explore_prevalidate_timeout_sec,
+                throttle_duration_sec=10.0)
+            self._prevalidate_reset()
+            return None
+        if phase == 'accept':
+            future = self._prevalidate_future
+            if future is None or not future.done():
+                return None
+            self._prevalidate_future = None
+            try:
+                goal_handle = future.result()
+            except Exception:  # noqa: BLE001
+                self._prevalidate_reset()
+                return None
+            if goal_handle is None or not getattr(goal_handle, 'accepted', False):
+                self._prevalidate_phase = 'idle'
+                return 'rejected'
+            try:
+                self._prevalidate_result_future = goal_handle.get_result_async()
+            except Exception:  # noqa: BLE001
+                self._prevalidate_reset()
+                return None
+            self._prevalidate_phase = 'result'
+            return None
+        if phase == 'result':
+            future = self._prevalidate_result_future
+            if future is None or not future.done():
+                return None
+            self._prevalidate_result_future = None
+            self._prevalidate_phase = 'idle'
+            try:
+                wrapped = future.result()
+            except Exception:  # noqa: BLE001
+                return None
+            result = getattr(wrapped, 'result', None)
+            path = getattr(result, 'path', None)
+            poses = getattr(path, 'poses', None) if path is not None else None
+            return 'ok' if poses else 'rejected'
+        return None
 
     def _pick_fallback_goal(self):
         """When all frontiers are blocked, pick a random free cell farther away
@@ -1631,7 +1890,23 @@ class StemmNav2Manager(Node):
         }
 
     def publish_zero_velocity(self):
-        self.cmd_vel_pub.publish(Twist())
+        """Best-effort stop; never let a torn-down context kill the process.
+
+        2026-10-13: during SIGINT teardown the node still commands a stop,
+        but rclpy may have invalidated this publisher's context already.
+        publish() then raises
+            RCLError: Failed to publish: publisher's context is invalid
+        which escaped main()'s finally block and turned a *successful*
+        return-home (position error 0.243 m) into `exit code 1`; the
+        session runner treats any code outside (-2, 130) as a failed
+        session.  rclpy.ok() is NOT sufficient here -- it reflects the
+        global context, while a publisher's own context can be invalid
+        independently.  A stop command is best-effort by nature.
+        """
+        try:
+            self.cmd_vel_pub.publish(Twist())
+        except Exception:  # noqa: BLE001 - best-effort stop, never fatal
+            pass
 
     def _kill_rrt_nodes(self):
         """Kill RRT exploration nodes to free CPU for smooth Nav2 return-home.

@@ -216,6 +216,28 @@ class TorsoCpuDemoNode(Node):
         self._diag_active_since = 0.0
         self._diag_last_publish = 0.0
         self._diag_window = []
+        # 2026-10-09 (operator): false-positive / score-distribution counters.  Purely additive:
+        # they answer "how much signal is left below confidence_threshold" and "how many boxes per
+        # frame are we now accepting", neither of which the locked-track-only diagnostics could.
+        self._diag_det_buckets = {"0": 0, "1": 0, "2": 0, ">=3": 0}
+        self._diag_score_buckets = {
+            "<0.10": 0, "0.10-0.20": 0, "0.20-0.30": 0,
+            "0.30-0.40": 0, "0.40-0.50": 0,
+            # split above 0.50 because the relaxed relock path demands score >= 0.60
+            "0.50-0.60": 0, "0.60-0.70": 0, "0.70-0.80": 0, ">=0.80": 0,
+        }
+        self._diag_frames_multi_det = 0
+        self._diag_raw_max_current = 0.0
+        self._diag_raw_max_peak = 0.0
+        self._diag_track_max_hits = 0
+        self._diag_track_max_score = 0.0
+        self._diag_stable_present = False
+        self._diag_relax_ready = False
+        self._diag_locked_neg = False
+        self._diag_acq = {"no_track": 0, "max_hits<lock_min_hits": 0,
+                          "lock_min_hits<=max_hits": 0}
+        self._diag_relax_ready_frames = 0
+        self._diag_locked_neg_frames = 0
         self._diag_reason_current = "unknown"
         self._diag_depth_age_ms = None
         self._diag_depth_skew_ms = None
@@ -510,6 +532,19 @@ class TorsoCpuDemoNode(Node):
             visible = self._update_tracks(detections, bgr.shape[1], bgr.shape[0])
             self._apply_pending_lock(visible, bgr.shape[1], bgr.shape[0])
             stable = [track for track in visible if track.hits >= self.lock_min_hits]
+            # 2026-10-09 (operator): lock-ACQUISITION diagnostics.  Item 4b only protects an
+            # EXISTING lock, so it cannot help acquire one.  These five signals discriminate
+            # track churn (max_hits never reaches lock_min_hits) from the relaxed path's own
+            # gates (score >= relock_relax_min_score, or its 5 s delay / _unlocked_since state).
+            self._diag_track_max_hits = max((t.hits for t in visible), default=0)
+            self._diag_stable_present = bool(stable)
+            self._diag_relax_ready = any(
+                t.hits >= self.relock_relax_min_hits
+                and float(t.score) >= self.relock_relax_min_score
+                for t in visible
+            )
+            self._diag_locked_neg = self._locked_track_id < 0
+            self._diag_track_max_score = max((float(t.score) for t in visible), default=0.0)
             if self.auto_lock_center and self._locked_track_id < 0:
                 if stable:
                     self._locked_track_id = self._select_relock(
@@ -605,6 +640,11 @@ class TorsoCpuDemoNode(Node):
 
         # YOLO11 export: xywh + 80 class probabilities.  Person is class 0.
         scores = matrix[:, 4]
+        # 2026-10-09: the highest person score in this frame, measured BEFORE any threshold or
+        # area filtering.  This is what makes the recall question answerable: a frame whose peak
+        # is 0.35 was a real person thrown away by the old 0.50 threshold, while a frame whose
+        # peak is 0.05 simply had nobody in it.
+        self._diag_raw_max_current = float(scores.max()) if scores.size else 0.0
         selected = np.flatnonzero(scores >= self.confidence_threshold)
         if selected.size == 0:
             return []
@@ -660,9 +700,8 @@ class TorsoCpuDemoNode(Node):
         candidates.sort(reverse=True)
         used_tracks = set()
         used_detections = set()
-        for _, track_index, detection_index in candidates:
-            if track_index in used_tracks or detection_index in used_detections:
-                continue
+
+        def _apply_match(track_index, detection_index):
             track = self._tracks[track_index]
             detection = detections[detection_index]
             alpha = self.track_smoothing
@@ -674,6 +713,30 @@ class TorsoCpuDemoNode(Node):
             track.missed = 0
             used_tracks.add(track_index)
             used_detections.add(detection_index)
+
+        # 2026-10-09 (operator): the LOCKED track gets first refusal on its best candidate.
+        # Without this the single global greedy pass can hand the locked track's detection to a
+        # competing box, mark the locked track missed, and make _publish_outputs() report
+        # lock_status=0 for a frame in which the person WAS detected.  Measured 2026-10-09
+        # 10:30:12-10:31:28: 76 of 633 frames (12%) lost the lock while the person was visible.
+        # Only the ordering changes: the same association gate and the same smoothing are used, so
+        # this cannot create a match the gate would have rejected.
+        if self._locked_track_id >= 0:
+            locked_index = None
+            for index, track in enumerate(self._tracks):
+                if track.track_id == self._locked_track_id:
+                    locked_index = index
+                    break
+            if locked_index is not None:
+                for _, track_index, detection_index in candidates:
+                    if track_index == locked_index:
+                        _apply_match(track_index, detection_index)
+                        break
+
+        for _, track_index, detection_index in candidates:
+            if track_index in used_tracks or detection_index in used_detections:
+                continue
+            _apply_match(track_index, detection_index)
 
         for index, track in enumerate(self._tracks):
             if index not in used_tracks:
@@ -1031,6 +1094,25 @@ class TorsoCpuDemoNode(Node):
         self._diag_invalid_since = 0.0
         self._diag_active_since = 0.0
         self._diag_window = []
+        self._diag_det_buckets = {"0": 0, "1": 0, "2": 0, ">=3": 0}
+        self._diag_score_buckets = {
+            "<0.10": 0, "0.10-0.20": 0, "0.20-0.30": 0,
+            "0.30-0.40": 0, "0.40-0.50": 0,
+            # split above 0.50 because the relaxed relock path demands score >= 0.60
+            "0.50-0.60": 0, "0.60-0.70": 0, "0.70-0.80": 0, ">=0.80": 0,
+        }
+        self._diag_frames_multi_det = 0
+        self._diag_raw_max_current = 0.0
+        self._diag_raw_max_peak = 0.0
+        self._diag_track_max_hits = 0
+        self._diag_track_max_score = 0.0
+        self._diag_stable_present = False
+        self._diag_relax_ready = False
+        self._diag_locked_neg = False
+        self._diag_acq = {"no_track": 0, "max_hits<lock_min_hits": 0,
+                          "lock_min_hits<=max_hits": 0}
+        self._diag_relax_ready_frames = 0
+        self._diag_locked_neg_frames = 0
 
     def _diag_note_frame(
         self,
@@ -1074,6 +1156,39 @@ class TorsoCpuDemoNode(Node):
             self._diag_reasons[reason] = self._diag_reasons.get(reason, 0) + 1
             if self._diag_invalid_since <= 0.0:
                 self._diag_invalid_since = now
+        det_bucket = ("0" if detection_count <= 0 else
+                      "1" if detection_count == 1 else
+                      "2" if detection_count == 2 else ">=3")
+        self._diag_det_buckets[det_bucket] = self._diag_det_buckets.get(det_bucket, 0) + 1
+        if detection_count >= 2:
+            self._diag_frames_multi_det += 1
+        peak = float(getattr(self, "_diag_raw_max_current", 0.0) or 0.0)
+        if peak > self._diag_raw_max_peak:
+            self._diag_raw_max_peak = peak
+        score_bucket = ("<0.10" if peak < 0.10 else
+                        "0.10-0.20" if peak < 0.20 else
+                        "0.20-0.30" if peak < 0.30 else
+                        "0.30-0.40" if peak < 0.40 else
+                        "0.40-0.50" if peak < 0.50 else
+                        "0.50-0.60" if peak < 0.60 else
+                        "0.60-0.70" if peak < 0.70 else
+                        "0.70-0.80" if peak < 0.80 else ">=0.80")
+        self._diag_score_buckets[score_bucket] = (
+            self._diag_score_buckets.get(score_bucket, 0) + 1
+        )
+        # lock-acquisition bucket for THIS frame
+        if track_count <= 0:
+            self._diag_acq["no_track"] = self._diag_acq.get("no_track", 0) + 1
+        elif int(getattr(self, "_diag_track_max_hits", 0)) >= self.lock_min_hits:
+            key = "lock_min_hits<=max_hits"
+            self._diag_acq[key] = self._diag_acq.get(key, 0) + 1
+        else:
+            key = "max_hits<lock_min_hits"
+            self._diag_acq[key] = self._diag_acq.get(key, 0) + 1
+        if getattr(self, "_diag_relax_ready", False):
+            self._diag_relax_ready_frames += 1
+        if getattr(self, "_diag_locked_neg", False):
+            self._diag_locked_neg_frames += 1
         self._diag_window.append((now, reason == "ok"))
         cutoff = now - 10.0
         while self._diag_window and self._diag_window[0][0] < cutoff:
@@ -1105,6 +1220,34 @@ class TorsoCpuDemoNode(Node):
                 ),
                 "active_s": round(active_s, 1),
                 "no_detection": self._diag_frames_no_detection,
+                # 2026-10-09 (operator): the two questions the old counters could not answer.
+                # det_per_frame = boxes accepted per frame (false-positive load).
+                # max_score_hist = bucket of the frame's peak person score BEFORE filtering, so
+                # <0.10 means "nobody there" while 0.30-0.50 means "a person the old 0.50
+                # threshold discarded".
+                "det_per_frame": dict(self._diag_det_buckets),
+                "max_score_hist": dict(self._diag_score_buckets),
+                # 2026-10-09 (operator): lock-ACQUISITION counters.  Read them together:
+                #   acq.no_track                         -> no candidate at all
+                #   acq.max_hits<lock_min_hits           -> candidates exist but never reach
+                #                                           lock_min_hits (H1: track churn)
+                #   relax_ready_frames / locked_neg_frames -> H2 (score<0.60 blocks relax) vs
+                #                                           H3 (relax ready but no lock taken)
+                "acq": dict(self._diag_acq),
+                "relax_ready_frames": self._diag_relax_ready_frames,
+                "locked_neg_frames": self._diag_locked_neg_frames,
+                "track_max_hits_last": int(self._diag_track_max_hits),
+                "track_max_score_last": round(float(self._diag_track_max_score), 4),
+                "stable_present_last": bool(self._diag_stable_present),
+                "relax_ready_last": bool(self._diag_relax_ready),
+                "lock_min_hits": self.lock_min_hits,
+                "relock_relax_after_s": self.relock_relax_after_s,
+                "relock_relax_min_hits": self.relock_relax_min_hits,
+                "relock_relax_min_score": self.relock_relax_min_score,
+                "frames_multi_det": self._diag_frames_multi_det,
+                "max_score_last": round(float(self._diag_raw_max_current), 4),
+                "max_score_peak": round(float(self._diag_raw_max_peak), 4),
+                "confidence_threshold": self.confidence_threshold,
                 "no_track": self._diag_frames_no_track,
                 "no_lock": self._diag_frames_no_lock,
                 "lock_unconfirmed": self._diag_frames_lock_unconfirmed,
